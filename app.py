@@ -776,14 +776,53 @@ async def _run_full_profile(
                         else:
                             best_vocab = []
 
+                # Token vocab size + delimiter presence + token-shape evidence for the chosen delimiter.
+                # This is critical for fields like Positions, where:
+                # - combinations can be highly unique (unique_count high)
+                # - but the underlying token set is small + code-like
+                token_vocab_size = 0
+                delimiter_presence_pct = 0.0
+                token_shape_pct = 0.0
+
+                if best_spec is not None:
+                    best_pat = best_spec["pattern"]
+
+                    # How often the delimiter pattern appears at all (not the same as multi_token_pct)
+                    delim_present_mask = scan_series.str.contains(best_pat, regex=True, na=False)
+                    delimiter_presence_pct = _pct(int(delim_present_mask.sum()), scan_n)
+
+                    best_token_lists = scan_series.str.split(best_pat, regex=True)
+
+                    tokens_flat_all: List[str] = []
+                    for lst in best_token_lists.tolist():
+                        if not isinstance(lst, list):
+                            continue
+                        for tok in lst:
+                            tok2 = str(tok).strip()
+                            if tok2:
+                                tokens_flat_all.append(tok2)
+
+                    token_vocab_size = len(set(tokens_flat_all)) if tokens_flat_all else 0
+
+                    # Token shape: percent of tokens that look like short codes (e.g., ST, RW, CAM)
+                    if tokens_flat_all:
+                        tok_series_all = pd.Series(tokens_flat_all, dtype="string")
+                        shape_mask = tok_series_all.str.match(r"^[A-Za-z]{1,4}$", na=False)
+                        token_shape_pct = _pct(int(shape_mask.sum()), int(len(tok_series_all)))
+
                 multi_value = {
                     "delimiter": best_spec["name"] if best_spec is not None else None,
                     "delimiter_pattern": best_spec["pattern"] if best_spec is not None else None,
                     "multi_token_pct": round(best_multi_pct, 6) if best_multi_pct >= 0 else 0.0,
+                    "delimiter_presence_pct": round(float(delimiter_presence_pct), 6),
                     "avg_tokens": round(best_tokens_stats[0], 6),
                     "max_tokens": best_tokens_stats[1],
                     "token_vocab_topk": best_vocab,
+                    "token_vocab_size": int(token_vocab_size),
+                    "token_shape_pct": round(float(token_shape_pct), 6),
                 }
+
+
 
 
                 # Range-like patterns
@@ -1022,16 +1061,62 @@ async def _run_full_profile(
 
          
             # Multi-value categorical candidates
-            if multi_token_pct >= 20.0 and multi_like.get("delimiter_pattern") is not None:
-                add_candidate(min(0.9, multi_token_pct / 100.0 + 0.1), {
+            # Goal: avoid "rigging" to high confidence. Surface ambiguity:
+            # - weak evidence -> low confidence multi (visible for review)
+            # - decent evidence -> medium multi
+            # - overwhelming evidence -> higher multi (still capped)
+            token_vocab_size = int(multi_like.get("token_vocab_size") or 0)
+            delimiter_presence_pct = float(multi_like.get("delimiter_presence_pct") or 0.0)
+            token_shape_pct = float(multi_like.get("token_shape_pct") or 0.0)
+
+            has_delim = (multi_like.get("delimiter_pattern") is not None)
+
+            # Evidence that this is a controlled-vocab multi field (Positions-like)
+            controlled_vocab_evidence = (
+                has_delim and
+                (delimiter_presence_pct >= 1.0) and
+                (token_vocab_size > 0 and token_vocab_size <= 120) and
+                (token_shape_pct >= 60.0)
+            )
+
+            # When evidence exists, always add a multi candidate, but keep confidence bounded.
+            # - If multi_token_pct is tiny, candidate should exist but be low confidence.
+            # - If multi_token_pct is strong, confidence can rise (still capped).
+            if has_delim and (multi_token_pct >= 1.0 or controlled_vocab_evidence):
+                base = _clamp(multi_token_pct / 100.0, 0.0, 1.0)
+
+                # small bump for controlled vocab signal; not enough to guarantee dominance
+                bump = 0.10 if controlled_vocab_evidence else 0.0
+
+                # raw score (then tier-capped below)
+                raw = _clamp(0.25 + 0.70 * base + bump, 0.0, 0.95)
+
+                # Tier caps to preserve ambiguity and encourage review:
+                # - <5% multi: keep multi confidence <= 0.60
+                # - 5–20%: keep <= 0.80
+                # - >=20%: keep <= 0.90
+                if multi_token_pct < 5.0:
+                    conf = min(raw, 0.60)
+                elif multi_token_pct < 20.0:
+                    conf = min(raw, 0.80)
+                else:
+                    conf = min(raw, 0.90)
+
+                add_candidate(conf, {
                     "type": "categorical_multi",
                     "op": f"split_regex(pattern='{multi_like.get('delimiter_pattern')}')",
                     "evidence": {
                         "multi_token_pct": multi_token_pct,
+                        "delimiter_presence_pct": delimiter_presence_pct,
                         "delimiter": multi_like.get("delimiter"),
                         "delimiter_pattern": multi_like.get("delimiter_pattern"),
+                        "token_vocab_size": token_vocab_size,
+                        "token_shape_pct": token_shape_pct,
+                        "controlled_vocab_evidence": bool(controlled_vocab_evidence),
                     }
                 })
+
+
 
 
             # Range candidates
@@ -1111,6 +1196,31 @@ async def _run_full_profile(
             # base combine
             text_conf = _clamp(0.1 + 0.9 * elim * u_norm, 0.0, 0.99)
 
+            # If the column shows evidence of being a multi-category controlled-vocab field (e.g. Positions),
+            # do NOT allow text to dominate purely due to high uniqueness.
+            # Design goal: when ambiguous, keep text low-medium so the system escalates to column detail.
+            token_vocab_size = int(multi_like.get("token_vocab_size") or 0)
+            delimiter_presence_pct = float(multi_like.get("delimiter_presence_pct") or 0.0)
+            token_shape_pct = float(multi_like.get("token_shape_pct") or 0.0)
+            has_delim = bool(multi_like.get("delimiter_pattern"))
+
+            controlled_vocab_evidence = (
+                has_delim and
+                (delimiter_presence_pct >= 1.0) and
+                (token_vocab_size > 0 and token_vocab_size <= 80) and
+                (token_shape_pct >= 60.0)
+            )
+
+            # If there's any credible multi structure, cap text confidence lower.
+            # - weak/marginal evidence: cap at 0.75
+            # - controlled vocab evidence: cap at 0.65
+            if has_delim and delimiter_presence_pct >= 1.0 and token_vocab_size > 0 and token_vocab_size <= 120:
+                text_conf = min(text_conf, 0.75)
+
+            if controlled_vocab_evidence:
+                text_conf = min(text_conf, 0.65)
+
+
             # URL/identifier boosts (high-confidence text even at moderate cardinality)
             # apply boost if any evidence in scan_series
             url_like_pct = 0.0
@@ -1153,6 +1263,26 @@ async def _run_full_profile(
             # Sort descending by confidence
             candidates.sort(key=lambda x: x.get("confidence", 0.0), reverse=True)
             col_info["candidates"] = candidates
+
+            # Review recommendation: if ambiguous, explicitly flag to call /profile_column_detail
+            top_conf = float((candidates[0].get("confidence") if candidates else 0.0) or 0.0)
+            second_conf = float((candidates[1].get("confidence") if len(candidates) > 1 else 0.0) or 0.0)
+            conf_gap = top_conf - second_conf
+
+            review_recommended = (top_conf < 0.90) or (conf_gap < 0.15)
+
+            col_info["review"] = {
+                "recommended": bool(review_recommended),
+                "top_confidence": round(top_conf, 6),
+                "second_confidence": round(second_conf, 6),
+                "confidence_gap": round(conf_gap, 6),
+                "reason": (
+                    "low_top_confidence" if top_conf < 0.90
+                    else "small_gap_between_top_candidates" if conf_gap < 0.15
+                    else "none"
+                ),
+            }
+
 
             # -----------------------------
             # Step 5 — Outlier visibility & parseability (numeric/date)
@@ -1292,6 +1422,7 @@ async def profile_summary(
                 "op": top.get("op"),
                 "evidence": top.get("evidence"),
             },
+            "review": info.get("review"),
             # optional but useful for routing to cleaner without extra calls
             "unit_plan": info.get("unit_plan"),
 
