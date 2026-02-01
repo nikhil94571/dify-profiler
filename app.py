@@ -723,33 +723,49 @@ async def _run_full_profile(
                 }
 
                 # Multi-value delimited detection
-                delimiters = [",", ";", "|"]
-                best_delim = None
+                # IMPORTANT: do NOT treat whitespace as a delimiter (would misclassify normal text).
+                # Instead, treat separators with optional surrounding whitespace as the delimiter.
+                delimiter_specs = [
+                    {"name": "comma", "pattern": r"\s*,\s*"},
+                    {"name": "semicolon", "pattern": r"\s*;\s*"},
+                    {"name": "pipe", "pattern": r"\s*\|\s*"},
+                    {"name": "slash", "pattern": r"\s*/\s*"},
+                ]
+
+                best_spec: Optional[Dict[str, str]] = None
                 best_multi_pct = -1.0
                 best_tokens_stats = (0.0, 0)  # avg_tokens, max_tokens
                 best_vocab: List[Dict[str, Any]] = []
 
-                for d in delimiters:
-                    # Split tokens; multi-token if at least one delimiter and >1 token after split
-                    token_lists = scan_series.str.split(d)
-                    token_counts = token_lists.apply(lambda lst: len([t for t in lst if t.strip() != ""]) if isinstance(lst, list) else 1)
+                for spec in delimiter_specs:
+                    pat = spec["pattern"]
+
+                    # Regex split so ", " and ",    " behave identically
+                    token_lists = scan_series.str.split(pat, regex=True)
+
+                    # Count non-empty tokens after strip
+                    token_counts = token_lists.apply(
+                        lambda lst: len([t for t in lst if str(t).strip() != ""]) if isinstance(lst, list) else 1
+                    )
+
                     multi_mask = token_counts > 1
                     multi_pct = _pct(int(multi_mask.sum()), scan_n)
 
                     if multi_pct > best_multi_pct:
                         best_multi_pct = multi_pct
-                        best_delim = d
+                        best_spec = spec
+
                         avg_tokens = float(token_counts.mean()) if scan_n else 0.0
                         max_tokens = int(token_counts.max()) if scan_n else 0
                         best_tokens_stats = (avg_tokens, max_tokens)
 
-                        # Build vocab top-k
+                        # Build vocab top-k from multi-valued rows only
                         tokens_flat: List[str] = []
                         for lst in token_lists[multi_mask].tolist():
                             if not isinstance(lst, list):
                                 continue
                             for tok in lst:
-                                tok2 = tok.strip()
+                                tok2 = str(tok).strip()
                                 if tok2:
                                     tokens_flat.append(tok2)
 
@@ -761,12 +777,14 @@ async def _run_full_profile(
                             best_vocab = []
 
                 multi_value = {
-                    "delimiter": best_delim,
+                    "delimiter": best_spec["name"] if best_spec is not None else None,
+                    "delimiter_pattern": best_spec["pattern"] if best_spec is not None else None,
                     "multi_token_pct": round(best_multi_pct, 6) if best_multi_pct >= 0 else 0.0,
                     "avg_tokens": round(best_tokens_stats[0], 6),
                     "max_tokens": best_tokens_stats[1],
                     "token_vocab_topk": best_vocab,
                 }
+
 
                 # Range-like patterns
                 year_range_mask = scan_series.str.match(RE_YEAR_RANGE, na=False)
@@ -778,24 +796,6 @@ async def _run_full_profile(
                     "numeric_range_pct": _pct(int(num_range_mask.sum()), scan_n),
                     "examples": range_examples,
                 }
-
-                # -----------------------------
-                # Unit plan exceptions (auditability + cleaner routing)
-                # -----------------------------
-                if isinstance(col_info.get("unit_plan"), dict):
-                    # Values that look numeric but have no unit when the column contains unit-suffixed values
-                    unit_missing_count = int(strict_mask.sum()) if int(unit_suffix_mask.sum()) > 0 else 0
-
-                    # Range-like count (year or numeric ranges)
-                    range_count = int((year_range_mask | num_range_mask).sum())
-
-                    # Unparseable examples (neither strict numeric nor unit-suffixed numeric)
-                    unparsable_mask = ~(strict_mask | unit_suffix_mask)
-                    unparseable_examples = _take_examples(scan_series[unparsable_mask], EXAMPLES_PER_PATTERN)
-
-                    col_info["unit_plan"]["exceptions"]["unit_missing_count"] = int(unit_missing_count)
-                    col_info["unit_plan"]["exceptions"]["range_count"] = int(range_count)
-                    col_info["unit_plan"]["exceptions"]["unparseable_examples"] = unparseable_examples
 
                 patterns["numeric_like"] = numeric_like
                 patterns["numeric_like_examples"] = numeric_like_examples
@@ -894,7 +894,26 @@ async def _run_full_profile(
                 if unit_plan is not None:
                     col_info["unit_plan"] = unit_plan
 
+                # -----------------------------
+                # Unit plan exceptions (auditability + cleaner routing)
+                # -----------------------------
+                if isinstance(col_info.get("unit_plan"), dict):
+                    # Values that look numeric but have no unit when the column contains unit-suffixed values
+                    unit_missing_count = int(strict_mask.sum()) if int(unit_suffix_mask.sum()) > 0 else 0
+
+                    # Range-like count (year or numeric ranges)
+                    range_count = int((year_range_mask | num_range_mask).sum())
+
+                    # Unparseable examples (neither strict numeric nor unit-suffixed numeric)
+                    unparsable_mask = ~(strict_mask | unit_suffix_mask)
+                    unparseable_examples = _take_examples(scan_series[unparsable_mask], EXAMPLES_PER_PATTERN)
+
+                    col_info["unit_plan"]["exceptions"]["unit_missing_count"] = int(unit_missing_count)
+                    col_info["unit_plan"]["exceptions"]["range_count"] = int(range_count)
+                    col_info["unit_plan"]["exceptions"]["unparseable_examples"] = unparseable_examples
+
             col_info["patterns"] = patterns
+
 
 
             # -----------------------------
@@ -911,7 +930,11 @@ async def _run_full_profile(
             strict_pct = float(num_like.get("strict_pct", 0.0))
             currency_pct = float(num_like.get("currency_pct", 0.0))
             suffix_pct = float(num_like.get("suffix_pct", 0.0))
+
+            # Keep Step 4 aligned with Step 3 numeric_like outputs
+            suffix_multiplier_pct = float(num_like.get("suffix_multiplier_pct", 0.0))
             suffix_unit_pct = float(num_like.get("suffix_unit_pct", 0.0))
+
             percent_pct = float(num_like.get("percent_pct", 0.0))
             thousands_pct = float(num_like.get("thousands_sep_pct", 0.0))
             month_pct = float(date_like.get("month_name_pct", 0.0))
@@ -921,6 +944,10 @@ async def _run_full_profile(
             year_range_pct = float(range_like.get("year_range_pct", 0.0))
             num_range_pct = float(range_like.get("numeric_range_pct", 0.0))
 
+
+            def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
+                return max(lo, min(hi, x))
+
             # Simple deterministic ranking rules
             def add_candidate(score: float, obj: Dict[str, Any]) -> None:
                 obj["confidence"] = round(float(score), 6)
@@ -928,10 +955,21 @@ async def _run_full_profile(
 
             # Numeric candidates
             if strict_pct >= 80.0:
+
+                # If a small suffix-multiplier minority exists (e.g., "1.6K"), record that explicitly.
+                # This prevents downstream systems from assuming "strict-only".
+                parse_mode = "strict"
+                if suffix_multiplier_pct > 0.0:
+                    parse_mode = "strict_with_suffix_minority"
+
                 add_candidate(strict_pct / 100.0, {
                     "type": "numeric",
-                    "parse": "strict",
-                    "evidence": {"strict_pct": strict_pct}
+                    "parse": parse_mode,
+                    "evidence": {
+                        "strict_pct": strict_pct,
+                        "suffix_multiplier_pct": suffix_multiplier_pct,
+                        "suffix_pct": suffix_pct,
+                    }
                 })
             if (currency_pct + suffix_pct) >= 10.0:
                 add_candidate(min(0.95, (currency_pct + suffix_pct) / 100.0 + 0.1), {
@@ -982,16 +1020,19 @@ async def _run_full_profile(
                     "evidence": {"iso_pct": iso_pct, "month_name_pct": month_pct, "parse_success_pct": date_parse_pct}
                 })
 
-            def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
-                return max(lo, min(hi, x))
-
+         
             # Multi-value categorical candidates
-            if multi_token_pct >= 20.0 and multi_like.get("delimiter") is not None:
+            if multi_token_pct >= 20.0 and multi_like.get("delimiter_pattern") is not None:
                 add_candidate(min(0.9, multi_token_pct / 100.0 + 0.1), {
                     "type": "categorical_multi",
-                    "op": f"split(delimiter='{multi_like.get('delimiter')}')",
-                    "evidence": {"multi_token_pct": multi_token_pct, "delimiter": multi_like.get("delimiter")}
+                    "op": f"split_regex(pattern='{multi_like.get('delimiter_pattern')}')",
+                    "evidence": {
+                        "multi_token_pct": multi_token_pct,
+                        "delimiter": multi_like.get("delimiter"),
+                        "delimiter_pattern": multi_like.get("delimiter_pattern"),
+                    }
                 })
+
 
             # Range candidates
             if (year_range_pct + num_range_pct) >= 10.0:
