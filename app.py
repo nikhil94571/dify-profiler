@@ -133,7 +133,7 @@ async def request_logging(request: Request, call_next):
 
 @app.middleware("http")
 async def limit_upload_size(request: Request, call_next):
-    if request.url.path == "/profile" and request.method.upper() == "POST":
+    if request.url.path in ("/profile", "/profile_summary", "/profile_column_detail") and request.method.upper() == "POST":
         cl = request.headers.get("content-length")
         if cl is not None:
             try:
@@ -146,7 +146,7 @@ async def limit_upload_size(request: Request, call_next):
 
 @app.middleware("http")
 async def basic_rate_limit(request: Request, call_next):
-    if request.url.path == "/profile" and request.method.upper() == "POST":
+    if request.url.path in ("/profile", "/profile_summary", "/profile_column_detail") and request.method.upper() == "POST":
         ip = _client_ip(request)
         now = time.time()
         q = _req_times[ip]
@@ -335,17 +335,25 @@ def _try_parse_date_for_profile(s_stripped: pd.Series) -> Tuple[pd.Series, pd.Se
         return parsed_b, success_b, "dayfirst_true"
     return parsed_a, success_a, "dayfirst_false"
 
+def _run_full_profile(
+    request: Request,
+    file: UploadFile,
+    dataset_id: str,
+    max_categorical_cardinality: int,
+) -> Dict[str, Any]:
+    """
+    Runs the full profiler and returns the complete data_profile dict.
+    Used internally by all profile endpoints.
+    """
 
 # -----------------------------
-# Main endpoint
+# Shared runner (used by all endpoints)
 # -----------------------------
-@app.post("/profile")
-async def profile(
+async def _run_full_profile(
     request: Request,
-    file: UploadFile = File(...),
-    dataset_id: str = Form(...),
-    max_categorical_cardinality: int = Form(20),
-    _=Depends(require_token),
+    file: UploadFile,
+    dataset_id: str,
+    max_categorical_cardinality: int,
 ) -> Dict[str, Any]:
     logger.info(json.dumps({
         "event": "profile_start",
@@ -394,7 +402,6 @@ async def profile(
         df.memory_usage(deep=True).sum() / 1e6
     )
 
-
     n_rows, n_cols = df.shape
     total_missing = int(df.isna().sum().sum())
 
@@ -429,10 +436,22 @@ async def profile(
     }
 
     max_cat = int(max_categorical_cardinality)
-    
+
     for col in df.columns:
         stage_logger.info("stage=col_start request_id=%s col=%s", rid, col)
         try:
+            # --- EVERYTHING inside your current per-column loop stays the same ---
+            # Keep your existing logic here unchanged:
+            # - infer type
+            # - samples
+            # - missing-like tokens
+            # - patterns
+            # - candidates
+            # - numeric_profile/date_profile
+            #
+            # At the end, you must set:
+            # out["columns"][col] = col_info
+
             s = df[col]
             missing_count = int(s.isna().sum())
             missing_pct = (missing_count / n_rows * 100.0) if n_rows else 0.0
@@ -462,6 +481,7 @@ async def profile(
                 else:
                     levels = sorted(str(v) for v in vals)
                 col_info["levels"] = levels
+
             # -----------------------------
             # Step 1 — Value sampling per column
             # -----------------------------
@@ -867,12 +887,110 @@ async def profile(
                 rid, col, type(exc).__name__, str(exc)
             )
             raise
-
         finally:
             stage_logger.info("stage=col_end request_id=%s col=%s", rid, col)
 
-
     return {"data_profile": out}
+
+
+# -----------------------------
+# Main endpoint (unchanged external behavior)
+# -----------------------------
+@app.post("/profile")
+async def profile(
+    request: Request,
+    file: UploadFile = File(...),
+    dataset_id: str = Form(...),
+    max_categorical_cardinality: int = Form(20),
+    _=Depends(require_token),
+) -> Dict[str, Any]:
+    return await _run_full_profile(
+        request=request,
+        file=file,
+        dataset_id=dataset_id,
+        max_categorical_cardinality=max_categorical_cardinality,
+    )
+
+
+# -----------------------------
+# Dify-safe: shallow summary
+# -----------------------------
+@app.post("/profile_summary")
+async def profile_summary(
+    request: Request,
+    file: UploadFile = File(...),
+    dataset_id: str = Form(...),
+    max_categorical_cardinality: int = Form(20),
+    _=Depends(require_token),
+) -> Dict[str, Any]:
+
+    full = (await _run_full_profile(
+        request=request,
+        file=file,
+        dataset_id=dataset_id,
+        max_categorical_cardinality=max_categorical_cardinality,
+    ))["data_profile"]
+
+    # Depth-safe: list of flat column cards (no deep nesting)
+    columns = []
+    for col, info in full["columns"].items():
+        top = (info.get("candidates") or [{}])[0]
+        columns.append({
+            "column": col,
+            "inferred_type": info.get("inferred_type"),
+            "missing_pct": info.get("missing_pct"),
+            "unique_count": info.get("unique_count"),
+            "top_candidate": {
+                "type": top.get("type"),
+                "confidence": top.get("confidence"),
+                "parse": top.get("parse"),
+                "op": top.get("op"),
+                "evidence": top.get("evidence"),
+            },
+        })
+
+    return {
+        "dataset_id": full["dataset_id"],
+        "dataset_sha256": full["dataset_sha256"],
+        "n_rows": full["n_rows"],
+        "n_columns": full["n_columns"],
+        "summary": full["summary"],
+        "columns": columns,
+    }
+
+
+# -----------------------------
+# Dify-safe: one column detail (returned as JSON string)
+# -----------------------------
+@app.post("/profile_column_detail")
+async def profile_column_detail(
+    request: Request,
+    file: UploadFile = File(...),
+    dataset_id: str = Form(...),
+    column: str = Form(...),
+    max_categorical_cardinality: int = Form(20),
+    _=Depends(require_token),
+) -> Dict[str, Any]:
+
+    full = (await _run_full_profile(
+        request=request,
+        file=file,
+        dataset_id=dataset_id,
+        max_categorical_cardinality=max_categorical_cardinality,
+    ))["data_profile"]
+
+    if column not in full["columns"]:
+        raise HTTPException(status_code=404, detail=f"Column '{column}' not found")
+
+    # Keep Dify under depth limit by returning the deep column object as a string.
+    # The LLM can still consume this string as text.
+    return {
+        "dataset_id": full["dataset_id"],
+        "dataset_sha256": full["dataset_sha256"],
+        "column": column,
+        "profile_json": json.dumps(full["columns"][column], ensure_ascii=False),
+    }
+
 
 
 @app.get("/health")
