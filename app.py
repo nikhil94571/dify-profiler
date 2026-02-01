@@ -230,10 +230,40 @@ def _cap_scan(s: pd.Series, max_rows: int) -> pd.Series:
 # -----------------------------
 RE_STRICT_NUM = re.compile(r"^-?\d+(?:\.\d+)?$")
 RE_CURRENCY_PREFIX = re.compile(r"^[€$£]\s*\d")
-RE_SUFFIX_MULT = re.compile(r"\d(?:\.\d+)?\s*[KMBkmb]\b")
 RE_PERCENT = re.compile(r"\d+(?:\.\d+)?%")
 RE_THOUSANDS = re.compile(r"\d{1,3}(?:[,\s]\d{3})+(?:\.\d+)?")
 RE_PARENS_NEG = re.compile(r"^\(\s*\d")
+
+# Multipliers are a distinct concept from measurement units
+MULTIPLIER_SUFFIXES = {"k", "m", "b"}
+RE_SUFFIX_MULT = re.compile(r"(?i)\b-?\d+(?:\.\d+)?\s*([KMB])\b")
+
+# Measurement-unit suffixes (first-class, separate from multipliers)
+UNIT_SUFFIXES = {
+    # weight
+    "kg", "kgs", "kilogram", "kilograms",
+    "lb", "lbs", "pound", "pounds",
+
+    # height / length
+    "mm", "cm", "m",
+    "ft", "feet", "in", "inch", "inches",
+}
+
+# numeric + optional whitespace + unit
+UNIT_SUFFIX_RE = re.compile(
+    r"^\s*(?P<num>-?\d+(?:\.\d+)?)\s*(?P<unit>("
+    + "|".join(sorted(UNIT_SUFFIXES, key=len, reverse=True))
+    + r"))\s*$",
+    re.IGNORECASE
+)
+
+# URL / identifier strong text signals
+RE_URL = re.compile(r"(?i)\bhttps?://")
+RE_EMAIL = re.compile(r"(?i)^[^@\s]+@[^@\s]+\.[^@\s]+$")
+RE_UUID = re.compile(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
+
+# Bool-like tokens (for elimination scoring)
+BOOL_LIKE = {"true", "false", "yes", "no", "y", "n", "t", "f", "0", "1"}
 
 RE_ISO_DATE = re.compile(r"^\d{4}[-/]\d{2}[-/]\d{2}")
 RE_DMY_MDY = re.compile(r"^\d{1,2}[-/]\d{1,2}[-/]\d{2,4}$")
@@ -242,10 +272,9 @@ RE_MONTH_NAME = re.compile(
     r"\b(?:jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)\b",
     re.IGNORECASE
 )
-
-
 RE_YEAR_RANGE = re.compile(r"^\s*\d{4}\s*~\s*\d{4}\s*$")
 RE_NUM_RANGE = re.compile(r"^\s*-?\d+(?:\.\d+)?\s*-\s*-?\d+(?:\.\d+)?\s*$")
+
 
 
 def _pct(n: int, d: int) -> float:
@@ -268,17 +297,17 @@ def _try_parse_numeric_for_profile(s_stripped: pd.Series) -> Tuple[pd.Series, pd
     """
     Returns (parsed_numeric_series, success_mask)
 
-    This is ONLY for profiling to compute parseability and quantiles.
-    It applies lightweight normalization:
-      - strips currency prefixes (€,$,£)
-      - handles (123) as -123
-      - removes thousands separators (comma/space) in digit groupings
-      - handles suffix K/M/B multipliers
-      - strips trailing %
+    Profiling-only numeric parser:
+    - preserves existing behaviors (currency, %, thousands, parens-negative, K/M/B)
+    - adds measurement-unit suffix recognition as a first-class parse mode:
+        e.g. "72kg", "185lbs", "1.82m", "182 cm", "6ft", "72 in"
+    NOTE: this returns a numeric value in the *original unit scale* (not converted),
+    because quantiles/extremes are still useful, and canonical conversion is handled
+    via unit_plan (separate).
     """
     x = s_stripped.copy()
 
-    # Parens negative: (123) -> -123
+    # Normalize: parens negative (123) -> -123
     paren_mask = x.str.match(r"^\(\s*.*\)\s*$", na=False)
     x = x.where(~paren_mask, "-" + x.str.replace(r"^\(\s*|\)\s*$", "", regex=True))
 
@@ -288,33 +317,30 @@ def _try_parse_numeric_for_profile(s_stripped: pd.Series) -> Tuple[pd.Series, pd
     # Strip trailing percent
     x = x.str.replace(r"%\s*$", "", regex=True)
 
-    # Capture suffix multiplier
-    suffix = x.str.extract(r"(?i)^\s*(-?\d+(?:\.\d+)?)\s*([KMB])\s*$")
-    has_suffix = suffix[0].notna() & suffix[1].notna()
+    # Measurement-unit suffix parse mode (extract numeric part if unit suffix)
+    # We deliberately do NOT convert here; conversion is driven by unit_plan.
+    unit_extract = x.str.extract(UNIT_SUFFIX_RE)
+    unit_has = unit_extract["num"].notna() & unit_extract["unit"].notna()
+    unit_num = pd.to_numeric(unit_extract["num"], errors="coerce").astype("float64")
 
-    base_num = pd.to_numeric(suffix[0], errors="coerce")
-    mult = suffix[1].str.upper().map({"K": 1_000.0, "M": 1_000_000.0, "B": 1_000_000_000.0})
+    # Capture suffix multiplier K/M/B (separate from measurement units)
+    mult_extract = x.str.extract(r"(?i)^\s*(-?\d+(?:\.\d+)?)\s*([KMB])\s*$")
+    has_mult = mult_extract[0].notna() & mult_extract[1].notna()
+    base_num = pd.to_numeric(mult_extract[0], errors="coerce").astype("float64")
+    mult = mult_extract[1].str.upper().map({"K": 1_000.0, "M": 1_000_000.0, "B": 1_000_000_000.0}).astype("float64")
+    mult_values = (base_num * mult).astype("float64")
 
-    # For non-suffix values, remove thousands separators in digit groupings
-    # This is conservative: remove commas/spaces between digits.
+    # For non-suffix values, remove thousands separators between digit groupings
     x2 = x.str.replace(r"(?<=\d)[,\s](?=\d{3}\b)", "", regex=True)
+    parsed_plain = pd.to_numeric(x2, errors="coerce").astype("float64")
 
-    parsed_plain = pd.to_numeric(x2, errors="coerce")
-
-    # Force float to avoid int/float assignment issues in .where(...)
-    parsed = pd.to_numeric(parsed_plain, errors="coerce").astype("float64")
-
-    suffix_values = (base_num * mult).astype("float64")
-
-    parsed = parsed.where(~has_suffix, suffix_values)
-
-    # Defensive: ensure dtype stays float for downstream quantiles/extremes
-    parsed = parsed.astype("float64")
-
-
+    # Priority: unit-suffix numeric > multiplier numeric > plain numeric
+    parsed = parsed_plain.where(~has_mult, mult_values)
+    parsed = parsed.where(~unit_has, unit_num)
 
     success = parsed.notna()
-    return parsed, success
+    return parsed.astype("float64"), success
+
 
 
 def _try_parse_date_for_profile(s_stripped: pd.Series) -> Tuple[pd.Series, pd.Series, str]:
@@ -608,28 +634,74 @@ async def _run_full_profile(
                 # Numeric-like
                 strict_mask = scan_series.str.match(RE_STRICT_NUM, na=False)
                 currency_mask = scan_series.str.match(RE_CURRENCY_PREFIX, na=False)
-                suffix_mask = scan_series.str.contains(RE_SUFFIX_MULT, na=False)
+
+                # Multiplier suffix (K/M/B)
+                suffix_mult_mask = scan_series.str.contains(RE_SUFFIX_MULT, na=False)
+
+                # Measurement-unit suffix (kg/lb/cm/m/etc.)
+                unit_match = scan_series.str.extract(UNIT_SUFFIX_RE)
+                unit_suffix_mask = unit_match["num"].notna() & unit_match["unit"].notna()
+
+                # suffix_pct counts EITHER multiplier suffix OR measurement-unit suffix
+                suffix_any_mask = suffix_mult_mask | unit_suffix_mask
+
                 percent_mask = scan_series.str.contains(RE_PERCENT, na=False)
                 thousands_mask = scan_series.str.contains(RE_THOUSANDS, na=False)
                 parens_mask = scan_series.str.match(RE_PARENS_NEG, na=False)
 
+                # bool-like (for elimination-based text scoring)
+                bool_mask = scan_series.str.lower().isin(BOOL_LIKE)
+
                 numeric_like = {
                     "strict_pct": _pct(int(strict_mask.sum()), scan_n),
                     "currency_pct": _pct(int(currency_mask.sum()), scan_n),
-                    "suffix_pct": _pct(int(suffix_mask.sum()), scan_n),
+
+                    # keep one suffix_pct for backwards compatibility + include breakdown
+                    "suffix_pct": _pct(int(suffix_any_mask.sum()), scan_n),
+                    "suffix_multiplier_pct": _pct(int(suffix_mult_mask.sum()), scan_n),
+                    "suffix_unit_pct": _pct(int(unit_suffix_mask.sum()), scan_n),
+
                     "percent_pct": _pct(int(percent_mask.sum()), scan_n),
                     "thousands_sep_pct": _pct(int(thousands_mask.sum()), scan_n),
                     "parens_neg_pct": _pct(int(parens_mask.sum()), scan_n),
+                    "bool_like_pct": _pct(int(bool_mask.sum()), scan_n),
                 }
+
+                # unit breakdown counts (for unit_plan + auditability)
+                units_detected: Dict[str, int] = {}
+                if scan_n > 0 and int(unit_suffix_mask.sum()) > 0:
+                    # canonicalize unit tokens (lbs -> lb, kilograms -> kg, etc.)
+                    raw_units = unit_match.loc[unit_suffix_mask, "unit"].astype("string").str.lower().tolist()
+
+                    def _canon_unit(u: str) -> str:
+                        u = (u or "").strip().lower()
+                        if u in ("kgs", "kilogram", "kilograms"):
+                            return "kg"
+                        if u in ("lbs", "pound", "pounds"):
+                            return "lb"
+                        if u in ("feet",):
+                            return "ft"
+                        if u in ("inch", "inches"):
+                            return "in"
+                        return u
+
+                    for u in raw_units:
+                        cu = _canon_unit(str(u))
+                        units_detected[cu] = units_detected.get(cu, 0) + 1
 
                 numeric_like_examples = {
                     "strict": _take_examples(scan_series[strict_mask], EXAMPLES_PER_PATTERN),
                     "currency_prefixed": _take_examples(scan_series[currency_mask], EXAMPLES_PER_PATTERN),
-                    "suffix_multiplier": _take_examples(scan_series[suffix_mask], EXAMPLES_PER_PATTERN),
+
+                    "suffix_multiplier": _take_examples(scan_series[suffix_mult_mask], EXAMPLES_PER_PATTERN),
+                    "suffix_unit": _take_examples(scan_series[unit_suffix_mask], EXAMPLES_PER_PATTERN),
+
                     "percent": _take_examples(scan_series[percent_mask], EXAMPLES_PER_PATTERN),
                     "thousands_sep": _take_examples(scan_series[thousands_mask], EXAMPLES_PER_PATTERN),
                     "parens_negative": _take_examples(scan_series[parens_mask], EXAMPLES_PER_PATTERN),
+                    "bool_like": _take_examples(scan_series[bool_mask], EXAMPLES_PER_PATTERN),
                 }
+
 
                 # Date-like patterns and parse attempt
                 iso_mask = scan_series.str.match(RE_ISO_DATE, na=False)
@@ -707,13 +779,123 @@ async def _run_full_profile(
                     "examples": range_examples,
                 }
 
+                # -----------------------------
+                # Unit plan exceptions (auditability + cleaner routing)
+                # -----------------------------
+                if isinstance(col_info.get("unit_plan"), dict):
+                    # Values that look numeric but have no unit when the column contains unit-suffixed values
+                    unit_missing_count = int(strict_mask.sum()) if int(unit_suffix_mask.sum()) > 0 else 0
+
+                    # Range-like count (year or numeric ranges)
+                    range_count = int((year_range_mask | num_range_mask).sum())
+
+                    # Unparseable examples (neither strict numeric nor unit-suffixed numeric)
+                    unparsable_mask = ~(strict_mask | unit_suffix_mask)
+                    unparseable_examples = _take_examples(scan_series[unparsable_mask], EXAMPLES_PER_PATTERN)
+
+                    col_info["unit_plan"]["exceptions"]["unit_missing_count"] = int(unit_missing_count)
+                    col_info["unit_plan"]["exceptions"]["range_count"] = int(range_count)
+                    col_info["unit_plan"]["exceptions"]["unparseable_examples"] = unparseable_examples
+
                 patterns["numeric_like"] = numeric_like
                 patterns["numeric_like_examples"] = numeric_like_examples
                 patterns["date_like"] = date_like
                 patterns["multi_value"] = multi_value
                 patterns["range_like"] = range_like
 
+                # -----------------------------
+                # Unit plan (for cleaner executor)
+                # -----------------------------
+                UNIT_PLAN_DEFAULTS = {
+                    # deterministic baseline (override later via env/config if desired)
+                    "weight": "kg",
+                    "length": "cm",
+                }
+                UNIT_KIND_BY_UNIT = {
+                    "kg": "weight", "lb": "weight",
+                    "mm": "length", "cm": "length", "m": "length", "ft": "length", "in": "length",
+                }
+                UNIT_CONVERSIONS = {
+                    # weight
+                    ("lb", "kg"): {"factor": 0.45359237, "formula": "kg = lb * 0.45359237"},
+                    ("kg", "lb"): {"factor": 1.0 / 0.45359237, "formula": "lb = kg / 0.45359237"},
+                    # length (optional but included for completeness)
+                    ("mm", "cm"): {"factor": 0.1, "formula": "cm = mm * 0.1"},
+                    ("cm", "mm"): {"factor": 10.0, "formula": "mm = cm * 10"},
+                    ("m", "cm"): {"factor": 100.0, "formula": "cm = m * 100"},
+                    ("cm", "m"): {"factor": 0.01, "formula": "m = cm * 0.01"},
+                    ("in", "cm"): {"factor": 2.54, "formula": "cm = in * 2.54"},
+                    ("cm", "in"): {"factor": 1.0 / 2.54, "formula": "in = cm / 2.54"},
+                    ("ft", "in"): {"factor": 12.0, "formula": "in = ft * 12"},
+                    ("in", "ft"): {"factor": 1.0 / 12.0, "formula": "ft = in / 12"},
+                    ("ft", "cm"): {"factor": 30.48, "formula": "cm = ft * 30.48"},
+                    ("cm", "ft"): {"factor": 1.0 / 30.48, "formula": "ft = cm / 30.48"},
+                }
+
+                def _pick_canonical_unit(units: Dict[str, int], threshold: float = 0.60) -> Optional[Dict[str, Any]]:
+                    if not units:
+                        return None
+                    parseable_count = int(sum(units.values()))
+                    if parseable_count <= 0:
+                        return None
+
+                    # Determine "kind" by majority (weight vs length)
+                    kind_counts: Dict[str, int] = {}
+                    for u, c in units.items():
+                        knd = UNIT_KIND_BY_UNIT.get(u)
+                        if knd:
+                            kind_counts[knd] = kind_counts.get(knd, 0) + int(c)
+                    if not kind_counts:
+                        return None
+
+                    kind = max(kind_counts.items(), key=lambda kv: kv[1])[0]
+                    default_unit = UNIT_PLAN_DEFAULTS.get(kind)
+                    if not default_unit:
+                        return None
+
+                    winner_unit, winner_count = max(units.items(), key=lambda kv: kv[1])
+                    winner_share = float(winner_count) / float(parseable_count)
+
+                    if winner_share >= threshold:
+                        canonical = winner_unit
+                        selection_rule = f"majority>={threshold:.2f}"
+                    else:
+                        canonical = default_unit
+                        selection_rule = f"majority<{threshold:.2f} -> default"
+
+                    conversions: List[Dict[str, Any]] = []
+                    for u, c in sorted(units.items(), key=lambda kv: (-kv[1], kv[0])):
+                        if u == canonical:
+                            continue
+                        conv = UNIT_CONVERSIONS.get((u, canonical))
+                        if conv:
+                            conversions.append({
+                                "from": u,
+                                "to": canonical,
+                                "factor": float(conv["factor"]),
+                                "formula": conv["formula"],
+                                "count": int(c),
+                            })
+
+                    return {
+                        "units_detected": units,
+                        "parseable_count": int(parseable_count),
+                        "canonical_unit_recommended": canonical,
+                        "selection_rule": selection_rule,
+                        "conversion": conversions,  # may be empty if no mapping exists
+                        "exceptions": {
+                            "unit_missing_count": None,
+                            "range_count": None,
+                            "unparseable_examples": [],
+                        },
+                    }
+
+                unit_plan = _pick_canonical_unit(units_detected) if "units_detected" in locals() else None
+                if unit_plan is not None:
+                    col_info["unit_plan"] = unit_plan
+
             col_info["patterns"] = patterns
+
 
             # -----------------------------
             # Step 4 — Candidate interpretations
@@ -729,6 +911,7 @@ async def _run_full_profile(
             strict_pct = float(num_like.get("strict_pct", 0.0))
             currency_pct = float(num_like.get("currency_pct", 0.0))
             suffix_pct = float(num_like.get("suffix_pct", 0.0))
+            suffix_unit_pct = float(num_like.get("suffix_unit_pct", 0.0))
             percent_pct = float(num_like.get("percent_pct", 0.0))
             thousands_pct = float(num_like.get("thousands_sep_pct", 0.0))
             month_pct = float(date_like.get("month_name_pct", 0.0))
@@ -756,12 +939,28 @@ async def _run_full_profile(
                     "parse": "currency+suffix_possible",
                     "evidence": {"currency_pct": currency_pct, "suffix_pct": suffix_pct}
                 })
+
+            # Numeric-with-unit candidate (e.g., Height/Weight)
+            # Triggers when unit suffix detection is present or a unit_plan exists.
+            if suffix_unit_pct >= 10.0 or isinstance(col_info.get("unit_plan"), dict):
+                base = _clamp(suffix_unit_pct / 100.0, 0.0, 1.0)
+                bump = 0.15 if isinstance(col_info.get("unit_plan"), dict) else 0.0
+                add_candidate(_clamp(0.35 + 0.6 * base + bump, 0.0, 0.99), {
+                    "type": "numeric_with_unit",
+                    "parse": "unit_suffix",
+                    "evidence": {
+                        "suffix_unit_pct": suffix_unit_pct,
+                        "unit_plan": col_info.get("unit_plan"),
+                    }
+                })
+
             if percent_pct >= 10.0:
                 add_candidate(min(0.9, percent_pct / 100.0 + 0.1), {
                     "type": "numeric",
                     "parse": "percent_possible",
                     "evidence": {"percent_pct": percent_pct}
                 })
+
             if thousands_pct >= 10.0:
                 add_candidate(min(0.85, thousands_pct / 100.0 + 0.05), {
                     "type": "numeric",
@@ -783,6 +982,9 @@ async def _run_full_profile(
                     "evidence": {"iso_pct": iso_pct, "month_name_pct": month_pct, "parse_success_pct": date_parse_pct}
                 })
 
+            def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
+                return max(lo, min(hi, x))
+
             # Multi-value categorical candidates
             if multi_token_pct >= 20.0 and multi_like.get("delimiter") is not None:
                 add_candidate(min(0.9, multi_token_pct / 100.0 + 0.1), {
@@ -799,11 +1001,113 @@ async def _run_full_profile(
                     "evidence": {"year_range_pct": year_range_pct, "numeric_range_pct": num_range_pct}
                 })
 
-            # Fallback text candidate always present
-            add_candidate(0.3, {
+            # Single-value categorical candidate (low-cardinality, non-multi, non-range, non-date-dominant, non-numeric-dominant)
+            # - fixes Preferred Foot (2 uniques)
+            # - fixes things like W/F, SM, A/W, etc.
+            is_low_card = (unique_count > 0 and unique_count <= max_cat)
+            is_multiish = (multi_token_pct >= 20.0)
+            is_rangeish = ((year_range_pct + num_range_pct) >= 10.0)
+            is_dateish = (date_parse_pct >= 60.0 or (iso_pct + month_pct) >= 20.0)
+
+            # numeric dominance estimate from pattern signals
+            num_dom_est = max(strict_pct, currency_pct + suffix_pct, percent_pct, thousands_pct)  # pct scale 0..100
+            is_numericish = (strict_pct >= 80.0) or ((currency_pct + suffix_pct) >= 10.0) or (percent_pct >= 10.0) or (thousands_pct >= 10.0)
+
+            if is_low_card and (not is_multiish) and (not is_rangeish) and (not is_dateish) and (not is_numericish):
+                # Confidence increases as uniques approach 2-5 and missingness is low
+                # Map uniques: 2->1.0, 5->0.8, max_cat->0.3 (monotonic decreasing)
+                if unique_count <= 1:
+                    uniq_score = 0.2
+                elif unique_count <= 2:
+                    uniq_score = 1.0
+                elif unique_count <= 5:
+                    uniq_score = 0.8
+                else:
+                    # linear falloff to 0.3 at max_cat
+                    uniq_score = 0.8 - (0.5 * ((unique_count - 5) / max(1, (max_cat - 5))))
+                    uniq_score = _clamp(uniq_score, 0.3, 0.8)
+
+                miss_penalty = _clamp(1.0 - (missing_pct / 100.0), 0.0, 1.0)
+                cat_conf = _clamp(0.15 + 0.85 * uniq_score * miss_penalty, 0.0, 0.99)
+
+                add_candidate(cat_conf, {
+                    "type": "categorical",
+                    "parse": "levels",
+                    "evidence": {
+                        "unique_count": unique_count,
+                        "max_categorical_cardinality": max_cat,
+                        "multi_token_pct": multi_token_pct,
+                        "missing_pct": missing_pct,
+                    }
+                })
+
+            # Mixed candidate (keeps text confidence moderate when patterns conflict)
+            # If numeric signals exist but aren't dominant, emit "mixed" to prevent overconfident text.
+            has_some_numeric = (num_dom_est >= 20.0)  # at least 20% numeric-like patterns
+            not_dominant_numeric = (num_dom_est < 80.0)
+            if has_some_numeric and not_dominant_numeric and (not is_dateish) and (not is_rangeish):
+                mixed_conf = _clamp(0.35 + 0.5 * (num_dom_est / 100.0), 0.35, 0.85)
+                add_candidate(mixed_conf, {
+                    "type": "mixed",
+                    "parse": "partial_numeric",
+                    "evidence": {"numeric_signal_pct_est": num_dom_est}
+                })
+
+            # Text candidate with elimination-based + cardinality-scaled confidence + URL/ID boosts
+            # A) elimination: how strongly it's NOT numeric/date/range/bool
+            p_num = _clamp(num_dom_est / 100.0, 0.0, 1.0)
+            p_date = _clamp(date_parse_pct / 100.0, 0.0, 1.0)
+            p_range = _clamp((year_range_pct + num_range_pct) / 100.0, 0.0, 1.0)
+            p_bool = _clamp(float(num_like.get("bool_like_pct", 0.0)) / 100.0, 0.0, 1.0)
+            elim = _clamp(1.0 - max(p_num, p_date, p_range, p_bool), 0.0, 1.0)
+
+            # B) cardinality: smoothly increases above max_cat
+            u = float(unique_count)
+            m = float(max_cat)
+            k = 2.0  # by u = 3m, u_norm ~ 1
+            u_norm = _clamp((u - m) / max(1.0, (k * m)), 0.0, 1.0)
+
+            # base combine
+            text_conf = _clamp(0.1 + 0.9 * elim * u_norm, 0.0, 0.99)
+
+            # URL/identifier boosts (high-confidence text even at moderate cardinality)
+            # apply boost if any evidence in scan_series
+            url_like_pct = 0.0
+            uuid_like_pct = 0.0
+            email_like_pct = 0.0
+            if scan_n > 0:
+                url_like_pct = _pct(int(scan_series.str.contains(RE_URL, na=False).sum()), scan_n)
+                uuid_like_pct = _pct(int(scan_series.str.contains(RE_UUID, na=False).sum()), scan_n)
+                email_like_pct = _pct(int(scan_series.str.match(RE_EMAIL, na=False).sum()), scan_n)
+
+            boost = 0.0
+            if url_like_pct >= 10.0:
+                boost = max(boost, 0.5)
+            if uuid_like_pct >= 10.0:
+                boost = max(boost, 0.5)
+            if email_like_pct >= 10.0:
+                boost = max(boost, 0.4)
+
+            text_conf = _clamp(max(text_conf, 0.75 if boost > 0 else text_conf) + boost * 0.2, 0.0, 0.99)
+
+            add_candidate(text_conf, {
                 "type": "text",
-                "evidence": {"inferred_type": t}
+                "evidence": {
+                    "inferred_type": t,
+                    "elim": round(elim, 6),
+                    "u_norm": round(u_norm, 6),
+                    "numeric_signal_pct_est": round(num_dom_est, 6),
+                    "date_parse_pct": date_parse_pct,
+                    "range_signal_pct": round(year_range_pct + num_range_pct, 6),
+                    "bool_like_pct": float(num_like.get("bool_like_pct", 0.0)),
+                    "url_like_pct": round(url_like_pct, 6),
+                    "uuid_like_pct": round(uuid_like_pct, 6),
+                    "email_like_pct": round(email_like_pct, 6),
+                    "max_categorical_cardinality": max_cat,
+                    "unique_count": unique_count,
+                }
             })
+
 
             # Sort descending by confidence
             candidates.sort(key=lambda x: x.get("confidence", 0.0), reverse=True)
@@ -947,6 +1251,9 @@ async def profile_summary(
                 "op": top.get("op"),
                 "evidence": top.get("evidence"),
             },
+            # optional but useful for routing to cleaner without extra calls
+            "unit_plan": info.get("unit_plan"),
+
         })
 
     return {
