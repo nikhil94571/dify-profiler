@@ -242,12 +242,27 @@ RE_SUFFIX_MULT = re.compile(r"(?i)\b-?\d+(?:\.\d+)?\s*([KMB])\b")
 UNIT_SUFFIXES = {
     # weight
     "kg", "kgs", "kilogram", "kilograms",
+    "g", "gram", "grams",
+    "mg", "milligram", "milligrams",
     "lb", "lbs", "pound", "pounds",
 
     # height / length
     "mm", "cm", "m",
     "ft", "feet", "in", "inch", "inches",
+
+    # time / duration (psych: reaction time, exposure duration, session length)
+    "ms", "msec", "msecs", "millisecond", "milliseconds",
+    "s", "sec", "secs", "second", "seconds",
+    "min", "mins", "minute", "minutes",
+    "h", "hr", "hrs", "hour", "hours",
+    "d", "day", "days",
+    "wk", "wks", "week", "weeks",
+
+    # age / longitudinal survey units
+    "yr", "yrs", "year", "years",
+    "mo", "mos", "month", "months",
 }
+
 
 # numeric + optional whitespace + unit
 UNIT_SUFFIX_RE = re.compile(
@@ -675,14 +690,43 @@ async def _run_full_profile(
 
                     def _canon_unit(u: str) -> str:
                         u = (u or "").strip().lower()
+
+                        # weight
                         if u in ("kgs", "kilogram", "kilograms"):
                             return "kg"
+                        if u in ("g", "gram", "grams"):
+                            return "g"
+                        if u in ("mg", "milligram", "milligrams"):
+                            return "mg"
                         if u in ("lbs", "pound", "pounds"):
                             return "lb"
+
+                        # length
                         if u in ("feet",):
                             return "ft"
                         if u in ("inch", "inches"):
                             return "in"
+
+                        # time
+                        if u in ("msec", "msecs", "millisecond", "milliseconds"):
+                            return "ms"
+                        if u in ("sec", "secs", "second", "seconds"):
+                            return "s"
+                        if u in ("min", "mins", "minute", "minutes"):
+                            return "min"
+                        if u in ("hr", "hrs", "hour", "hours"):
+                            return "h"
+                        if u in ("day", "days"):
+                            return "d"
+                        if u in ("wk", "wks", "week", "weeks"):
+                            return "wk"
+
+                        # age / longitudinal
+                        if u in ("yr", "yrs", "year", "years"):
+                            return "yr"
+                        if u in ("mo", "mos", "month", "months"):
+                            return "mo"
+
                         return u
 
                     for u in raw_units:
@@ -849,16 +893,32 @@ async def _run_full_profile(
                     # deterministic baseline (override later via env/config if desired)
                     "weight": "kg",
                     "length": "cm",
+                    "time": "ms",  # psych default for reaction times
+                    "age": "yr",
                 }
                 UNIT_KIND_BY_UNIT = {
-                    "kg": "weight", "lb": "weight",
+                    # weight
+                    "kg": "weight", "lb": "weight", "g": "weight", "mg": "weight",
+
+                    # length
                     "mm": "length", "cm": "length", "m": "length", "ft": "length", "in": "length",
+
+                    # time
+                    "ms": "time", "s": "time", "min": "time", "h": "time", "d": "time", "wk": "time",
+
+                    # age / longitudinal (kept as separate “age” kind to avoid accidental normalization to time)
+                    "yr": "age", "mo": "age",
                 }
                 UNIT_CONVERSIONS = {
                     # weight
                     ("lb", "kg"): {"factor": 0.45359237, "formula": "kg = lb * 0.45359237"},
                     ("kg", "lb"): {"factor": 1.0 / 0.45359237, "formula": "lb = kg / 0.45359237"},
-                    # length (optional but included for completeness)
+                    ("g", "kg"): {"factor": 0.001, "formula": "kg = g * 0.001"},
+                    ("mg", "kg"): {"factor": 0.000001, "formula": "kg = mg * 0.000001"},
+                    ("kg", "g"): {"factor": 1000.0, "formula": "g = kg * 1000"},
+                    ("kg", "mg"): {"factor": 1_000_000.0, "formula": "mg = kg * 1000000"},
+
+                    # length
                     ("mm", "cm"): {"factor": 0.1, "formula": "cm = mm * 0.1"},
                     ("cm", "mm"): {"factor": 10.0, "formula": "mm = cm * 10"},
                     ("m", "cm"): {"factor": 100.0, "formula": "cm = m * 100"},
@@ -869,6 +929,18 @@ async def _run_full_profile(
                     ("in", "ft"): {"factor": 1.0 / 12.0, "formula": "ft = in / 12"},
                     ("ft", "cm"): {"factor": 30.48, "formula": "cm = ft * 30.48"},
                     ("cm", "ft"): {"factor": 1.0 / 30.48, "formula": "ft = cm / 30.48"},
+
+                    # time (canonical default is ms)
+                    ("s", "ms"): {"factor": 1000.0, "formula": "ms = s * 1000"},
+                    ("min", "ms"): {"factor": 60_000.0, "formula": "ms = min * 60000"},
+                    ("h", "ms"): {"factor": 3_600_000.0, "formula": "ms = h * 3600000"},
+                    ("d", "ms"): {"factor": 86_400_000.0, "formula": "ms = d * 86400000"},
+                    ("wk", "ms"): {"factor": 604_800_000.0, "formula": "ms = wk * 604800000"},
+                    ("ms", "s"): {"factor": 0.001, "formula": "s = ms * 0.001"},
+
+                    # age (canonical default is yr)
+                    ("mo", "yr"): {"factor": 1.0 / 12.0, "formula": "yr = mo / 12"},
+                    ("yr", "mo"): {"factor": 12.0, "formula": "mo = yr * 12"},
                 }
 
                 def _pick_canonical_unit(units: Dict[str, int], threshold: float = 0.60) -> Optional[Dict[str, Any]]:
@@ -983,7 +1055,6 @@ async def _run_full_profile(
             year_range_pct = float(range_like.get("year_range_pct", 0.0))
             num_range_pct = float(range_like.get("numeric_range_pct", 0.0))
 
-
             def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
                 return max(lo, min(hi, x))
 
@@ -992,24 +1063,115 @@ async def _run_full_profile(
                 obj["confidence"] = round(float(score), 6)
                 candidates.append(obj)
 
+            # ---------------------------------------------------------
+            # Numeric-coded detection (binary codes, Likert-ish scales)
+            # ---------------------------------------------------------
+            # (Decision) Treat low-cardinality, strict-integer columns as potentially coded categories.
+            # Why it matters: prevents columns like sex=1/2 or Likert 1..5 from becoming "100% numeric".
+            coded_kind: Optional[str] = None  # "binary" | "scale" | None
+            coded_levels: Optional[List[int]] = None  # sorted integer levels if detected
+            coded_conf_cap_numeric = 1.0  # numeric confidence cap if coded
+
+            # Only attempt if column is small-cardinality AND strongly strict numeric AND not obviously "transform" numeric.
+            # We exclude currency/percent/thousands/suffix-unit because those are genuinely numeric transforms.
+            coded_candidate_gate = (
+                    (unique_count > 0 and unique_count <= max_cat) and
+                    (strict_pct >= 95.0) and
+                    ((currency_pct + suffix_pct) < 10.0) and
+                    (percent_pct < 10.0) and
+                    (thousands_pct < 10.0) and
+                    (suffix_unit_pct < 10.0)
+            )
+
+            if coded_candidate_gate:
+                # Build integer levels robustly (handles integer dtype, float dtype with .0, and numeric strings)
+                # Use existing levels if present; else compute.
+                raw_levels = col_info.get("levels")
+                levels_num: List[float] = []
+
+                if isinstance(raw_levels, list) and len(raw_levels) > 0:
+                    try:
+                        levels_num = [float(v) for v in raw_levels]
+                    except Exception:
+                        levels_num = []
+                else:
+                    try:
+                        # deterministic: use dropna uniques
+                        vals = s.dropna().unique().tolist()
+                        levels_num = [float(v) for v in vals]
+                    except Exception:
+                        levels_num = []
+
+                # Keep only integer-like values (e.g., 1.0 is ok; 1.2 is not)
+                int_like = []
+                for x in levels_num:
+                    if x is None:
+                        continue
+                    try:
+                        if abs(float(x) - round(float(x))) < 1e-9:
+                            int_like.append(int(round(float(x))))
+                    except Exception:
+                        continue
+
+                int_like = sorted(set(int_like))
+
+                # If most uniques are integer-like, we can reason about coding patterns.
+                if len(int_like) == unique_count and unique_count >= 2:
+                    lo, hi = int_like[0], int_like[-1]
+                    span = hi - lo
+
+                    # Binary code patterns commonly seen in surveys / datasets
+                    if unique_count == 2 and int_like in ([0, 1], [1, 2], [-1, 1]):
+                        coded_kind = "binary"
+                        coded_levels = int_like
+                        coded_conf_cap_numeric = 0.75
+
+                    # Likert-ish / bounded scale patterns (3–11 levels, small contiguous-ish span)
+                    # Examples: 1..5, 1..7, 0..10, 0..4
+                    elif 3 <= unique_count <= 11 and 2 <= span <= 12:
+                        # contiguous if unique_count == span+1; allow at most 1 missing level
+                        missing_levels = (span + 1) - unique_count
+                        if missing_levels in (0, 1):
+                            coded_kind = "scale"
+                            coded_levels = int_like
+                            coded_conf_cap_numeric = 0.70
+
+                    # Generic low-card integer coding (fallback): small set + small span
+                    # Example: category codes 1..8 (not necessarily Likert, but categorical-coded is plausible)
+                    elif unique_count <= 15 and span <= 20:
+                        coded_kind = "coded_category"
+                        coded_levels = int_like
+                        coded_conf_cap_numeric = 0.78
+
             # Numeric candidates
             if strict_pct >= 80.0:
 
-                # If a small suffix-multiplier minority exists (e.g., "1.6K"), record that explicitly.
+                # If a small suffix-multiplier minority exists (e.g. "1.6K"), record that explicitly.
                 # This prevents downstream systems from assuming "strict-only".
                 parse_mode = "strict"
                 if suffix_multiplier_pct > 0.0:
                     parse_mode = "strict_with_suffix_minority"
 
-                add_candidate(strict_pct / 100.0, {
+                # Apply coded confidence cap so "coded" cannot dominate as 1.0 numeric.
+                base_numeric_conf = strict_pct / 100.0
+                if coded_kind is not None:
+                    base_numeric_conf = min(base_numeric_conf, coded_conf_cap_numeric)
+
+                add_candidate(base_numeric_conf, {
                     "type": "numeric",
                     "parse": parse_mode,
                     "evidence": {
                         "strict_pct": strict_pct,
                         "suffix_multiplier_pct": suffix_multiplier_pct,
                         "suffix_pct": suffix_pct,
+
+                        # expose coded detection for auditability + downstream routing
+                        "coded_kind": coded_kind,
+                        "coded_levels": coded_levels,
+                        "coded_numeric_conf_cap": coded_conf_cap_numeric,
                     }
                 })
+
             if (currency_pct + suffix_pct) >= 10.0:
                 add_candidate(min(0.95, (currency_pct + suffix_pct) / 100.0 + 0.1), {
                     "type": "numeric",
@@ -1139,22 +1301,41 @@ async def _run_full_profile(
             num_dom_est = max(strict_pct, currency_pct + suffix_pct, percent_pct, thousands_pct)  # pct scale 0..100
             is_numericish = (strict_pct >= 80.0) or ((currency_pct + suffix_pct) >= 10.0) or (percent_pct >= 10.0) or (thousands_pct >= 10.0)
 
-            if is_low_card and (not is_multiish) and (not is_rangeish) and (not is_dateish) and (not is_numericish):
-                # Confidence increases as uniques approach 2-5 and missingness is low
-                # Map uniques: 2->1.0, 5->0.8, max_cat->0.3 (monotonic decreasing)
-                if unique_count <= 1:
-                    uniq_score = 0.2
-                elif unique_count <= 2:
-                    uniq_score = 1.0
-                elif unique_count <= 5:
-                    uniq_score = 0.8
-                else:
-                    # linear falloff to 0.3 at max_cat
-                    uniq_score = 0.8 - (0.5 * ((unique_count - 5) / max(1, (max_cat - 5))))
-                    uniq_score = _clamp(uniq_score, 0.3, 0.8)
+            # Allow categorical even if numericish when we have strong coded evidence (binary / scale / coded_category).
+            # (Decision) If coded_kind is set, treat as categorical-coded even though values are numeric.
+            # Why it matters: fixes sex=1/2 and Likert 1..5 being blocked by is_numericish.
+            if is_low_card and (not is_multiish) and (not is_rangeish) and (not is_dateish) and ((not is_numericish) or (coded_kind is not None)):
 
-                miss_penalty = _clamp(1.0 - (missing_pct / 100.0), 0.0, 1.0)
-                cat_conf = _clamp(0.15 + 0.85 * uniq_score * miss_penalty, 0.0, 0.99)
+                # Confidence should be HIGH for "clear" categoricals (2–5 uniques) to avoid review spam.
+                # (Decision) Make confidence scale inversely with unique_count much more steeply at the low end.
+                # Why it matters: columns like W/F, SM, A/W should not be reviewed by default.
+                if unique_count <= 1:
+                    uniq_score = 0.10
+                elif unique_count == 2:
+                    uniq_score = 1.00
+                elif unique_count == 3:
+                    uniq_score = 0.98
+                elif unique_count == 4:
+                    uniq_score = 0.96
+                elif unique_count == 5:
+                    uniq_score = 0.94
+                elif unique_count <= 8:
+                    uniq_score = 0.88
+                else:
+                    # Smooth falloff toward 0.55 by max_cat (still allows categorical, but less “certain”)
+                    uniq_score = 0.88 - (0.33 * ((unique_count - 8) / max(1, (max_cat - 8))))
+                    uniq_score = _clamp(uniq_score, 0.55, 0.88)
+
+                # Missingness penalty: light penalty until 20%, then steeper.
+                mp = missing_pct / 100.0
+                if mp <= 0.20:
+                    miss_penalty = 1.0 - 0.25 * (mp / 0.20)  # down to 0.75 at 20%
+                else:
+                    miss_penalty = 0.75 - 0.75 * ((mp - 0.20) / 0.80)  # down to ~0 at 100%
+                miss_penalty = _clamp(miss_penalty, 0.0, 1.0)
+
+                # Lift the floor so clean low-card categoricals exceed 0.90
+                cat_conf = _clamp(0.25 + 0.75 * uniq_score * miss_penalty, 0.0, 0.99)
 
                 add_candidate(cat_conf, {
                     "type": "categorical",
@@ -1264,25 +1445,71 @@ async def _run_full_profile(
             candidates.sort(key=lambda x: x.get("confidence", 0.0), reverse=True)
             col_info["candidates"] = candidates
 
-            # Review recommendation: if ambiguous, explicitly flag to call /profile_column_detail
-            top_conf = float((candidates[0].get("confidence") if candidates else 0.0) or 0.0)
-            second_conf = float((candidates[1].get("confidence") if len(candidates) > 1 else 0.0) or 0.0)
+            # Review recommendation:
+            # (Decision) If the top candidate requires *any* transformation (parse/split/normalize), always require review.
+            # Why it matters: guarantees downstream does not silently apply the wrong normalization.
+            top = candidates[0] if candidates else {}
+            second = candidates[1] if len(candidates) > 1 else {}
+
+            top_conf = float((top.get("confidence") if top else 0.0) or 0.0)
+            second_conf = float((second.get("confidence") if second else 0.0) or 0.0)
             conf_gap = top_conf - second_conf
 
-            review_recommended = (top_conf < 0.90) or (conf_gap < 0.15)
+            top_type = str(top.get("type") or "")
+            top_parse = top.get("parse")
+            top_op = top.get("op")
+
+            def _top_requires_transform(ttype: str, parse: Any, op: Any) -> Tuple[bool, str]:
+                # Operations always imply transform (splitting, etc.)
+                if op:
+                    return True, "op_requires_transform"
+
+                # Type-based transforms
+                if ttype in ("numeric_with_unit", "categorical_multi", "range_like", "date"):
+                    return True, f"type_requires_transform:{ttype}"
+
+                # Parse-based transforms (numeric parsing modes beyond strict)
+                # Include strict_with_suffix_minority because it signals mixed numeric conventions in the column.
+                if parse in ("currency+suffix_possible", "percent_possible", "thousands_sep_possible",
+                             "strict_with_suffix_minority"):
+                    return True, f"parse_requires_transform:{parse}"
+
+                return False, "none"
+
+            requires_transform, transform_reason = _top_requires_transform(top_type, top_parse, top_op)
+
+            # Default ambiguity-based review (your existing rule)
+            # (Decision) If top is a strong low-card categorical, do not trigger review due to a small gap alone.
+            # Why it matters: avoids review spam on stable enums where the second-best is often "text".
+            clear_categorical_no_review = (
+                    (top_type == "categorical") and
+                    (unique_count > 0 and unique_count <= max_cat) and
+                    (top_conf >= 0.90) and
+                    (not top_op) and
+                    (top_parse == "levels")
+            )
+
+            ambiguous_review = (top_conf < 0.90) or ((conf_gap < 0.15) and (not clear_categorical_no_review))
+
+            # Force review if transformation is required, else fall back to ambiguity rule
+            review_recommended = bool(requires_transform or ambiguous_review)
+
+            # Prefer a specific transform reason when applicable
+            reason = transform_reason
+            if reason == "none":
+                reason = (
+                    "low_top_confidence" if top_conf < 0.90
+                    else "small_gap_between_top_candidates" if conf_gap < 0.15
+                    else "none"
+                )
 
             col_info["review"] = {
                 "recommended": bool(review_recommended),
                 "top_confidence": round(top_conf, 6),
                 "second_confidence": round(second_conf, 6),
                 "confidence_gap": round(conf_gap, 6),
-                "reason": (
-                    "low_top_confidence" if top_conf < 0.90
-                    else "small_gap_between_top_candidates" if conf_gap < 0.15
-                    else "none"
-                ),
+                "reason": reason,
             }
-
 
             # -----------------------------
             # Step 5 — Outlier visibility & parseability (numeric/date)
