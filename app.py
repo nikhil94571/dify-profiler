@@ -2130,6 +2130,182 @@ async def evidence_associations(
         return None
 
     # -----------------------------
+    # 3b) Key / grain evidence + time structure evidence (deterministic)
+    # -----------------------------
+    # (Decision) Emit “grain” candidates as evidence signals.
+    # Why it matters: it prevents reshape steps that duplicate or collapse records incorrectly.
+    #
+    # (Decision) Detect time structure before reshape planning.
+    # Why it matters: long format often needs (id, time, measure) not just (id, measure).
+
+    def _is_idish_name(col: str) -> bool:
+        cl = _norm_name(col)
+        return any(k in cl for k in ["id", "uuid", "guid", "respondent", "subject", "participant", "record", "case"])
+
+    def _col_uniqueness_stats(s: pd.Series) -> Dict[str, Any]:
+        nn = int(s.notna().sum())
+        nu = int(s.nunique(dropna=True))
+        uniq_ratio = float(nu / nn) if nn > 0 else 0.0
+        dup_rows = int(s.dropna().duplicated().sum()) if nn > 0 else 0
+        return {
+            "non_null": nn,
+            "n_unique": nu,
+            "uniq_ratio": uniq_ratio,
+            "dup_rows": dup_rows,
+            "n_rows": int(len(s)),
+            "non_null_rate": float(nn / len(s)) if len(s) else 0.0,
+        }
+
+    # --- Candidate primary key (single col) ---
+    # heuristic: high uniqueness + decent coverage; prefer id-ish names
+    pk_candidates: List[Tuple[float, str, Dict[str, Any]]] = []
+    for c in df.columns:
+        s = df[c]
+        st = _col_uniqueness_stats(s)
+        if st["non_null"] < ASSOC_MIN_OVERLAP:
+            continue
+        # allow either: extremely unique, or reasonably unique with id-ish name
+        score = st["uniq_ratio"]
+        if score >= 0.98 or (score >= 0.95 and _is_idish_name(c)):
+            # mild boost for id-ish names
+            boosted = score + (0.02 if _is_idish_name(c) else 0.0)
+            pk_candidates.append((boosted, c, st))
+
+    pk_candidates.sort(key=lambda t: t[0], reverse=True)
+    for boosted, c, st in pk_candidates[:5]:
+        _add_signal(
+            signals,
+            kind="candidate_primary_key",
+            columns=[c],
+            score=float(min(1.0, st["uniq_ratio"])),
+            metric="uniq_ratio",
+            evidence={
+                **st,
+                "idish_name": bool(_is_idish_name(c)),
+            },
+        )
+        _add_signal(
+            signals,
+            kind="duplicate_rows_rate_under_key",
+            columns=[c],
+            score=float(st["dup_rows"] / len(df)) if len(df) else 0.0,
+            metric="dup_rows_rate",
+            evidence={
+                "key_cols": [c],
+                "dup_rows": int(st["dup_rows"]),
+                "dup_rows_rate": float(st["dup_rows"] / len(df)) if len(df) else 0.0,
+                "n_rows": int(len(df)),
+            },
+        )
+
+    # --- Candidate composite key (pairs), bounded search ---
+    # Choose top 20 "id-ish or near-unique" columns, then test pairwise uniqueness.
+    id_like_pool: List[Tuple[float, str]] = []
+    for c in df.columns:
+        st = _col_uniqueness_stats(df[c])
+        if st["non_null"] < ASSOC_MIN_OVERLAP:
+            continue
+        score = st["uniq_ratio"]
+        if score >= 0.90 or _is_idish_name(c):
+            id_like_pool.append((score + (0.02 if _is_idish_name(c) else 0.0), c))
+
+    id_like_pool.sort(key=lambda t: t[0], reverse=True)
+    id_like_cols = [c for _, c in id_like_pool[:20]]
+
+    comp_pairs: List[Tuple[float, Tuple[str, str], Dict[str, Any]]] = []
+    for i in range(len(id_like_cols)):
+        for j in range(i + 1, len(id_like_cols)):
+            a = id_like_cols[i]
+            b = id_like_cols[j]
+            sa = df[a]
+            sb = df[b]
+            mask = sa.notna() & sb.notna()
+            n = int(mask.sum())
+            if n < ASSOC_MIN_OVERLAP:
+                continue
+            # composite uniqueness among rows with both present
+            key_df = pd.DataFrame({"a": sa[mask].astype("string"), "b": sb[mask].astype("string")})
+            n_unique = int(key_df.dropna().drop_duplicates().shape[0])
+            uniq_ratio = float(n_unique / n) if n else 0.0
+            dup_rows = int(n - n_unique)
+            if uniq_ratio >= 0.98:
+                comp_pairs.append((
+                    uniq_ratio,
+                    (a, b),
+                    {
+                        "key_cols": [a, b],
+                        "n": n,
+                        "n_unique": n_unique,
+                        "uniq_ratio": uniq_ratio,
+                        "dup_rows": dup_rows,
+                        "dup_rows_rate": float(dup_rows / n) if n else 0.0,
+                    }
+                ))
+
+    comp_pairs.sort(key=lambda t: t[0], reverse=True)
+    for uniq_ratio, (a, b), ev in comp_pairs[:10]:
+        _add_signal(
+            signals,
+            kind="candidate_composite_key",
+            columns=[a, b],
+            score=float(uniq_ratio),
+            metric="uniq_ratio",
+            evidence=ev,
+        )
+        _add_signal(
+            signals,
+            kind="duplicate_rows_rate_under_key",
+            columns=[a, b],
+            score=float(ev["dup_rows_rate"]),
+            metric="dup_rows_rate",
+            evidence=ev,
+        )
+
+    # --- Time column candidates ---
+    time_candidates: List[Tuple[float, str, Dict[str, Any]]] = []
+    for c in df.columns:
+        sdt, pct = _to_datetime_series(df[c])
+        if pct < 60.0:
+            continue
+        nn = int(sdt.notna().sum())
+        if nn < ASSOC_MIN_OVERLAP:
+            continue
+
+        # monotonic-ish score on consecutive non-null pairs in original row order
+        sdt_non = sdt.dropna()
+        mono_rate = 0.0
+        if len(sdt_non) >= 3:
+            diffs = sdt_non.diff().dropna()
+            if len(diffs) > 0:
+                nonneg = float((diffs >= pd.Timedelta(0)).mean())
+                nonpos = float((diffs <= pd.Timedelta(0)).mean())
+                mono_rate = max(nonneg, nonpos)
+
+        # combine parse success + monotonic-ish (bounded to [0,1])
+        score = (pct / 100.0) * 0.7 + mono_rate * 0.3
+        time_candidates.append((
+            score,
+            c,
+            {
+                "parse_success_pct": float(pct),
+                "non_null": nn,
+                "non_null_rate": float(nn / len(df)) if len(df) else 0.0,
+                "monotonic_rate": float(mono_rate),
+            }
+        ))
+
+    time_candidates.sort(key=lambda t: t[0], reverse=True)
+    for score, c, ev in time_candidates[:5]:
+        _add_signal(
+            signals,
+            kind="time_col_candidate",
+            columns=[c],
+            score=float(min(1.0, score)),
+            metric="time_candidate_score",
+            evidence=ev,
+        )
+
+    # -----------------------------
     # 4) Dependency checks (name-heuristic, deterministic)
     # -----------------------------
     name_map = {_norm_name(c): c for c in df.columns}
@@ -2172,7 +2348,6 @@ async def evidence_associations(
                 rhs = tot_num[mask].astype("float64")
                 diff = (lhs - rhs).abs()
 
-                # abs + relative tolerance
                 rel = (diff / (rhs.abs() + 1e-9))
                 ok = (diff <= ASSOC_TOL_ABS) | (rel <= ASSOC_TOL_REL)
                 ok_rate = float(ok.mean()) if n else 0.0
@@ -2192,7 +2367,7 @@ async def evidence_associations(
                     },
                 )
 
-    # 4b) end_date >= start_date
+    # 4b) start/end pairing evidence (end >= start)
     start_cols = _find_any(["start_date", "start", "begin", "from_date"])
     end_cols = _find_any(["end_date", "end", "finish", "to_date"])
 
@@ -2215,19 +2390,51 @@ async def evidence_associations(
 
             _add_signal(
                 signals,
-                kind="dependency_check",
+                kind="start_end_pair_check",
                 columns=[sc, ec],
                 score=ok_rate,
-                metric="pct_rows_with_end_date_ge_start_date",
+                metric="pct_end_ge_start",
                 evidence={
                     "n": n,
                     "ok_rate": ok_rate,
                     "parse_success_pct": {"start": spct, "end": epct},
                 },
             )
-    # 4c) Survey scale totals ≈ sum(items), e.g. HOP.total ≈ HOP1.r + ... + HOP7.r
-    # (Decision) Use stem rules for *.r item columns, because survey datasets rarely use subtotal/tax style names.
-    # Why it matters: this is the strongest deterministic evidence of derived columns in psych instruments.
+
+    # 4c) id_time_duplicates: multiple records per id per time (if we have both candidates)
+    # choose the strongest pk candidate (if any) and strongest time candidate (if any)
+    best_pk = pk_candidates[0][1] if pk_candidates else None
+    best_time = time_candidates[0][1] if time_candidates else None
+    if best_pk and best_time:
+        s_id = df[best_pk].astype("string")
+        tdt, tpct = _to_datetime_series(df[best_time])
+        mask = s_id.notna() & tdt.notna()
+        n = int(mask.sum())
+        if n >= ASSOC_MIN_OVERLAP:
+            tmp = pd.DataFrame({"id": s_id[mask], "t": tdt[mask]})
+            # duplicates on (id,t)
+            dup_mask = tmp.duplicated(subset=["id", "t"], keep=False)
+            n_dup_rows = int(dup_mask.sum())
+            rate = float(n_dup_rows / n) if n else 0.0
+            _add_signal(
+                signals,
+                kind="id_time_duplicates",
+                columns=[best_pk, best_time],
+                score=rate,
+                metric="dup_rows_rate_in_id_time",
+                evidence={
+                    "id_col": best_pk,
+                    "time_col": best_time,
+                    "n": n,
+                    "dup_rows": n_dup_rows,
+                    "dup_rows_rate": rate,
+                    "time_parse_success_pct": float(tpct),
+                },
+            )
+
+    # 4d) Survey scale totals: choose best-fitting aggregate rule (sum / mean / scaled_sum)
+    # (Decision) Emit “best-fitting aggregate rule” rather than just sum pass/fail.
+    # Why it matters: avoids throwing away real derived totals that aren’t sums.
     items_by_stem: Dict[str, List[str]] = {}
     for c in df.columns:
         stem = _stem_for_items(c)
@@ -2242,14 +2449,12 @@ async def evidence_associations(
         if not total_col:
             continue
 
-        # deterministic ordering: numeric sort by item index
         def _item_key(cname: str) -> int:
-            m = re.match(r"^.+?(\d+)\.r$", str(cname))
+            m = re.match(r"^.+?(\\d+)\\.r$", str(cname))
             return int(m.group(1)) if m else 10 ** 9
 
         item_cols_sorted = sorted(item_cols, key=_item_key)
 
-        # parse items and total numeric
         item_nums = []
         min_parse = 100.0
         for ic in item_cols_sorted:
@@ -2275,29 +2480,66 @@ async def evidence_associations(
         if n < ASSOC_MIN_OVERLAP:
             continue
 
-        lhs = sum_items[mask]
         rhs = tot_num[mask].astype("float64")
-        diff = (lhs - rhs).abs()
-        rel = (diff / (rhs.abs() + 1e-9))
-        ok = (diff <= ASSOC_TOL_ABS) | (rel <= ASSOC_TOL_REL)
-        ok_rate = float(ok.mean()) if n else 0.0
+        k = float(len(item_cols_sorted))
+
+        # hypotheses
+        lhs_sum = sum_items[mask]
+        lhs_mean = lhs_sum / k if k > 0 else lhs_sum
+
+        # scaled_sum: choose a robust scalar that best maps sum -> total (median ratio)
+        scale = None
+        lhs_for_scale = lhs_sum.copy()
+        denom_mask = lhs_for_scale.notna() & rhs.notna() & (lhs_for_scale.abs() > 1e-12)
+        if int(denom_mask.sum()) >= ASSOC_MIN_OVERLAP:
+            ratios = (rhs[denom_mask] / lhs_for_scale[denom_mask]).astype("float64")
+            try:
+                scale = float(ratios.median())
+            except Exception:
+                scale = None
+        lhs_scaled = (lhs_sum * scale) if (scale is not None) else None
+
+        def _ok_rate(lhs: pd.Series) -> float:
+            diff = (lhs - rhs).abs()
+            rel = (diff / (rhs.abs() + 1e-9))
+            ok = (diff <= ASSOC_TOL_ABS) | (rel <= ASSOC_TOL_REL)
+            return float(ok.mean()) if n else 0.0
+
+        ok_sum = _ok_rate(lhs_sum)
+        ok_mean = _ok_rate(lhs_mean)
+        ok_scaled = _ok_rate(lhs_scaled) if lhs_scaled is not None else -1.0
+
+        candidates = [
+            ("sum", ok_sum),
+            ("mean", ok_mean),
+        ]
+        if lhs_scaled is not None:
+            candidates.append(("scaled_sum", ok_scaled))
+
+        best_rule, best_ok = max(candidates, key=lambda t: t[1])
+
+        evidence = {
+            "stem": stem,
+            "n": n,
+            "tol_abs": ASSOC_TOL_ABS,
+            "tol_rel": ASSOC_TOL_REL,
+            "parse_success_floor_pct": float(min_parse),
+            "total_col": total_col,
+            "item_cols": item_cols_sorted,
+            "ok_rates": {"sum": float(ok_sum), "mean": float(ok_mean),
+                         "scaled_sum": float(ok_scaled) if lhs_scaled is not None else None},
+            "best_rule": best_rule,
+            "best_ok_rate": float(best_ok),
+            "scaled_sum_factor": float(scale) if scale is not None else None,
+        }
 
         _add_signal(
             signals,
             kind="dependency_check",
             columns=item_cols_sorted + [total_col],
-            score=ok_rate,
-            metric="pct_rows_with_total_eq_sum_items",
-            evidence={
-                "stem": stem,
-                "n": n,
-                "ok_rate": ok_rate,
-                "tol_abs": ASSOC_TOL_ABS,
-                "tol_rel": ASSOC_TOL_REL,
-                "parse_success_floor_pct": min_parse,
-                "total_col": total_col,
-                "item_cols": item_cols_sorted,
-            },
+            score=float(best_ok),
+            metric="best_fitting_aggregate_rule_ok_rate",
+            evidence=evidence,
         )
 
     return {
