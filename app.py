@@ -56,6 +56,19 @@ EXAMPLES_PER_PATTERN = int(os.getenv("EXAMPLES_PER_PATTERN", "5"))
 RARE_EXAMPLES_MAX = int(os.getenv("RARE_EXAMPLES_MAX", "10"))
 EXTREMES_N = int(os.getenv("EXTREMES_N", "5"))
 
+# -----------------------------
+# Association/Dependency evidence limits (Dify-safe)
+# -----------------------------
+ASSOC_MAX_ROWS = int(os.getenv("ASSOC_MAX_ROWS", "50000"))                 # cap rows scanned
+ASSOC_TOP_K_PAIRS = int(os.getenv("ASSOC_TOP_K_PAIRS", "40"))              # top pairs returned
+ASSOC_MAX_NUMERIC_COLS = int(os.getenv("ASSOC_MAX_NUMERIC_COLS", "30"))    # cap numeric cols for pairwise corr
+ASSOC_MAX_CAT_COLS = int(os.getenv("ASSOC_MAX_CAT_COLS", "30"))            # cap categorical cols for pairwise assoc
+ASSOC_MAX_CAT_CARD = int(os.getenv("ASSOC_MAX_CAT_CARD", "50"))            # max unique values for categorical assoc
+ASSOC_MIN_OVERLAP = int(os.getenv("ASSOC_MIN_OVERLAP", "40"))              # min non-null overlap for pairwise stats
+ASSOC_TOL_ABS = float(os.getenv("ASSOC_TOL_ABS", "0.01"))                  # tolerance for arithmetic identity checks
+ASSOC_TOL_REL = float(os.getenv("ASSOC_TOL_REL", "0.005"))                 # relative tolerance for arithmetic checks
+
+
 # Missing-like tokens (Step 2)
 MISSING_LIKE_TOKENS = [
     "N/A", "NA", "null", "None", "", "-", "—", "?", "Unknown"
@@ -133,7 +146,7 @@ async def request_logging(request: Request, call_next):
 
 @app.middleware("http")
 async def limit_upload_size(request: Request, call_next):
-    if request.url.path in ("/profile", "/profile_summary", "/profile_column_detail") and request.method.upper() == "POST":
+    if request.url.path in ("/profile", "/profile_summary", "/profile_column_detail", "/evidence_associations") and request.method.upper() == "POST":
         cl = request.headers.get("content-length")
         if cl is not None:
             try:
@@ -146,7 +159,7 @@ async def limit_upload_size(request: Request, call_next):
 
 @app.middleware("http")
 async def basic_rate_limit(request: Request, call_next):
-    if request.url.path in ("/profile", "/profile_summary", "/profile_column_detail") and request.method.upper() == "POST":
+    if request.url.path in ("/profile", "/profile_summary", "/profile_column_detail", "/evidence_associations") and request.method.upper() == "POST":
         ip = _client_ip(request)
         now = time.time()
         q = _req_times[ip]
@@ -395,6 +408,10 @@ async def _run_full_profile(
     file: UploadFile,
     dataset_id: str,
     max_categorical_cardinality: int,
+    *,
+    include_samples: bool = True,
+    include_pattern_examples: bool = True,
+    include_deep_profiles: bool = True,
 ) -> Dict[str, Any]:
     logger.info(json.dumps({
         "event": "profile_start",
@@ -524,57 +541,58 @@ async def _run_full_profile(
                 col_info["levels"] = levels
 
             # -----------------------------
-            # Step 1 — Value sampling per column
+            # Step 1 — Value sampling per column (optional)
             # -----------------------------
-            s_non_na = _non_null_series(s)
-            s_non_na_str = _as_str_series(s_non_na)
+            if include_samples:
+                s_non_na = _non_null_series(s)
+                s_non_na_str = _as_str_series(s_non_na)
 
-            # Deterministic head/tail of non-null values
-            head_vals = s_non_na_str.head(SAMPLE_SIZE_HEAD)
-            tail_vals = s_non_na_str.tail(SAMPLE_SIZE_TAIL)
+                # Deterministic head/tail of non-null values
+                head_vals = s_non_na_str.head(SAMPLE_SIZE_HEAD)
+                tail_vals = s_non_na_str.tail(SAMPLE_SIZE_TAIL)
 
-            # Deterministic random sample (seeded by dataset hash + col name)
-            seed = _stable_int_seed(dataset_sha256, col)
-            if len(s_non_na_str) > 0:
-                rnd_n = min(SAMPLE_SIZE_RANDOM, len(s_non_na_str))
-                random_vals = s_non_na_str.sample(n=rnd_n, random_state=seed)
-            else:
-                random_vals = s_non_na_str
+                # Deterministic random sample (seeded by dataset hash + col name)
+                seed = _stable_int_seed(dataset_sha256, col)
+                if len(s_non_na_str) > 0:
+                    rnd_n = min(SAMPLE_SIZE_RANDOM, len(s_non_na_str))
+                    random_vals = s_non_na_str.sample(n=rnd_n, random_state=seed)
+                else:
+                    random_vals = s_non_na_str
 
-            # Top frequent values (counts) from non-null stringified values
-            vc = s_non_na_str.value_counts(dropna=False)
-            top_vc = vc.head(TOP_K_FREQUENT)
+                # Top frequent values (counts) from non-null stringified values
+                vc = s_non_na_str.value_counts(dropna=False)
+                top_vc = vc.head(TOP_K_FREQUENT)
 
-            top_frequent = [
-                {"value": _stringify_value(idx), "count": int(cnt)}
-                for idx, cnt in top_vc.items()
-            ]
+                top_frequent = [
+                    {"value": _stringify_value(idx), "count": int(cnt)}
+                    for idx, cnt in top_vc.items()
+                ]
 
-            # Rare examples: values that occur once
-            rare_vals = vc[vc == 1].index.to_series()
-            rare_examples = [_stringify_value(v) for v in rare_vals.head(RARE_EXAMPLES_MAX).tolist()]
-            rare_examples = [v for v in rare_examples if v is not None]
+                # Rare examples: values that occur once
+                rare_vals = vc[vc == 1].index.to_series()
+                rare_examples = [_stringify_value(v) for v in rare_vals.head(RARE_EXAMPLES_MAX).tolist()]
+                rare_examples = [v for v in rare_examples if v is not None]
 
-            # String length stats (on non-null stringified original values, before truncation)
-            if len(s_non_na_str) > 0:
-                lens = s_non_na_str.str.len()
-                p95 = float(lens.quantile(0.95)) if len(lens) else None
-                col_info["string_length_stats"] = {
-                    "min": int(lens.min()) if len(lens) else None,
-                    "median": float(lens.median()) if len(lens) else None,
-                    "p95": p95,
-                    "max": int(lens.max()) if len(lens) else None,
+                # String length stats
+                if len(s_non_na_str) > 0:
+                    lens = s_non_na_str.str.len()
+                    p95 = float(lens.quantile(0.95)) if len(lens) else None
+                    col_info["string_length_stats"] = {
+                        "min": int(lens.min()) if len(lens) else None,
+                        "median": float(lens.median()) if len(lens) else None,
+                        "p95": p95,
+                        "max": int(lens.max()) if len(lens) else None,
+                    }
+                else:
+                    col_info["string_length_stats"] = {"min": None, "median": None, "p95": None, "max": None}
+
+                col_info["samples"] = {
+                    "head": [_stringify_value(v) for v in head_vals.tolist()],
+                    "tail": [_stringify_value(v) for v in tail_vals.tolist()],
+                    "random": [_stringify_value(v) for v in random_vals.tolist()],
+                    "top_frequent": top_frequent,
+                    "rare_examples": rare_examples,
                 }
-            else:
-                col_info["string_length_stats"] = {"min": None, "median": None, "p95": None, "max": None}
-
-            col_info["samples"] = {
-                "head": [_stringify_value(v) for v in head_vals.tolist()],
-                "tail": [_stringify_value(v) for v in tail_vals.tolist()],
-                "random": [_stringify_value(v) for v in random_vals.tolist()],
-                "top_frequent": top_frequent,
-                "rare_examples": rare_examples,
-            }
 
             # -----------------------------
             # Step 2 — Missing-like token detection
@@ -733,19 +751,21 @@ async def _run_full_profile(
                         cu = _canon_unit(str(u))
                         units_detected[cu] = units_detected.get(cu, 0) + 1
 
-                numeric_like_examples = {
-                    "strict": _take_examples(scan_series[strict_mask], EXAMPLES_PER_PATTERN),
-                    "currency_prefixed": _take_examples(scan_series[currency_mask], EXAMPLES_PER_PATTERN),
+                if include_pattern_examples:
+                    numeric_like_examples = {
+                        "strict": _take_examples(scan_series[strict_mask], EXAMPLES_PER_PATTERN),
+                        "currency_prefixed": _take_examples(scan_series[currency_mask], EXAMPLES_PER_PATTERN),
 
-                    "suffix_multiplier": _take_examples(scan_series[suffix_mult_mask], EXAMPLES_PER_PATTERN),
-                    "suffix_unit": _take_examples(scan_series[unit_suffix_mask], EXAMPLES_PER_PATTERN),
+                        "suffix_multiplier": _take_examples(scan_series[suffix_mult_mask], EXAMPLES_PER_PATTERN),
+                        "suffix_unit": _take_examples(scan_series[unit_suffix_mask], EXAMPLES_PER_PATTERN),
 
-                    "percent": _take_examples(scan_series[percent_mask], EXAMPLES_PER_PATTERN),
-                    "thousands_sep": _take_examples(scan_series[thousands_mask], EXAMPLES_PER_PATTERN),
-                    "parens_negative": _take_examples(scan_series[parens_mask], EXAMPLES_PER_PATTERN),
-                    "bool_like": _take_examples(scan_series[bool_mask], EXAMPLES_PER_PATTERN),
-                }
-
+                        "percent": _take_examples(scan_series[percent_mask], EXAMPLES_PER_PATTERN),
+                        "thousands_sep": _take_examples(scan_series[thousands_mask], EXAMPLES_PER_PATTERN),
+                        "parens_negative": _take_examples(scan_series[parens_mask], EXAMPLES_PER_PATTERN),
+                        "bool_like": _take_examples(scan_series[bool_mask], EXAMPLES_PER_PATTERN),
+                    }
+                else:
+                    numeric_like_examples = {}
 
                 # Date-like patterns and parse attempt
                 iso_mask = scan_series.str.match(RE_ISO_DATE, na=False)
@@ -754,9 +774,11 @@ async def _run_full_profile(
                 parsed_dt, success_dt, policy = _try_parse_date_for_profile(scan_series)
                 parse_success_pct = _pct(int(success_dt.sum()), scan_n)
 
-                # Failure examples
-                failures = scan_series[~success_dt]
-                parse_failure_examples = _take_examples(failures, EXAMPLES_PER_PATTERN)
+                if include_pattern_examples:
+                    failures = scan_series[~success_dt]
+                    parse_failure_examples = _take_examples(failures, EXAMPLES_PER_PATTERN)
+                else:
+                    parse_failure_examples = []
 
                 date_like = {
                     "iso_pct": _pct(int(iso_mask.sum()), scan_n),
@@ -803,27 +825,30 @@ async def _run_full_profile(
                         max_tokens = int(token_counts.max()) if scan_n else 0
                         best_tokens_stats = (avg_tokens, max_tokens)
 
-                        # Build vocab top-k from multi-valued rows only
-                        tokens_flat: List[str] = []
-                        for lst in token_lists[multi_mask].tolist():
-                            if not isinstance(lst, list):
-                                continue
-                            for tok in lst:
-                                tok2 = str(tok).strip()
-                                if tok2:
-                                    tokens_flat.append(tok2)
+                        # Build vocab top-k from multi-valued rows only (optional)
+                        # When include_pattern_examples=False (e.g., /profile_summary), skip this to reduce runtime.
+                        if include_pattern_examples:
+                            tokens_flat: List[str] = []
+                            for lst in token_lists[multi_mask].tolist():
+                                if not isinstance(lst, list):
+                                    continue
+                                for tok in lst:
+                                    tok2 = str(tok).strip()
+                                    if tok2:
+                                        tokens_flat.append(tok2)
 
-                        if tokens_flat:
-                            tok_series = pd.Series(tokens_flat, dtype="string")
-                            tok_vc = tok_series.value_counts().head(TOP_K_FREQUENT)
-                            best_vocab = [{"token": _truncate(str(k), MAX_STRING_LEN), "count": int(v)} for k, v in tok_vc.items()]
+                            if tokens_flat:
+                                tok_series = pd.Series(tokens_flat, dtype="string")
+                                tok_vc = tok_series.value_counts().head(TOP_K_FREQUENT)
+                                best_vocab = [{"token": _truncate(str(k), MAX_STRING_LEN), "count": int(v)} for k, v in
+                                              tok_vc.items()]
+                            else:
+                                best_vocab = []
                         else:
                             best_vocab = []
 
                 # Token vocab size + delimiter presence + token-shape evidence for the chosen delimiter.
-                # This is critical for fields like Positions, where:
-                # - combinations can be highly unique (unique_count high)
-                # - but the underlying token set is small + code-like
+                # This is critical for fields like Positions, but it's expensive. For /profile_summary, skip it.
                 token_vocab_size = 0
                 delimiter_presence_pct = 0.0
                 token_shape_pct = 0.0
@@ -835,24 +860,25 @@ async def _run_full_profile(
                     delim_present_mask = scan_series.str.contains(best_pat, regex=True, na=False)
                     delimiter_presence_pct = _pct(int(delim_present_mask.sum()), scan_n)
 
-                    best_token_lists = scan_series.str.split(best_pat, regex=True)
+                    if include_pattern_examples:
+                        best_token_lists = scan_series.str.split(best_pat, regex=True)
 
-                    tokens_flat_all: List[str] = []
-                    for lst in best_token_lists.tolist():
-                        if not isinstance(lst, list):
-                            continue
-                        for tok in lst:
-                            tok2 = str(tok).strip()
-                            if tok2:
-                                tokens_flat_all.append(tok2)
+                        tokens_flat_all: List[str] = []
+                        for lst in best_token_lists.tolist():
+                            if not isinstance(lst, list):
+                                continue
+                            for tok in lst:
+                                tok2 = str(tok).strip()
+                                if tok2:
+                                    tokens_flat_all.append(tok2)
 
-                    token_vocab_size = len(set(tokens_flat_all)) if tokens_flat_all else 0
+                        token_vocab_size = len(set(tokens_flat_all)) if tokens_flat_all else 0
 
-                    # Token shape: percent of tokens that look like short codes (e.g., ST, RW, CAM)
-                    if tokens_flat_all:
-                        tok_series_all = pd.Series(tokens_flat_all, dtype="string")
-                        shape_mask = tok_series_all.str.match(r"^[A-Za-z]{1,4}$", na=False)
-                        token_shape_pct = _pct(int(shape_mask.sum()), int(len(tok_series_all)))
+                        # Token shape: percent of tokens that look like short codes (e.g., ST, RW, CAM)
+                        if tokens_flat_all:
+                            tok_series_all = pd.Series(tokens_flat_all, dtype="string")
+                            shape_mask = tok_series_all.str.match(r"^[A-Za-z]{1,4}$", na=False)
+                            token_shape_pct = _pct(int(shape_mask.sum()), int(len(tok_series_all)))
 
                 multi_value = {
                     "delimiter": best_spec["name"] if best_spec is not None else None,
@@ -872,7 +898,10 @@ async def _run_full_profile(
                 # Range-like patterns
                 year_range_mask = scan_series.str.match(RE_YEAR_RANGE, na=False)
                 num_range_mask = scan_series.str.match(RE_NUM_RANGE, na=False)
-                range_examples = _take_examples(scan_series[year_range_mask | num_range_mask], EXAMPLES_PER_PATTERN)
+                if include_pattern_examples:
+                    range_examples = _take_examples(scan_series[year_range_mask | num_range_mask], EXAMPLES_PER_PATTERN)
+                else:
+                    range_examples = []
 
                 range_like = {
                     "year_range_pct": _pct(int(year_range_mask.sum()), scan_n),
@@ -1512,10 +1541,11 @@ async def _run_full_profile(
             }
 
             # -----------------------------
-            # Step 5 — Outlier visibility & parseability (numeric/date)
+            # Step 5 — Outlier visibility & parseability (numeric/date) (optional)
             # -----------------------------
-            # Numeric parseability (value-level) for ANY column using string scan (use scan_series)
-            if scan_n > 0:
+            # Numeric/date deep profiling is expensive (quantiles, extremes, invalid examples).
+            # Only compute it when explicitly requested (e.g., full profile / column detail).
+            if include_deep_profiles and scan_n > 0:
                 parsed_num, success_num = _try_parse_numeric_for_profile(scan_series)
                 parseable_n = int(success_num.sum())
                 parseable_pct = _pct(parseable_n, scan_n)
@@ -1631,6 +1661,9 @@ async def profile_summary(
         file=file,
         dataset_id=dataset_id,
         max_categorical_cardinality=max_categorical_cardinality,
+        include_samples=False,
+        include_pattern_examples=False,
+        include_deep_profiles=False,
     ))["data_profile"]
 
     # Depth-safe: list of flat column cards (no deep nesting)
@@ -1642,17 +1675,35 @@ async def profile_summary(
             "inferred_type": info.get("inferred_type"),
             "missing_pct": info.get("missing_pct"),
             "unique_count": info.get("unique_count"),
+
             "top_candidate": {
                 "type": top.get("type"),
                 "confidence": top.get("confidence"),
                 "parse": top.get("parse"),
                 "op": top.get("op"),
-                "evidence": top.get("evidence"),
+                # stringify deep evidence to avoid JSON depth errors in Dify
+                "top_candidate_evidence_json": (
+                    json.dumps(top.get("evidence"), ensure_ascii=False)
+                    if isinstance(top.get("evidence"), dict)
+                    else None
+                ),
             },
-            "review": info.get("review"),
-            # optional but useful for routing to cleaner without extra calls
-            "unit_plan": info.get("unit_plan"),
 
+            # keep review shallow (booleans + scalars only)
+            "review": {
+                "recommended": bool((info.get("review") or {}).get("recommended")),
+                "reason": (info.get("review") or {}).get("reason"),
+                "top_confidence": (info.get("review") or {}).get("top_confidence"),
+                "second_confidence": (info.get("review") or {}).get("second_confidence"),
+                "confidence_gap": (info.get("review") or {}).get("confidence_gap"),
+            },
+
+            # stringify unit_plan (deep object)
+            "unit_plan_json": (
+                json.dumps(info.get("unit_plan"), ensure_ascii=False)
+                if isinstance(info.get("unit_plan"), dict)
+                else None
+            ),
         })
 
     return {
@@ -1660,7 +1711,10 @@ async def profile_summary(
         "dataset_sha256": full["dataset_sha256"],
         "n_rows": full["n_rows"],
         "n_columns": full["n_columns"],
-        "summary": full["summary"],
+
+        # stringify deep summary object
+        "summary_json": json.dumps(full.get("summary"), ensure_ascii=False),
+
         "columns": columns,
     }
 
@@ -1695,6 +1749,572 @@ async def profile_column_detail(
         "dataset_sha256": full["dataset_sha256"],
         "column": column,
         "profile_json": json.dumps(full["columns"][column], ensure_ascii=False),
+    }
+# -----------------------------
+# Dify-safe: association + dependency evidence
+# -----------------------------
+def _cap_df_rows(df: pd.DataFrame, max_rows: int) -> pd.DataFrame:
+    if len(df) <= max_rows:
+        return df
+    return df.iloc[:max_rows].copy()
+
+def _norm_name(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", (s or "").strip().lower()).strip("_")
+
+def _safe_json(obj: Any) -> str:
+    # Keep response shallow for Dify by stringifying evidence dicts.
+    try:
+        return json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        return json.dumps({"_stringify_failed": True, "repr": repr(obj)}, ensure_ascii=False)
+
+def _to_numeric_series(series: pd.Series) -> Tuple[pd.Series, float]:
+    """
+    Returns (numeric_values, parse_success_pct over non-null).
+    Uses your profiling numeric parser for string columns.
+    """
+    s = series
+    non_null = s[~s.isna()]
+    if len(non_null) == 0:
+        return pd.Series([pd.NA] * len(s), index=s.index, dtype="float64"), 0.0
+
+    if pd.api.types.is_numeric_dtype(s):
+        num = pd.to_numeric(s, errors="coerce").astype("float64")
+        ok = num.notna().sum()
+        return num, round((ok / len(non_null)) * 100.0, 6)
+
+    # String parse path (reuse your profiling parser)
+    s_str = _as_str_series(non_null).str.strip()
+    parsed, success = _try_parse_numeric_for_profile(s_str)
+    num_full = pd.Series([pd.NA] * len(s), index=s.index, dtype="float64")
+    num_full.loc[non_null.index] = parsed
+    ok = int(success.sum())
+    return num_full.astype("float64"), round((ok / len(non_null)) * 100.0, 6)
+
+def _to_datetime_series(series: pd.Series) -> Tuple[pd.Series, float]:
+    non_null = series[~series.isna()]
+    if len(non_null) == 0:
+        return pd.Series([pd.NaT] * len(series), index=series.index), 0.0
+
+    s_str = _as_str_series(non_null).str.strip()
+    parsed_a = pd.to_datetime(s_str, errors="coerce", dayfirst=False)
+    parsed_b = pd.to_datetime(s_str, errors="coerce", dayfirst=True)
+
+    ok_a = int(parsed_a.notna().sum())
+    ok_b = int(parsed_b.notna().sum())
+    parsed = parsed_b if ok_b > ok_a else parsed_a
+    ok = max(ok_a, ok_b)
+
+    out = pd.Series([pd.NaT] * len(series), index=series.index)
+    out.loc[non_null.index] = parsed
+    return out, round((ok / len(non_null)) * 100.0, 6)
+
+def _cramers_v_from_crosstab(ct: pd.DataFrame) -> Optional[float]:
+    """
+    Cramer's V without scipy/numpy explicit calls.
+    Returns None if not computable.
+    """
+    try:
+        n = float(ct.values.sum())
+        if n <= 0:
+            return None
+
+        row_sums = ct.sum(axis=1).astype("float64")
+        col_sums = ct.sum(axis=0).astype("float64")
+
+        # Expected counts under independence
+        expected = pd.DataFrame(index=ct.index, columns=ct.columns, dtype="float64")
+        for r in ct.index:
+            for c in ct.columns:
+                expected.loc[r, c] = (row_sums.loc[r] * col_sums.loc[c]) / n
+
+        observed = ct.astype("float64")
+        with pd.option_context("mode.use_inf_as_na", True):
+            chi2 = (((observed - expected) ** 2) / expected).fillna(0.0).values.sum()
+
+        r, k = ct.shape
+        if r <= 1 or k <= 1:
+            return None
+
+        phi2 = chi2 / n
+        # Bias correction (Bergsma 2013 style); keep simple + safe
+        phi2corr = max(0.0, phi2 - ((k - 1) * (r - 1)) / (n - 1.0)) if n > 1 else 0.0
+        rcorr = r - ((r - 1) ** 2) / (n - 1.0) if n > 1 else r
+        kcorr = k - ((k - 1) ** 2) / (n - 1.0) if n > 1 else k
+        denom = min((kcorr - 1.0), (rcorr - 1.0))
+        if denom <= 0:
+            return None
+        return float((phi2corr / denom) ** 0.5)
+    except Exception:
+        return None
+
+def _add_signal(out: List[Dict[str, Any]], *, kind: str, columns: List[str], score: Optional[float], metric: str, evidence: Dict[str, Any]) -> None:
+    out.append({
+        "kind": kind,
+        "columns": columns,
+        "score": (None if score is None else round(float(score), 6)),
+        "metric": metric,
+        "evidence_json": _safe_json(evidence),
+    })
+
+@app.post("/evidence_associations")
+async def evidence_associations(
+    request: Request,
+    file: UploadFile = File(...),
+    dataset_id: str = Form(...),
+    max_categorical_cardinality: int = Form(20),
+    _=Depends(require_token),
+) -> Dict[str, Any]:
+    """
+    Deterministic association + dependency evidence:
+    - numeric–numeric correlations
+    - categorical–categorical association (Cramer's V)
+    - numeric by group (eta^2-like variance explained)
+    - dependency checks from name-based heuristics (subtotal+tax=total; start<=end)
+    """
+    raw_bytes = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(raw_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Upload too large")
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    dataset_sha256 = sha256_hex(raw_bytes)
+
+    try:
+        df = pd.read_csv(io.BytesIO(raw_bytes), low_memory=False)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to parse CSV: {e}")
+
+    df = _cap_df_rows(df, ASSOC_MAX_ROWS)
+    n_rows_scanned = int(len(df))
+
+    # --- Column selection (deterministic caps) ---
+    # (Decision) Use observed non-null counts to prioritize columns for pairwise tests.
+    # Why it matters: better signal density under strict caps.
+    non_null_counts = df.notna().sum().sort_values(ascending=False)
+
+    # Build numeric frame (native numeric + parseable numeric strings)
+    numeric_cols: List[str] = []
+    numeric_parse_pct: Dict[str, float] = {}
+
+    # Prefer existing numeric dtype columns first
+    for c in df.columns:
+        if pd.api.types.is_numeric_dtype(df[c]):
+            numeric_cols.append(c)
+
+    # Add parseable object columns next (by non-null density)
+    obj_candidates = [c for c in non_null_counts.index.tolist() if c not in numeric_cols]
+    for c in obj_candidates:
+        if len(numeric_cols) >= ASSOC_MAX_NUMERIC_COLS:
+            break
+        ser = df[c]
+        # Only attempt parse if it's not huge-cardinality text (quick gate)
+        try:
+            uniq = int(ser.nunique(dropna=True))
+        except Exception:
+            uniq = 10**9
+        if uniq > max(ASSOC_MAX_CAT_CARD, 200):
+            continue
+
+        num, pct = _to_numeric_series(ser)
+        if pct >= 60.0:  # parseable enough to be meaningfully numeric
+            df[c + "__num__"] = num
+            numeric_cols.append(c + "__num__")
+            numeric_parse_pct[c] = pct
+
+    # cap numeric cols deterministically (by non-null)
+    numeric_cols = sorted(
+        numeric_cols,
+        key=lambda c: int(df[c].notna().sum()) if c in df.columns else 0,
+        reverse=True
+    )[:ASSOC_MAX_NUMERIC_COLS]
+
+    # Build categorical candidates: low-card columns by unique_count (and not numeric dtypes)
+    cat_cols: List[str] = []
+    for c in non_null_counts.index.tolist():
+        if len(cat_cols) >= ASSOC_MAX_CAT_COLS:
+            break
+        if pd.api.types.is_numeric_dtype(df[c]):
+            continue
+        try:
+            uniq = int(df[c].nunique(dropna=True))
+        except Exception:
+            continue
+        if 2 <= uniq <= min(int(max_categorical_cardinality), ASSOC_MAX_CAT_CARD):
+            cat_cols.append(c)
+
+    signals: List[Dict[str, Any]] = []
+
+    # -----------------------------
+    # 1) numeric–numeric correlations (Pearson; no scipy dependency)
+    # -----------------------------
+    # (Decision) Use Pearson instead of Spearman to avoid SciPy.
+    # Why it matters: pandas' Spearman path imports scipy.stats, which is not available in this runtime.
+    corr_pairs: List[Tuple[float, Dict[str, Any]]] = []
+    for i in range(len(numeric_cols)):
+        for j in range(i + 1, len(numeric_cols)):
+            a = numeric_cols[i]
+            b = numeric_cols[j]
+            sa = df[a]
+            sb = df[b]
+            overlap = int((sa.notna() & sb.notna()).sum())
+            if overlap < ASSOC_MIN_OVERLAP:
+                continue
+
+            r = sa.corr(sb, method="pearson")
+            if pd.isna(r):
+                continue
+
+            r = float(r)
+            corr_pairs.append((abs(r), {
+                "a": a,
+                "b": b,
+                "r": r,
+                "overlap": overlap,
+                "non_null_a": int(sa.notna().sum()),
+                "non_null_b": int(sb.notna().sum()),
+            }))
+
+    corr_pairs.sort(key=lambda x: x[0], reverse=True)
+    for r_abs, meta in corr_pairs[:ASSOC_TOP_K_PAIRS]:
+        _add_signal(
+            signals,
+            kind="numeric_numeric_corr",
+            columns=[meta["a"], meta["b"]],
+            score=r_abs,
+            metric="abs_pearson_r",
+            evidence=meta,
+        )
+
+    # -----------------------------
+    # 2) categorical–categorical association (Cramer's V)
+    # -----------------------------
+    assoc_pairs: List[Tuple[float, Dict[str, Any]]] = []
+    for i in range(len(cat_cols)):
+        for j in range(i + 1, len(cat_cols)):
+            a = cat_cols[i]
+            b = cat_cols[j]
+            sa = df[a]
+            sb = df[b]
+            overlap_mask = sa.notna() & sb.notna()
+            overlap = int(overlap_mask.sum())
+            if overlap < ASSOC_MIN_OVERLAP:
+                continue
+
+            ct = pd.crosstab(sa[overlap_mask], sb[overlap_mask])
+            v = _cramers_v_from_crosstab(ct)
+            if v is None:
+                continue
+            assoc_pairs.append((abs(float(v)), {
+                "a": a, "b": b, "cramers_v": float(v), "overlap": overlap,
+                "shape": [int(ct.shape[0]), int(ct.shape[1])]
+            }))
+
+    assoc_pairs.sort(key=lambda x: x[0], reverse=True)
+    for v_abs, meta in assoc_pairs[:ASSOC_TOP_K_PAIRS]:
+        _add_signal(
+            signals,
+            kind="categorical_categorical_assoc",
+            columns=[meta["a"], meta["b"]],
+            score=v_abs,
+            metric="cramers_v",
+            evidence=meta,
+        )
+
+    # -----------------------------
+    # 3) numeric by group (eta^2-like) + explicit encoding_pair
+    # -----------------------------
+    ng_pairs: List[Tuple[float, Dict[str, Any]]] = []
+
+    for num_c in numeric_cols[: min(len(numeric_cols), 20)]:
+        s_num = df[num_c]
+        if int(s_num.notna().sum()) < ASSOC_MIN_OVERLAP:
+            continue
+
+        for grp_c in cat_cols[: min(len(cat_cols), 20)]:
+            s_grp = df[grp_c]
+            mask = s_num.notna() & s_grp.notna()
+            overlap = int(mask.sum())
+            if overlap < ASSOC_MIN_OVERLAP:
+                continue
+
+            x = s_num[mask].astype("float64")
+            g = s_grp[mask].astype("string")
+
+            overall_mean = float(x.mean())
+            ss_total = float(((x - overall_mean) ** 2).sum())
+            if ss_total <= 0:
+                continue
+
+            ss_between = 0.0
+            group_means: Dict[str, float] = {}
+            group_nunique_num: Dict[str, int] = {}
+
+            for level, idx in g.groupby(g).groups.items():
+                xv = x.loc[idx]
+                if len(xv) == 0:
+                    continue
+                mu = float(xv.mean())
+                group_means[str(level)] = mu
+                group_nunique_num[str(level)] = int(xv.nunique(dropna=True))
+                ss_between += float(len(xv)) * (mu - overall_mean) ** 2
+
+            eta2 = ss_between / ss_total if ss_total > 0 else 0.0
+            n_groups = int(g.nunique(dropna=True))
+
+            # (Decision) Treat eta2 ~ 1 as "this numeric column is an encoding of the categorical".
+            # Why it matters: downstream cleaning must avoid double-counting (keep one, drop/derive the other).
+            if eta2 >= 0.999 and n_groups >= 2:
+                invertible = all(v == 1 for v in group_nunique_num.values()) if group_nunique_num else False
+                _add_signal(
+                    signals,
+                    kind="encoding_pair",
+                    columns=[grp_c, num_c],
+                    score=float(min(1.0, eta2)),
+                    metric="eta2_encoding",
+                    evidence={
+                        "overlap": overlap,
+                        "n_groups": n_groups,
+                        "invertible": bool(invertible),
+                        "group_means": group_means,  # mapping hint
+                        "group_nunique_num": group_nunique_num,  # sanity check
+                    },
+                )
+                continue
+
+            ng_pairs.append((eta2, {
+                "numeric": num_c,
+                "group": grp_c,
+                "eta2": float(eta2),
+                "overlap": overlap,
+                "n_groups": n_groups,
+            }))
+
+    ng_pairs.sort(key=lambda x: x[0], reverse=True)
+    for eta2, meta in ng_pairs[:ASSOC_TOP_K_PAIRS]:
+        _add_signal(
+            signals,
+            kind="numeric_by_group",
+            columns=[meta["numeric"], meta["group"]],
+            score=eta2,
+            metric="eta2",
+            evidence=meta,
+        )
+
+    def _stem_for_items(col: str) -> Optional[str]:
+        """
+        Detect stems like HOP1.r -> HOP, auditc2.r -> auditc
+        Returns None if it doesn't match the expected item pattern.
+        """
+        m = re.match(r"^(.+?)(\d+)\.r$", str(col))
+        if not m:
+            return None
+        return m.group(1)
+
+    def _find_total_col_for_stem(df_cols: List[str], stem: str) -> Optional[str]:
+        """
+        Prefer exact '<stem>.total', else '<stem>_total', else any column containing both stem and 'total'.
+        """
+        exact1 = f"{stem}.total"
+        exact2 = f"{stem}_total"
+        if exact1 in df_cols:
+            return exact1
+        if exact2 in df_cols:
+            return exact2
+
+        stem_l = stem.lower()
+        for c in df_cols:
+            cl = str(c).lower()
+            if ("total" in cl) and (stem_l in cl):
+                return c
+        return None
+
+    # -----------------------------
+    # 4) Dependency checks (name-heuristic, deterministic)
+    # -----------------------------
+    name_map = {_norm_name(c): c for c in df.columns}
+
+    def _find_any(keys: List[str]) -> List[str]:
+        out = []
+        for nk, orig in name_map.items():
+            for k in keys:
+                if k in nk:
+                    out.append(orig)
+                    break
+        return out
+
+    # 4a) subtotal + tax ≈ total
+    subtotal_cols = _find_any(["subtotal", "sub_total", "subtot"])
+    tax_cols = _find_any(["tax", "gst", "vat"])
+    total_cols = _find_any(["total", "grand_total", "amount_due", "invoice_total"])
+
+    # (Decision) Only run arithmetic identity checks when we can parse >=60% numeric for each.
+    # Why it matters: avoids garbage results on mostly-text money fields.
+    for sub in subtotal_cols[:3]:
+        sub_num, sub_pct = _to_numeric_series(df[sub])
+        if sub_pct < 60.0:
+            continue
+        for tax in tax_cols[:3]:
+            tax_num, tax_pct = _to_numeric_series(df[tax])
+            if tax_pct < 60.0:
+                continue
+            for tot in total_cols[:3]:
+                tot_num, tot_pct = _to_numeric_series(df[tot])
+                if tot_pct < 60.0:
+                    continue
+
+                mask = sub_num.notna() & tax_num.notna() & tot_num.notna()
+                n = int(mask.sum())
+                if n < ASSOC_MIN_OVERLAP:
+                    continue
+
+                lhs = (sub_num[mask].astype("float64") + tax_num[mask].astype("float64"))
+                rhs = tot_num[mask].astype("float64")
+                diff = (lhs - rhs).abs()
+
+                # abs + relative tolerance
+                rel = (diff / (rhs.abs() + 1e-9))
+                ok = (diff <= ASSOC_TOL_ABS) | (rel <= ASSOC_TOL_REL)
+                ok_rate = float(ok.mean()) if n else 0.0
+
+                _add_signal(
+                    signals,
+                    kind="dependency_check",
+                    columns=[sub, tax, tot],
+                    score=ok_rate,
+                    metric="pct_rows_satisfying_subtotal_plus_tax_eq_total",
+                    evidence={
+                        "n": n,
+                        "ok_rate": ok_rate,
+                        "tol_abs": ASSOC_TOL_ABS,
+                        "tol_rel": ASSOC_TOL_REL,
+                        "parse_success_pct": {"subtotal": sub_pct, "tax": tax_pct, "total": tot_pct},
+                    },
+                )
+
+    # 4b) end_date >= start_date
+    start_cols = _find_any(["start_date", "start", "begin", "from_date"])
+    end_cols = _find_any(["end_date", "end", "finish", "to_date"])
+
+    for sc in start_cols[:5]:
+        sdt, spct = _to_datetime_series(df[sc])
+        if spct < 60.0:
+            continue
+        for ec in end_cols[:5]:
+            edt, epct = _to_datetime_series(df[ec])
+            if epct < 60.0:
+                continue
+
+            mask = sdt.notna() & edt.notna()
+            n = int(mask.sum())
+            if n < ASSOC_MIN_OVERLAP:
+                continue
+
+            ok = (edt[mask] >= sdt[mask])
+            ok_rate = float(ok.mean()) if n else 0.0
+
+            _add_signal(
+                signals,
+                kind="dependency_check",
+                columns=[sc, ec],
+                score=ok_rate,
+                metric="pct_rows_with_end_date_ge_start_date",
+                evidence={
+                    "n": n,
+                    "ok_rate": ok_rate,
+                    "parse_success_pct": {"start": spct, "end": epct},
+                },
+            )
+    # 4c) Survey scale totals ≈ sum(items), e.g. HOP.total ≈ HOP1.r + ... + HOP7.r
+    # (Decision) Use stem rules for *.r item columns, because survey datasets rarely use subtotal/tax style names.
+    # Why it matters: this is the strongest deterministic evidence of derived columns in psych instruments.
+    items_by_stem: Dict[str, List[str]] = {}
+    for c in df.columns:
+        stem = _stem_for_items(c)
+        if stem:
+            items_by_stem.setdefault(stem, []).append(c)
+
+    for stem, item_cols in sorted(items_by_stem.items(), key=lambda kv: (kv[0].lower(), len(kv[1]))):
+        if len(item_cols) < 3:
+            continue
+
+        total_col = _find_total_col_for_stem(list(df.columns), stem)
+        if not total_col:
+            continue
+
+        # deterministic ordering: numeric sort by item index
+        def _item_key(cname: str) -> int:
+            m = re.match(r"^.+?(\d+)\.r$", str(cname))
+            return int(m.group(1)) if m else 10 ** 9
+
+        item_cols_sorted = sorted(item_cols, key=_item_key)
+
+        # parse items and total numeric
+        item_nums = []
+        min_parse = 100.0
+        for ic in item_cols_sorted:
+            s_num, pct = _to_numeric_series(df[ic])
+            item_nums.append(s_num.astype("float64"))
+            min_parse = min(min_parse, pct)
+
+        tot_num, tot_pct = _to_numeric_series(df[total_col])
+        min_parse = min(min_parse, tot_pct)
+
+        if min_parse < 60.0:
+            continue
+
+        # compute sum with overlap mask
+        sum_items = item_nums[0].copy()
+        mask = sum_items.notna()
+        for s in item_nums[1:]:
+            sum_items = sum_items + s
+            mask = mask & s.notna()
+
+        mask = mask & tot_num.notna()
+        n = int(mask.sum())
+        if n < ASSOC_MIN_OVERLAP:
+            continue
+
+        lhs = sum_items[mask]
+        rhs = tot_num[mask].astype("float64")
+        diff = (lhs - rhs).abs()
+        rel = (diff / (rhs.abs() + 1e-9))
+        ok = (diff <= ASSOC_TOL_ABS) | (rel <= ASSOC_TOL_REL)
+        ok_rate = float(ok.mean()) if n else 0.0
+
+        _add_signal(
+            signals,
+            kind="dependency_check",
+            columns=item_cols_sorted + [total_col],
+            score=ok_rate,
+            metric="pct_rows_with_total_eq_sum_items",
+            evidence={
+                "stem": stem,
+                "n": n,
+                "ok_rate": ok_rate,
+                "tol_abs": ASSOC_TOL_ABS,
+                "tol_rel": ASSOC_TOL_REL,
+                "parse_success_floor_pct": min_parse,
+                "total_col": total_col,
+                "item_cols": item_cols_sorted,
+            },
+        )
+
+    return {
+        "dataset_id": dataset_id,
+        "dataset_sha256": dataset_sha256,
+        "n_rows_scanned": n_rows_scanned,
+        "limits": {
+            "ASSOC_MAX_ROWS": ASSOC_MAX_ROWS,
+            "ASSOC_TOP_K_PAIRS": ASSOC_TOP_K_PAIRS,
+            "ASSOC_MAX_NUMERIC_COLS": ASSOC_MAX_NUMERIC_COLS,
+            "ASSOC_MAX_CAT_COLS": ASSOC_MAX_CAT_COLS,
+            "ASSOC_MAX_CAT_CARD": ASSOC_MAX_CAT_CARD,
+            "ASSOC_MIN_OVERLAP": ASSOC_MIN_OVERLAP,
+            "ASSOC_TOL_ABS": ASSOC_TOL_ABS,
+            "ASSOC_TOL_REL": ASSOC_TOL_REL,
+        },
+        "signals": signals,
     }
 
 
