@@ -51,6 +51,13 @@ MAX_STRING_LEN = int(os.getenv("MAX_STRING_LEN", "80"))
 # Deterministic cap for expensive scans (extra, but important for service stability)
 PATTERN_SCAN_MAX_ROWS = int(os.getenv("PATTERN_SCAN_MAX_ROWS", "50000"))
 
+# Deterministic hybrid scan: head + tail + seeded random from the remainder
+# (Decision) Default head/tail are small relative to max to preserve speed while catching tail-only patterns.
+# Why it matters: avoids missing tail-end formatting changes without introducing nondeterminism.
+PATTERN_SCAN_HEAD_ROWS = int(os.getenv("PATTERN_SCAN_HEAD_ROWS", "2000"))
+PATTERN_SCAN_TAIL_ROWS = int(os.getenv("PATTERN_SCAN_TAIL_ROWS", "2000"))
+
+
 # Limits for examples emitted per pattern category
 EXAMPLES_PER_PATTERN = int(os.getenv("EXAMPLES_PER_PATTERN", "5"))
 RARE_EXAMPLES_MAX = int(os.getenv("RARE_EXAMPLES_MAX", "10"))
@@ -231,11 +238,58 @@ def _as_str_series(s: pd.Series) -> pd.Series:
     return s.astype("string")
 
 
-def _cap_scan(s: pd.Series, max_rows: int) -> pd.Series:
-    if len(s) <= max_rows:
+def _cap_scan(
+    s: pd.Series,
+    max_rows: int,
+    *,
+    seed: int,
+    head_rows: int,
+    tail_rows: int,
+) -> pd.Series:
+    """
+    Deterministic hybrid sampler:
+      - take head chunk
+      - take tail chunk
+      - take seeded random sample from the middle remainder
+    Preserves reproducibility via a stable seed.
+    """
+    n = len(s)
+    if n <= max_rows:
         return s
-    # Deterministic: take head of non-null series
-    return s.iloc[:max_rows]
+
+    # Guardrails: keep within [0, max_rows] and avoid negative middle sizes
+    head_n = max(0, min(int(head_rows), max_rows))
+    tail_n = max(0, min(int(tail_rows), max_rows - head_n))
+
+    # If max_rows is tiny, the head already fills it
+    if head_n >= max_rows:
+        return s.iloc[:max_rows]
+
+    # Split into head / middle / tail
+    head = s.iloc[:head_n]
+    tail = s.iloc[-tail_n:] if tail_n > 0 else s.iloc[:0]
+
+    mid_start = head_n
+    mid_end = max(mid_start, n - tail_n)
+    middle = s.iloc[mid_start:mid_end]
+
+    remaining = max_rows - head_n - tail_n
+    if remaining <= 0 or len(middle) == 0:
+        out = pd.concat([head, tail])
+    else:
+        rnd_n = min(remaining, len(middle))
+        rnd = middle.sample(n=rnd_n, random_state=seed)
+        out = pd.concat([head, tail, rnd])
+
+    # Deterministic de-dupe while preserving first-seen order
+    out = out[~out.duplicated()]
+
+    # Final safety cap (should already be <= max_rows)
+    if len(out) > max_rows:
+        out = out.iloc[:max_rows]
+
+    return out
+
 
 
 # -----------------------------
@@ -484,12 +538,19 @@ async def _run_full_profile(
             "sample_size_random": SAMPLE_SIZE_RANDOM,
             "top_k_frequent": TOP_K_FREQUENT,
             "max_string_len": MAX_STRING_LEN,
+
+            # Pattern scan sampling policy (Decision: deterministic hybrid scan).
+            # Why it matters: makes confidence/pattern rates auditable and reproducible across runs.
             "pattern_scan_max_rows": PATTERN_SCAN_MAX_ROWS,
+            "pattern_scan_head_rows": PATTERN_SCAN_HEAD_ROWS,
+            "pattern_scan_tail_rows": PATTERN_SCAN_TAIL_ROWS,
+
             "examples_per_pattern": EXAMPLES_PER_PATTERN,
             "rare_examples_max": RARE_EXAMPLES_MAX,
             "extremes_n": EXTREMES_N,
             "missing_like_tokens": MISSING_LIKE_TOKENS,
         },
+
         "columns": {},
     }
 
@@ -627,8 +688,15 @@ async def _run_full_profile(
             # -----------------------------
             # Step 3 — Pattern classifiers (rule-based)
             # -----------------------------
-            # Use capped scan for performance deterministically
-            scan_series = _cap_scan(s_stripped, PATTERN_SCAN_MAX_ROWS)
+            # Use deterministic hybrid scan for performance + tail coverage
+            seed = _stable_int_seed(dataset_sha256, col)
+            scan_series = _cap_scan(
+                s_stripped,
+                PATTERN_SCAN_MAX_ROWS,
+                seed=seed,
+                head_rows=PATTERN_SCAN_HEAD_ROWS,
+                tail_rows=PATTERN_SCAN_TAIL_ROWS,
+            )
             scan_n = int(len(scan_series))
 
             patterns: Dict[str, Any] = {}
@@ -1712,6 +1780,11 @@ async def profile_summary(
         "n_rows": full["n_rows"],
         "n_columns": full["n_columns"],
 
+        # Surface profiler configuration for auditability
+        # (Decision) Flatten as JSON string to avoid depth issues in Dify.
+        # Why it matters: pattern confidence values depend on sampling policy.
+        "profiler_config_json": json.dumps(full.get("profiler_config", {})),
+
         # stringify deep summary object
         "summary_json": json.dumps(full.get("summary"), ensure_ascii=False),
 
@@ -1772,24 +1845,35 @@ def _to_numeric_series(series: pd.Series) -> Tuple[pd.Series, float]:
     """
     Returns (numeric_values, parse_success_pct over non-null).
     Uses your profiling numeric parser for string columns.
+
+    NOTE: We must not build float64 arrays from pd.NA (causes TypeError).
+    We use NaN for float64 buffers.
     """
     s = series
     non_null = s[~s.isna()]
+
     if len(non_null) == 0:
-        return pd.Series([pd.NA] * len(s), index=s.index, dtype="float64"), 0.0
+        nan = float("nan")
+        return pd.Series([nan] * len(s), index=s.index, dtype="float64"), 0.0
 
     if pd.api.types.is_numeric_dtype(s):
         num = pd.to_numeric(s, errors="coerce").astype("float64")
-        ok = num.notna().sum()
+        ok = int(num.notna().sum())
         return num, round((ok / len(non_null)) * 100.0, 6)
 
     # String parse path (reuse your profiling parser)
     s_str = _as_str_series(non_null).str.strip()
     parsed, success = _try_parse_numeric_for_profile(s_str)
-    num_full = pd.Series([pd.NA] * len(s), index=s.index, dtype="float64")
-    num_full.loc[non_null.index] = parsed
-    ok = int(success.sum())
-    return num_full.astype("float64"), round((ok / len(non_null)) * 100.0, 6)
+
+    # Ensure parsed is plain float64 with NaN (not pandas nullable Float64 with pd.NA)
+    parsed_float = pd.to_numeric(parsed, errors="coerce").astype("float64")
+
+    nan = float("nan")
+    num_full = pd.Series([nan] * len(s), index=s.index, dtype="float64")
+    num_full.loc[non_null.index] = parsed_float
+
+    ok = int(pd.Series(success, index=s_str.index).astype(bool).sum())
+    return num_full, round((ok / len(non_null)) * 100.0, 6)
 
 def _to_datetime_series(series: pd.Series) -> Tuple[pd.Series, float]:
     non_null = series[~series.isna()]
@@ -1955,13 +2039,20 @@ async def evidence_associations(
         for j in range(i + 1, len(numeric_cols)):
             a = numeric_cols[i]
             b = numeric_cols[j]
-            sa = df[a]
-            sb = df[b]
-            overlap = int((sa.notna() & sb.notna()).sum())
+            # Coerce to numeric to avoid pd.NA / mixed object issues during corr()
+            sa_raw = df[a]
+            sb_raw = df[b]
+
+            sa = pd.to_numeric(sa_raw, errors="coerce")
+            sb = pd.to_numeric(sb_raw, errors="coerce")
+
+            mask = sa.notna() & sb.notna()
+            overlap = int(mask.sum())
             if overlap < ASSOC_MIN_OVERLAP:
                 continue
 
-            r = sa.corr(sb, method="pearson")
+            # corr() will now see float + np.nan only (no NAType)
+            r = sa[mask].corr(sb[mask], method="pearson")
             if pd.isna(r):
                 continue
 
@@ -1973,6 +2064,8 @@ async def evidence_associations(
                 "overlap": overlap,
                 "non_null_a": int(sa.notna().sum()),
                 "non_null_b": int(sb.notna().sum()),
+                "raw_non_null_a": int(sa_raw.notna().sum()),
+                "raw_non_null_b": int(sb_raw.notna().sum()),
             }))
 
     corr_pairs.sort(key=lambda x: x[0], reverse=True)
