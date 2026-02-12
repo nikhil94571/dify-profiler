@@ -12,7 +12,9 @@ from collections import defaultdict, deque
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel
+from xlsx_export import build_xlsx_bytes
 
 try:
     from dateutil import parser as dateparser  # optional fallback
@@ -153,7 +155,7 @@ async def request_logging(request: Request, call_next):
 
 @app.middleware("http")
 async def limit_upload_size(request: Request, call_next):
-    if request.url.path in ("/profile", "/profile_summary", "/profile_column_detail", "/evidence_associations") and request.method.upper() == "POST":
+    if request.url.path in ("/profile", "/profile_summary", "/profile_column_detail", "/evidence_associations", "/export/light-contract-xlsx") and request.method.upper() == "POST":
         cl = request.headers.get("content-length")
         if cl is not None:
             try:
@@ -166,7 +168,7 @@ async def limit_upload_size(request: Request, call_next):
 
 @app.middleware("http")
 async def basic_rate_limit(request: Request, call_next):
-    if request.url.path in ("/profile", "/profile_summary", "/profile_column_detail", "/evidence_associations") and request.method.upper() == "POST":
+    if request.url.path in ("/profile", "/profile_summary", "/profile_column_detail", "/evidence_associations", "/export/light-contract-xlsx") and request.method.upper() == "POST":
         ip = _client_ip(request)
         now = time.time()
         q = _req_times[ip]
@@ -2652,6 +2654,41 @@ async def evidence_associations(
         "signals": signals,
     }
 
+
+class XlsxExportRequest(BaseModel):
+    rows_table_json: str
+    filename: str | None = None
+
+
+@app.post("/export/light-contract-xlsx")
+def export_light_contract_xlsx(
+    req: XlsxExportRequest,
+    _: None = Depends(require_token),
+):
+
+    try:
+        xlsx_bytes = build_xlsx_bytes(req.rows_table_json, sheet_name="Light Contract")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"XLSX build failed: {e}")
+
+    import re
+
+    def _sanitize_filename(name: str) -> str:
+        name = (name or "").strip().replace("\n", "").replace("\r", "")
+        name = re.sub(r'[^A-Za-z0-9._-]+', "_", name)
+        if not name.lower().endswith(".xlsx"):
+            name += ".xlsx"
+        return name or "light_contract_template.xlsx"
+
+    filename = _sanitize_filename(req.filename or "light_contract_template.xlsx")
+
+    return Response(
+        content=xlsx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        },
+    )
 
 
 @app.get("/health")

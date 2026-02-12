@@ -5,11 +5,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py .
+# Copy application code (includes app.py, xlsx_export.py, etc.)
+COPY . .
 
-EXPOSE 8000
+EXPOSE 8080
 
-# Cloud-friendly: listen on all interfaces
-CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port $PORT"]
-
-
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8080}"]
