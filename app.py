@@ -8,13 +8,18 @@ import uuid
 import logging
 import re
 from collections import defaultdict, deque
+from datetime import timedelta
+from uuid import uuid4
 
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
+from google.cloud import storage
+
 from xlsx_export import build_xlsx_bytes
+
 
 try:
     from dateutil import parser as dateparser  # optional fallback
@@ -2665,30 +2670,63 @@ def export_light_contract_xlsx(
     req: XlsxExportRequest,
     _: None = Depends(require_token),
 ):
+    # (Decision) Use GCS + signed URL instead of returning bytes.
+    # Why it matters: Dify HTTP nodes handle JSON cleanly; a signed URL gives a reliable “download” UX.
 
     try:
         xlsx_bytes = build_xlsx_bytes(req.rows_table_json, sheet_name="Light Contract")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"XLSX build failed: {e}")
 
-    import re
-
     def _sanitize_filename(name: str) -> str:
         name = (name or "").strip().replace("\n", "").replace("\r", "")
-        name = re.sub(r'[^A-Za-z0-9._-]+', "_", name)
+        name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
         if not name.lower().endswith(".xlsx"):
             name += ".xlsx"
         return name or "light_contract_template.xlsx"
 
     filename = _sanitize_filename(req.filename or "light_contract_template.xlsx")
 
-    return Response(
-        content=xlsx_bytes,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"'
-        },
-    )
+    bucket_name = os.getenv("EXPORT_BUCKET")
+    if not bucket_name:
+        raise HTTPException(status_code=500, detail="Missing EXPORT_BUCKET env var")
+
+    ttl_minutes = int(os.getenv("EXPORT_SIGNED_URL_TTL_MINUTES", "30"))
+
+    # (Decision) Unique object name per request.
+    # Why it matters: avoids collisions and makes requests idempotent-ish for debugging.
+    object_name = f"exports/{uuid4().hex}_{filename}"
+
+    try:
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(object_name)
+
+        blob.upload_from_string(
+            xlsx_bytes,
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+        # (Decision) Signed URL for temporary access.
+        # Why it matters: keeps bucket private while still allowing downloads.
+        signed_url = blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(minutes=ttl_minutes),
+            method="GET",
+            response_disposition=f'attachment; filename="{filename}"',
+            response_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"GCS upload/sign failed: {e}")
+
+    return {
+        "status": "success",
+        "filename": filename,
+        "object": object_name,
+        "signed_url": signed_url,
+        "expires_minutes": ttl_minutes,
+    }
 
 
 @app.get("/health")

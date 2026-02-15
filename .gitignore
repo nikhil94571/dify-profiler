@@ -17,3 +17,21 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# --- secrets / keys ---
+*.json
+!lifecycle.json
+!package*.json
+!tsconfig*.json
+!*.schema.json
+
+sa-key.json
+*-key.json
+*_key.json
+*.pem
+*.p12
+*.pfx
+
+# --- generated / downloads ---
+downloaded_*.xlsx
+*.xlsx
