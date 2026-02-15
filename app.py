@@ -17,6 +17,9 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 from google.cloud import storage
+import google.auth
+from google.auth import impersonated_credentials
+
 
 from xlsx_export import build_xlsx_bytes
 
@@ -2707,15 +2710,30 @@ def export_light_contract_xlsx(
             content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-        # (Decision) Signed URL for temporary access.
-        # Why it matters: keeps bucket private while still allowing downloads.
+        # (Decision) Signed URL for temporary access using IAM SignBlob (Cloud Run-safe).
+        # Why it matters: Cloud Run default credentials are token-only and cannot sign V4 URLs directly.
+        signing_sa = os.getenv("SIGNING_SA_EMAIL")
+        if not signing_sa:
+            raise HTTPException(status_code=500, detail="Missing SIGNING_SA_EMAIL env var")
+
+        source_creds, _ = google.auth.default()
+
+        signing_creds = impersonated_credentials.Credentials(
+            source_credentials=source_creds,
+            target_principal=signing_sa,
+            target_scopes=["https://www.googleapis.com/auth/devstorage.read_only"],
+            lifetime=3600,
+        )
+
         signed_url = blob.generate_signed_url(
             version="v4",
             expiration=timedelta(minutes=ttl_minutes),
             method="GET",
             response_disposition=f'attachment; filename="{filename}"',
             response_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            credentials=signing_creds,
         )
+
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"GCS upload/sign failed: {e}")
