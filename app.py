@@ -10,6 +10,7 @@ import re
 from collections import defaultdict, deque
 from datetime import timedelta
 from uuid import uuid4
+from manifest_export import upload_and_sign_text
 
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Request
@@ -2746,6 +2747,35 @@ def export_light_contract_xlsx(
         "expires_minutes": ttl_minutes,
     }
 
+from fastapi import HTTPException
+
+@app.post("/export/manifest-txt")
+def export_manifest_txt(body: dict):
+    run_id = body.get("run_id")
+    manifest_text = body.get("manifest_text")
+
+    if not run_id:
+        raise HTTPException(status_code=400, detail="run_id required")
+    if manifest_text is None:
+        raise HTTPException(status_code=400, detail="manifest_text required")
+
+    export_bucket = os.environ.get("EXPORT_BUCKET")
+    if not export_bucket:
+        raise HTTPException(status_code=500, detail="EXPORT_BUCKET env var not set")
+
+    object_name = f"manifests/{run_id}_manifest.txt"
+
+    signed_url = upload_and_sign_text(
+        bucket_name=export_bucket,
+        object_name=object_name,
+        text_content=str(manifest_text),
+        expiration_minutes=60,  # (inference) 60min is nicer for humans than 30min
+    )
+
+    return {
+        "filename": f"{run_id}_manifest.txt",
+        "signed_url": signed_url,
+    }
 
 @app.get("/health")
 def health() -> Dict[str, str]:
