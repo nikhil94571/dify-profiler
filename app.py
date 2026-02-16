@@ -7,12 +7,14 @@ import json
 import uuid
 import logging
 import re
+import zipfile
+from xml.sax.saxutils import escape
 from collections import defaultdict, deque
 
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 try:
     from dateutil import parser as dateparser  # optional fallback
@@ -21,6 +23,42 @@ except Exception:
 
 app = FastAPI()
 bearer = HTTPBearer(auto_error=True)
+
+_artifact_store: Dict[str, Dict[str, Any]] = {}
+
+
+def _make_upload_from_bytes(raw_bytes: bytes, filename: Optional[str]) -> UploadFile:
+    return UploadFile(filename=filename or "dataset.csv", file=io.BytesIO(raw_bytes))
+
+
+def _store_artifact(
+    request: Request,
+    *,
+    dataset_id: str,
+    artifact_type: str,
+    filename: str,
+    media_type: str,
+    content: bytes,
+) -> Dict[str, Any]:
+    artifact_id = str(uuid.uuid4())
+    _artifact_store[artifact_id] = {
+        "artifact_id": artifact_id,
+        "dataset_id": dataset_id,
+        "artifact_type": artifact_type,
+        "filename": filename,
+        "media_type": media_type,
+        "content": content,
+        "size_bytes": len(content),
+        "created_at": int(time.time()),
+    }
+    return {
+        "artifact_id": artifact_id,
+        "artifact_type": artifact_type,
+        "filename": filename,
+        "media_type": media_type,
+        "size_bytes": len(content),
+        "url": f"{request.base_url}artifacts/{artifact_id}",
+    }
 
 # --- Config ---
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))  # 20MB default
@@ -146,7 +184,7 @@ async def request_logging(request: Request, call_next):
 
 @app.middleware("http")
 async def limit_upload_size(request: Request, call_next):
-    if request.url.path in ("/profile", "/profile_summary", "/profile_column_detail", "/evidence_associations") and request.method.upper() == "POST":
+    if request.url.path in ("/profile", "/profile_summary", "/profile_column_detail", "/evidence_associations", "/profile_bundle") and request.method.upper() == "POST":
         cl = request.headers.get("content-length")
         if cl is not None:
             try:
@@ -159,7 +197,7 @@ async def limit_upload_size(request: Request, call_next):
 
 @app.middleware("http")
 async def basic_rate_limit(request: Request, call_next):
-    if request.url.path in ("/profile", "/profile_summary", "/profile_column_detail", "/evidence_associations") and request.method.upper() == "POST":
+    if request.url.path in ("/profile", "/profile_summary", "/profile_column_detail", "/evidence_associations", "/profile_bundle") and request.method.upper() == "POST":
         ip = _client_ip(request)
         now = time.time()
         q = _req_times[ip]
@@ -1776,7 +1814,7 @@ def _to_numeric_series(series: pd.Series) -> Tuple[pd.Series, float]:
     s = series
     non_null = s[~s.isna()]
     if len(non_null) == 0:
-        return pd.Series([pd.NA] * len(s), index=s.index, dtype="float64"), 0.0
+        return pd.Series([float("nan")] * len(s), index=s.index, dtype="float64"), 0.0
 
     if pd.api.types.is_numeric_dtype(s):
         num = pd.to_numeric(s, errors="coerce").astype("float64")
@@ -1786,7 +1824,7 @@ def _to_numeric_series(series: pd.Series) -> Tuple[pd.Series, float]:
     # String parse path (reuse your profiling parser)
     s_str = _as_str_series(non_null).str.strip()
     parsed, success = _try_parse_numeric_for_profile(s_str)
-    num_full = pd.Series([pd.NA] * len(s), index=s.index, dtype="float64")
+    num_full = pd.Series([float("nan")] * len(s), index=s.index, dtype="float64")
     num_full.loc[non_null.index] = parsed
     ok = int(success.sum())
     return num_full.astype("float64"), round((ok / len(non_null)) * 100.0, 6)
@@ -2560,9 +2598,311 @@ async def evidence_associations(
     }
 
 
+def _build_light_contract_xlsx(full_profile: Dict[str, Any], evidence: Dict[str, Any]) -> bytes:
+    sections: List[Tuple[str, str, str]] = [
+        (
+            "dataset_notes",
+            "Dataset Notes",
+            "FREE TEXT (recommended): Describe the dataset and intended structure.\n"
+            "Examples:\n"
+            "- 'Columns 1–12 represent Questions 1–12 of the OCQ scale.'\n"
+            "- 'Each participant has multiple visits; visit columns are labelled Visit1/Visit2.'\n"
+            "- 'These are survey waves; long format should use (participant_id, wave) as keys.'",
+        ),
+        (
+            "group_definitions",
+            "Group Definitions",
+            "OPTIONAL: Define families of variables (blocks/scales) in free text.\n"
+            "Examples:\n"
+            "- 'OCQ: Q1–Q12; total in ocq_total'\n"
+            "- 'PHQ9: phq_1..phq_9; total in phq_total'",
+        ),
+        (
+            "group_regex_rules",
+            "Group Regex Rules",
+            "OPTIONAL (advanced): Provide regex rules for repeated patterns.\n"
+            "Examples:\n"
+            "- 'OCQ_Q(\\d+)' or 'ocq_(\\d+)' or 'Q(\\d+)'\n"
+            "Keep small; the next step will validate/interpret.",
+        ),
+        (
+            "global_override_instructions",
+            "Global Override Instructions",
+            "OPTIONAL FREE TEXT: Any global rename/reshape instruction.\n"
+            "Examples:\n"
+            "- 'Treat baseline/week4/week8 as timepoints.'\n"
+            "- 'Do NOT pivot demographic columns.'",
+        ),
+        (
+            "global_renaming_instructions",
+            "Global Renaming Instructions",
+            "FREE TEXT: Provide global renaming guidance (e.g., columns 5-15 should be Q1..Q11).",
+        ),
+    ]
+
+    # Row schema: (style_idx, field_key, title_or_label, value)
+    rows: List[Tuple[int, str, str, str]] = [
+        (1, "", "Light Contract", ""),
+        (0, "", "", ""),
+    ]
+
+    for key, heading, help_text in sections:
+        rows.append((1, key, heading, ""))
+        rows.append((0, key, "Guidance", help_text))
+        rows.append((1, key, "Your Input", ""))
+        rows.append((0, key, "", ""))
+        rows.append((0, key, "", ""))
+        rows.append((0, "", "", ""))
+
+    shared: Dict[str, int] = {}
+    shared_vals: List[str] = []
+
+    def s_idx(value: str) -> int:
+        if value not in shared:
+            shared[value] = len(shared_vals)
+            shared_vals.append(value)
+        return shared[value]
+
+    def col_letter(index: int) -> str:
+        # 1-based column index to Excel letters.
+        result = ""
+        while index > 0:
+            index, rem = divmod(index - 1, 26)
+            result = chr(65 + rem) + result
+        return result
+
+    sheet_rows: List[str] = []
+    for r_i, (style_idx, field_key, label, value) in enumerate(rows, 1):
+        row_cells: List[str] = []
+        values = [field_key, label, value]
+        for c_i, cell_value in enumerate(values, 1):
+            col = col_letter(c_i)
+            idx = s_idx(cell_value)
+            style_attr = f' s="{style_idx}"' if style_idx == 1 and c_i in (2,) else ''
+            row_cells.append(f'<c r="{col}{r_i}" t="s"{style_attr}><v>{idx}</v></c>')
+        sheet_rows.append(f'<row r="{r_i}">{"".join(row_cells)}</row>')
+
+    shared_xml = (
+        f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        f'count="{len(shared_vals)}" uniqueCount="{len(shared_vals)}">'
+        + "".join(f"<si><t>{escape(v)}</t></si>" for v in shared_vals)
+        + "</sst>"
+    )
+
+    sheet_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<cols>'
+        '<col min="1" max="1" width="28" customWidth="1"/>'
+        '<col min="2" max="2" width="38" customWidth="1"/>'
+        '<col min="3" max="3" width="110" customWidth="1"/>'
+        '</cols>'
+        '<sheetData>' + "".join(sheet_rows) + '</sheetData>'
+        '</worksheet>'
+    )
+
+    styles_xml = """<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
+<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">
+  <fonts count=\"2\">
+    <font><sz val=\"11\"/><name val=\"Calibri\"/></font>
+    <font><b/><sz val=\"11\"/><name val=\"Calibri\"/></font>
+  </fonts>
+  <fills count=\"2\">
+    <fill><patternFill patternType=\"none\"/></fill>
+    <fill><patternFill patternType=\"gray125\"/></fill>
+  </fills>
+  <borders count=\"1\"><border/></borders>
+  <cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs>
+  <cellXfs count=\"2\">
+    <xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/>
+    <xf numFmtId=\"0\" fontId=\"1\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"/>
+  </cellXfs>
+  <cellStyles count=\"1\"><cellStyle name=\"Normal\" xfId=\"0\" builtinId=\"0\"/></cellStyles>
+</styleSheet>"""
+
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", """<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
+<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">
+  <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>
+  <Default Extension=\"xml\" ContentType=\"application/xml\"/>
+  <Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>
+  <Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>
+  <Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>
+  <Override PartName=\"/xl/sharedStrings.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml\"/>
+</Types>""")
+        zf.writestr("_rels/.rels", """<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
+<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">
+  <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>
+</Relationships>""")
+        zf.writestr("xl/workbook.xml", """<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
+<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">
+  <sheets>
+    <sheet name=\"light_contract\" sheetId=\"1\" r:id=\"rId1\"/>
+  </sheets>
+</workbook>""")
+        zf.writestr("xl/_rels/workbook.xml.rels", """<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
+<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">
+  <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>
+  <Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>
+  <Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings\" Target=\"sharedStrings.xml\"/>
+</Relationships>""")
+        zf.writestr("xl/styles.xml", styles_xml)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+        zf.writestr("xl/sharedStrings.xml", shared_xml)
+
+    return output.getvalue()
+
+
+@app.get("/artifacts/{artifact_id}")
+async def get_artifact(artifact_id: str, _=Depends(require_token)) -> StreamingResponse:
+    artifact = _artifact_store.get(artifact_id)
+    if not artifact:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    headers = {"Content-Disposition": f'attachment; filename="{artifact["filename"]}"'}
+    return StreamingResponse(
+        io.BytesIO(artifact["content"]),
+        media_type=artifact["media_type"],
+        headers=headers,
+    )
+
+
+@app.post("/profile_bundle")
+async def profile_bundle(
+    request: Request,
+    file: UploadFile = File(...),
+    dataset_id: str = Form(...),
+    max_categorical_cardinality: int = Form(20),
+    _=Depends(require_token),
+) -> Dict[str, Any]:
+    raw_bytes = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(raw_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Upload too large")
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    source_filename = file.filename or "dataset.csv"
+
+    summary_payload = await profile_summary(
+        request=request,
+        file=_make_upload_from_bytes(raw_bytes, source_filename),
+        dataset_id=dataset_id,
+        max_categorical_cardinality=max_categorical_cardinality,
+    )
+
+    full_profile = (await _run_full_profile(
+        request=request,
+        file=_make_upload_from_bytes(raw_bytes, source_filename),
+        dataset_id=dataset_id,
+        max_categorical_cardinality=max_categorical_cardinality,
+    ))["data_profile"]
+
+    flagged_columns = [
+        card.get("column")
+        for card in summary_payload.get("columns", [])
+        if bool((card.get("review") or {}).get("recommended"))
+    ]
+
+    column_details: Dict[str, Dict[str, Any]] = {}
+    for col in flagged_columns:
+        detail_payload = await profile_column_detail(
+            request=request,
+            file=_make_upload_from_bytes(raw_bytes, source_filename),
+            dataset_id=dataset_id,
+            column=col,
+            max_categorical_cardinality=max_categorical_cardinality,
+        )
+        try:
+            detail_obj = json.loads(detail_payload.get("profile_json") or "{}")
+        except Exception:
+            detail_obj = {"_raw_profile_json": detail_payload.get("profile_json")}
+
+        column_details[col] = detail_obj
+        if col in full_profile.get("columns", {}):
+            full_profile["columns"][col]["column_detail"] = detail_obj
+
+    evidence_payload = await evidence_associations(
+        request=request,
+        file=_make_upload_from_bytes(raw_bytes, source_filename),
+        dataset_id=dataset_id,
+        max_categorical_cardinality=max_categorical_cardinality,
+    )
+
+    profile_json_bytes = json.dumps(full_profile, ensure_ascii=False, indent=2).encode("utf-8")
+    profile_artifact = _store_artifact(
+        request,
+        dataset_id=dataset_id,
+        artifact_type="full_profile_json",
+        filename=f"{dataset_id}_full_profile.json",
+        media_type="application/json",
+        content=profile_json_bytes,
+    )
+
+    evidence_json_bytes = json.dumps(evidence_payload, ensure_ascii=False, indent=2).encode("utf-8")
+    evidence_artifact = _store_artifact(
+        request,
+        dataset_id=dataset_id,
+        artifact_type="evidence_associations_json",
+        filename=f"{dataset_id}_evidence_associations.json",
+        media_type="application/json",
+        content=evidence_json_bytes,
+    )
+
+    xlsx_bytes = _build_light_contract_xlsx(full_profile, evidence_payload)
+    contract_artifact = _store_artifact(
+        request,
+        dataset_id=dataset_id,
+        artifact_type="light_contract_xlsx",
+        filename=f"{dataset_id}_light_contract.xlsx",
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        content=xlsx_bytes,
+    )
+
+    artifacts_for_manifest = [profile_artifact, evidence_artifact, contract_artifact]
+    manifest_lines = [
+        f"dataset_id: {dataset_id}",
+        f"dataset_sha256: {full_profile.get('dataset_sha256')}",
+        "",
+        "Artifacts:",
+    ]
+    for a in artifacts_for_manifest:
+        manifest_lines.extend([
+            f"- {a['artifact_type']}: {a['url']}",
+            f"  filename: {a['filename']}",
+            f"  media_type: {a['media_type']}",
+            f"  size_bytes: {a['size_bytes']}",
+        ])
+
+    manifest_content = "\n".join(manifest_lines).encode("utf-8")
+    manifest_artifact = _store_artifact(
+        request,
+        dataset_id=dataset_id,
+        artifact_type="manifest_txt",
+        filename=f"{dataset_id}_manifest.txt",
+        media_type="text/plain; charset=utf-8",
+        content=manifest_content,
+    )
+
+    return {
+        "dataset_id": dataset_id,
+        "dataset_sha256": full_profile.get("dataset_sha256"),
+        "n_rows": full_profile.get("n_rows"),
+        "n_columns": full_profile.get("n_columns"),
+        "flagged_columns": flagged_columns,
+        "flagged_column_count": len(flagged_columns),
+        "summary": summary_payload,
+        "integrated_profile": full_profile,
+        "column_details": column_details,
+        "evidence_associations": evidence_payload,
+        "artifacts": artifacts_for_manifest + [manifest_artifact],
+    }
+
+
+
 
 @app.get("/health")
 def health() -> Dict[str, str]:
     return {"status": "ok"}
 
-#testing
