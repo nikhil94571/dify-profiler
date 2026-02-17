@@ -2599,10 +2599,11 @@ async def evidence_associations(
 
 
 def _build_light_contract_xlsx(full_profile: Dict[str, Any], evidence: Dict[str, Any]) -> bytes:
-    sections: List[Tuple[str, str, str]] = [
+    _ = evidence
+
+    headers: List[Tuple[str, str]] = [
         (
             "dataset_notes",
-            "Dataset Notes",
             "FREE TEXT (recommended): Describe the dataset and intended structure.\n"
             "Examples:\n"
             "- 'Columns 1–12 represent Questions 1–12 of the OCQ scale.'\n"
@@ -2611,7 +2612,6 @@ def _build_light_contract_xlsx(full_profile: Dict[str, Any], evidence: Dict[str,
         ),
         (
             "group_definitions",
-            "Group Definitions",
             "OPTIONAL: Define families of variables (blocks/scales) in free text.\n"
             "Examples:\n"
             "- 'OCQ: Q1–Q12; total in ocq_total'\n"
@@ -2619,7 +2619,6 @@ def _build_light_contract_xlsx(full_profile: Dict[str, Any], evidence: Dict[str,
         ),
         (
             "group_regex_rules",
-            "Group Regex Rules",
             "OPTIONAL (advanced): Provide regex rules for repeated patterns.\n"
             "Examples:\n"
             "- 'OCQ_Q(\\d+)' or 'ocq_(\\d+)' or 'Q(\\d+)'\n"
@@ -2627,7 +2626,6 @@ def _build_light_contract_xlsx(full_profile: Dict[str, Any], evidence: Dict[str,
         ),
         (
             "global_override_instructions",
-            "Global Override Instructions",
             "OPTIONAL FREE TEXT: Any global rename/reshape instruction.\n"
             "Examples:\n"
             "- 'Treat baseline/week4/week8 as timepoints.'\n"
@@ -2635,24 +2633,9 @@ def _build_light_contract_xlsx(full_profile: Dict[str, Any], evidence: Dict[str,
         ),
         (
             "global_renaming_instructions",
-            "Global Renaming Instructions",
             "FREE TEXT: Provide global renaming guidance (e.g., columns 5-15 should be Q1..Q11).",
         ),
     ]
-
-    # Row schema: (style_idx, field_key, title_or_label, value)
-    rows: List[Tuple[int, str, str, str]] = [
-        (1, "", "Light Contract", ""),
-        (0, "", "", ""),
-    ]
-
-    for key, heading, help_text in sections:
-        rows.append((1, key, heading, ""))
-        rows.append((0, key, "Guidance", help_text))
-        rows.append((1, key, "Your Input", ""))
-        rows.append((0, key, "", ""))
-        rows.append((0, key, "", ""))
-        rows.append((0, "", "", ""))
 
     shared: Dict[str, int] = {}
     shared_vals: List[str] = []
@@ -2671,16 +2654,49 @@ def _build_light_contract_xlsx(full_profile: Dict[str, Any], evidence: Dict[str,
             result = chr(65 + rem) + result
         return result
 
-    sheet_rows: List[str] = []
-    for r_i, (style_idx, field_key, label, value) in enumerate(rows, 1):
+    # Sheet 1: row 1 headings, row 2 descriptions, row 3 fillable cells, row 5 note.
+    sheet1_rows: Dict[int, List[Tuple[int, str]]] = {
+        1: [(1, heading) for heading, _ in headers],
+        2: [(2, description) for _, description in headers],
+        3: [(0, "") for _ in headers],
+        5: [(0, "Check worksheet 2 for naming context")],
+    }
+
+    sheet1_xml_rows: List[str] = []
+    for row_number in sorted(sheet1_rows):
         row_cells: List[str] = []
-        values = [field_key, label, value]
-        for c_i, cell_value in enumerate(values, 1):
-            col = col_letter(c_i)
+        for column_number, (style_idx, cell_value) in enumerate(sheet1_rows[row_number], 1):
+            ref = f"{col_letter(column_number)}{row_number}"
             idx = s_idx(cell_value)
-            style_attr = f' s="{style_idx}"' if style_idx == 1 and c_i in (2,) else ''
-            row_cells.append(f'<c r="{col}{r_i}" t="s"{style_attr}><v>{idx}</v></c>')
-        sheet_rows.append(f'<row r="{r_i}">{"".join(row_cells)}</row>')
+            style_attr = f' s="{style_idx}"' if style_idx else ""
+            row_cells.append(f'<c r="{ref}" t="s"{style_attr}><v>{idx}</v></c>')
+        sheet1_xml_rows.append(f'<row r="{row_number}">{"".join(row_cells)}</row>')
+
+    column_names: List[str] = []
+    if isinstance(full_profile.get("columns"), dict):
+        column_names = list(full_profile["columns"].keys())
+
+    # Sheet 2: row 1 headings, row 2+ include dataset column index + current name.
+    sheet2_xml_rows: List[str] = []
+    sheet2_heading_cells = [
+        ('A1', 1, 'Column number'),
+        ('B1', 1, 'Current column name'),
+    ]
+    heading_row_cells: List[str] = []
+    for ref, style_idx, value in sheet2_heading_cells:
+        idx = s_idx(value)
+        heading_row_cells.append(f'<c r="{ref}" t="s" s="{style_idx}"><v>{idx}</v></c>')
+    sheet2_xml_rows.append(f'<row r="1">{"".join(heading_row_cells)}</row>')
+
+    for i, column_name in enumerate(column_names, 1):
+        row_number = i + 1
+        idx_num = s_idx(str(i))
+        idx_name = s_idx(column_name)
+        row_cells = [
+            f'<c r="A{row_number}" t="s"><v>{idx_num}</v></c>',
+            f'<c r="B{row_number}" t="s"><v>{idx_name}</v></c>',
+        ]
+        sheet2_xml_rows.append(f'<row r="{row_number}">{"".join(row_cells)}</row>')
 
     shared_xml = (
         f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -2690,66 +2706,85 @@ def _build_light_contract_xlsx(full_profile: Dict[str, Any], evidence: Dict[str,
         + "</sst>"
     )
 
-    sheet_xml = (
+    sheet1_xml = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
         '<cols>'
-        '<col min="1" max="1" width="28" customWidth="1"/>'
-        '<col min="2" max="2" width="38" customWidth="1"/>'
-        '<col min="3" max="3" width="110" customWidth="1"/>'
+        '<col min="1" max="1" width="36" customWidth="1"/>'
+        '<col min="2" max="2" width="36" customWidth="1"/>'
+        '<col min="3" max="3" width="36" customWidth="1"/>'
+        '<col min="4" max="4" width="36" customWidth="1"/>'
+        '<col min="5" max="5" width="42" customWidth="1"/>'
         '</cols>'
-        '<sheetData>' + "".join(sheet_rows) + '</sheetData>'
+        '<sheetData>' + "".join(sheet1_xml_rows) + '</sheetData>'
         '</worksheet>'
     )
 
-    styles_xml = """<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
-<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">
-  <fonts count=\"2\">
-    <font><sz val=\"11\"/><name val=\"Calibri\"/></font>
-    <font><b/><sz val=\"11\"/><name val=\"Calibri\"/></font>
+    sheet2_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<cols>'
+        '<col min="1" max="1" width="18" customWidth="1"/>'
+        '<col min="2" max="2" width="55" customWidth="1"/>'
+        '</cols>'
+        '<sheetData>' + "".join(sheet2_xml_rows) + '</sheetData>'
+        '</worksheet>'
+    )
+
+    styles_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts count="3">
+    <font><sz val="11"/><name val="Calibri"/></font>
+    <font><b/><sz val="11"/><name val="Calibri"/></font>
+    <font><i/><sz val="11"/><name val="Calibri"/></font>
   </fonts>
-  <fills count=\"2\">
-    <fill><patternFill patternType=\"none\"/></fill>
-    <fill><patternFill patternType=\"gray125\"/></fill>
+  <fills count="2">
+    <fill><patternFill patternType="none"/></fill>
+    <fill><patternFill patternType="gray125"/></fill>
   </fills>
-  <borders count=\"1\"><border/></borders>
-  <cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs>
-  <cellXfs count=\"2\">
-    <xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/>
-    <xf numFmtId=\"0\" fontId=\"1\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyFont=\"1\"/>
+  <borders count="1"><border/></borders>
+  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+  <cellXfs count="3">
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
+    <xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>
+    <xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1"/>
   </cellXfs>
-  <cellStyles count=\"1\"><cellStyle name=\"Normal\" xfId=\"0\" builtinId=\"0\"/></cellStyles>
+  <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
 </styleSheet>"""
 
     output = io.BytesIO()
     with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("[Content_Types].xml", """<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
-<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">
-  <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>
-  <Default Extension=\"xml\" ContentType=\"application/xml\"/>
-  <Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>
-  <Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>
-  <Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>
-  <Override PartName=\"/xl/sharedStrings.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml\"/>
+        zf.writestr("[Content_Types].xml", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+  <Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>
 </Types>""")
-        zf.writestr("_rels/.rels", """<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
-<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">
-  <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>
+        zf.writestr("_rels/.rels", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
 </Relationships>""")
-        zf.writestr("xl/workbook.xml", """<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
-<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">
+        zf.writestr("xl/workbook.xml", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
   <sheets>
-    <sheet name=\"light_contract\" sheetId=\"1\" r:id=\"rId1\"/>
+    <sheet name="light_contract" sheetId="1" r:id="rId1"/>
+    <sheet name="naming_context" sheetId="2" r:id="rId2"/>
   </sheets>
 </workbook>""")
-        zf.writestr("xl/_rels/workbook.xml.rels", """<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
-<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">
-  <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>
-  <Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>
-  <Relationship Id=\"rId3\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings\" Target=\"sharedStrings.xml\"/>
+        zf.writestr("xl/_rels/workbook.xml.rels", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+  <Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>
 </Relationships>""")
         zf.writestr("xl/styles.xml", styles_xml)
-        zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet1_xml)
+        zf.writestr("xl/worksheets/sheet2.xml", sheet2_xml)
         zf.writestr("xl/sharedStrings.xml", shared_xml)
 
     return output.getvalue()
