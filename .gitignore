@@ -1,19 +1,68 @@
-# Environment
+# =========================
+# Environment variables
+# =========================
 .env
-.venv/
+.env.*
+*.env
 
-# Python
+# =========================
+# Service account / key files
+# =========================
+sa-key.json
+service-account.json
+credentials.json
+*credentials*.json
+*service_account*.json
+*private_key*.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# =========================
+# Google Cloud / Firebase
+# =========================
+*.gcp.json
+*.firebase.json
+
+# =========================
+# Python virtual environments
+# =========================
+.venv/
+venv/
+env/
+ENV/
+
+# =========================
+# Python artifacts
+# =========================
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.egg-info/
+dist/
+build/
 
+# =========================
+# Docker
+# =========================
+*.tar
+docker-compose.override.yml
+
+# =========================
 # Logs
+# =========================
 *.log
 
+# =========================
 # IDE
+# =========================
+.vscode/
 .idea/
 
+# =========================
 # OS
+# =========================
 .DS_Store
 Thumbs.db
