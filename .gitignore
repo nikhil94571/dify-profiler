@@ -35,3 +35,7 @@ sa-key.json
 # --- generated / downloads ---
 downloaded_*.xlsx
 *.xlsx
+
+#Patch
+*.patch
+*.rej
