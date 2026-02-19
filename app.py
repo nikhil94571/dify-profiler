@@ -15,7 +15,7 @@ from manifest_export import upload_and_sign_text
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from google.cloud import storage
 import google.auth
@@ -40,8 +40,7 @@ RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "30"))          # requests
 RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))    # seconds
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-
-logger = logging.getLogger("profiler")
+logger = logging.getLogger("profiler")
 
 # Stage logger: goes to uvicorn stderr / Cloud Run logs
 stage_logger = logging.getLogger("uvicorn.error")
@@ -164,7 +163,7 @@ async def request_logging(request: Request, call_next):
 
 @app.middleware("http")
 async def limit_upload_size(request: Request, call_next):
-    if request.url.path in ("/profile", "/profile_summary", "/profile_column_detail", "/evidence_associations", "/export/light-contract-xlsx") and request.method.upper() == "POST":
+    if request.url.path in ("/profile", "/profile_summary", "/profile_column_detail", "/evidence_associations", "/export/light-contract-xlsx", "/full-bundle") and request.method.upper() == "POST":
         cl = request.headers.get("content-length")
         if cl is not None:
             try:
@@ -177,7 +176,7 @@ async def limit_upload_size(request: Request, call_next):
 
 @app.middleware("http")
 async def basic_rate_limit(request: Request, call_next):
-    if request.url.path in ("/profile", "/profile_summary", "/profile_column_detail", "/evidence_associations", "/export/light-contract-xlsx") and request.method.upper() == "POST":
+    if request.url.path in ("/profile", "/profile_summary", "/profile_column_detail", "/evidence_associations", "/export/light-contract-xlsx", "/full-bundle") and request.method.upper() == "POST":
         ip = _client_ip(request)
         now = time.time()
         q = _req_times[ip]
@@ -202,8 +201,7 @@ def infer_type(s: pd.Series) -> str:
         return "boolean"
     if pd.api.types.is_integer_dtype(s):
         return "integer"
-    if pd.api.types.is_float_dtype(s):
-        return "float"
+    if pd.api.types.is_float_dtype(s):        return "float"
     if pd.api.types.is_datetime64_any_dtype(s):
         return "datetime"
     return "text"
@@ -2782,3 +2780,556 @@ def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 #testing
+
+ARTIFACT_SPECS: Dict[str, Dict[str, str]] = {
+    "A1": {"filename": "run_manifest.json", "content_type": "application/json"},
+    "A2": {"filename": "column_dictionary.jsonl", "content_type": "application/jsonl"},
+    "A3": {"filename": "missingness_catalog.json", "content_type": "application/json"},
+    "A4": {"filename": "key_candidates_and_integrity.json", "content_type": "application/json"},
+    "A5": {"filename": "grain_tests.json", "content_type": "application/json"},
+    "A6": {"filename": "duplicates_report.json", "content_type": "application/json"},
+    "A7": {"filename": "repeat_dimension_candidates.json", "content_type": "application/json"},
+    "A8": {"filename": "role_scores.json", "content_type": "application/json"},
+    "A9": {"filename": "relationships_and_derivations.json", "content_type": "application/json"},
+    "A10": {"filename": "glimpses.json", "content_type": "application/json"},
+    "B1": {"filename": "family_packets.jsonl", "content_type": "application/jsonl"},
+}
+
+
+def _require_api_key_from_request(request: Request) -> None:
+    expected = os.getenv("PROFILER_API_KEY")
+    if not expected:
+        raise HTTPException(status_code=500, detail="Missing PROFILER_API_KEY env var")
+
+    auth = request.headers.get("authorization", "")
+    api_key = request.headers.get("x-api-key")
+    bearer_token = None
+    if auth.lower().startswith("bearer "):
+        bearer_token = auth[7:].strip()
+
+    if api_key == expected or bearer_token == expected:
+        return
+    raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def _read_dataframe(raw_bytes: bytes, filename: Optional[str]) -> pd.DataFrame:
+    name = (filename or "").lower()
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        return pd.read_excel(io.BytesIO(raw_bytes))
+    return pd.read_csv(io.BytesIO(raw_bytes), low_memory=False)
+
+
+def _json_bytes(payload: Any) -> bytes:
+    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def _jsonl_bytes(rows: List[Dict[str, Any]]) -> bytes:
+    return ("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n").encode("utf-8")
+
+
+def _series_samples(s: pd.Series, dataset_sha256: str, col: str) -> Dict[str, List[Optional[str]]]:
+    s_non_na = _non_null_series(s)
+    s_non_na_str = _as_str_series(s_non_na)
+    head_vals = [_stringify_value(v) for v in s_non_na_str.head(3).tolist()]
+    tail_vals = [_stringify_value(v) for v in s_non_na_str.tail(2).tolist()]
+    if len(s_non_na_str) > 0:
+        rnd_n = min(3, len(s_non_na_str))
+        rnd = s_non_na_str.sample(n=rnd_n, random_state=_stable_int_seed(dataset_sha256, col))
+        random_vals = [_stringify_value(v) for v in rnd.tolist()]
+    else:
+        random_vals = []
+    return {"head": head_vals, "tail": tail_vals, "random": random_vals}
+
+
+def _build_families(columns: List[str]) -> List[Dict[str, Any]]:
+    families: Dict[str, List[str]] = defaultdict(list)
+    for c in columns:
+        m = re.match(r"^(.*?)[_\-](\d+)$", c)
+        if m:
+            families[m.group(1)].append(c)
+    out: List[Dict[str, Any]] = []
+    for stem, cols in sorted(families.items()):
+        if len(cols) < 2:
+            continue
+        idxs = []
+        for c in cols:
+            m = re.match(r"^(.*?)[_\-](\d+)$", c)
+            if m:
+                idxs.append(int(m.group(2)))
+        idxs = sorted(set(idxs))
+        out.append({
+            "family_id": stem,
+            "columns": sorted(cols),
+            "patterns": ["suffix_numeric_index"],
+            "extracted_index_set": idxs,
+            "shared_index_analysis": {
+                "shared": True,
+                "shared_index_set": idxs,
+                "mismatched_columns": [],
+            },
+            "index_type_candidate": "ordinal",
+            "flags": {
+                "variable_specific_indices": False,
+                "suspected_timepoint": any(k in stem.lower() for k in ["time", "visit", "wave", "month", "day"]),
+                "suspected_item": any(k in stem.lower() for k in ["item", "q", "score", "phq", "gad"]),
+            },
+        })
+    return out
+
+
+def _upload_artifact(bucket: storage.Bucket, object_path: str, payload: bytes, content_type: str) -> Dict[str, Any]:
+    blob = bucket.blob(object_path)
+    blob.upload_from_string(payload, content_type=content_type)
+    return {
+        "object_path": object_path,
+        "content_type": content_type,
+        "sha256": sha256_hex(payload),
+        "size_bytes": len(payload),
+    }
+
+
+def _build_artifact_url(base_url: str, artifact_id: str, run_id: str, mode: str) -> str:
+    return f"{base_url}/artifacts/{artifact_id}/{mode}?run_id={run_id}"
+
+
+@app.post("/full-bundle")
+async def full_bundle(
+    request: Request,
+    file: UploadFile = File(...),
+    dataset_id: str = Form(...),
+    max_categorical_cardinality: int = Form(20),
+    _=Depends(require_token),
+) -> Dict[str, Any]:
+    raw_bytes = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(raw_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Upload too large")
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    dataset_sha256 = sha256_hex(raw_bytes)
+    df = _read_dataframe(raw_bytes, file.filename)
+    n_rows, n_cols = df.shape
+
+    profile_upload = UploadFile(filename=file.filename, file=io.BytesIO(raw_bytes), headers=file.headers)
+    profile_result = await _run_full_profile(
+        request=request,
+        file=profile_upload,
+        dataset_id=dataset_id,
+        max_categorical_cardinality=max_categorical_cardinality,
+        include_samples=True,
+        include_pattern_examples=True,
+        include_deep_profiles=True,
+    )
+    cols_profile = profile_result["data_profile"]["columns"]
+
+    missing_global: Dict[str, int] = defaultdict(int)
+    missing_by_col: Dict[str, Dict[str, int]] = {}
+    column_dictionary_rows: List[Dict[str, Any]] = []
+
+    for col in df.columns:
+        p = cols_profile.get(col, {})
+        missing_tokens = p.get("missing_like_tokens", {})
+        missing_by_col[col] = missing_tokens
+        for tkn, cnt in missing_tokens.items():
+            missing_global[tkn] += int(cnt)
+
+        inferred_type = p.get("inferred_type", "text")
+        top_candidate = (p.get("candidates") or [{}])[0]
+        type_conf = float(top_candidate.get("confidence", 0.0) or 0.0)
+        one_hot_like = bool(inferred_type in ("integer", "float") and p.get("unique_count", 0) <= 2)
+        is_unique_like = float((p.get("unique_count", 0) / n_rows) if n_rows else 0.0)
+
+        row = {
+            "column": col,
+            "inferred_type": inferred_type,
+            "type_confidence": round(type_conf, 6),
+            "missing_tokens_observed": missing_tokens,
+            "missing_pct": p.get("missing_pct", 0.0),
+            "unique_count": p.get("unique_count", 0),
+            "is_unique_like": round(is_unique_like, 6),
+            "top_levels": [x.get("value") for x in (p.get("samples", {}).get("top_frequent", [])[:8])],
+            "level_counts_sample": p.get("samples", {}).get("top_frequent", [])[:8],
+            "is_one_hot_like": one_hot_like,
+            "numeric_profile": p.get("numeric_profile"),
+            "datetime_profile": p.get("date_profile"),
+            "samples": _series_samples(df[col], dataset_sha256, col),
+        }
+        column_dictionary_rows.append(row)
+
+    missing_catalog = {
+        "global_tokens": dict(sorted(missing_global.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "per_column_tokens": missing_by_col,
+        "candidate_classification": [
+            {
+                "token": t,
+                "class_candidate": "sentinel_numeric" if re.fullmatch(r"\d+", t or "") else (
+                    "refused" if "prefer not" in (t or "").lower() else (
+                        "not_applicable" if (t or "").upper() in {"N/A", "NA"} else "missing"
+                    )
+                ),
+                "evidence": {
+                    "columns": [c for c, toks in missing_by_col.items() if t in toks],
+                    "global_count": c,
+                },
+            }
+            for t, c in sorted(missing_global.items(), key=lambda kv: (-kv[1], kv[0]))
+        ],
+    }
+
+    key_candidates = []
+    for col in df.columns:
+        s = df[col]
+        uniq_pct = float(s.nunique(dropna=True) / n_rows) if n_rows else 0.0
+        miss_pct = float(s.isna().mean()) if n_rows else 0.0
+        stability = max(0.0, min(1.0, uniq_pct * (1.0 - miss_pct)))
+        if uniq_pct >= 0.8:
+            key_candidates.append({
+                "column": col,
+                "uniqueness_pct": round(uniq_pct * 100, 6),
+                "missing_pct": round(miss_pct * 100, 6),
+                "stability_score": round(stability, 6),
+                "id_like_signals": {
+                    "high_cardinality": bool(uniq_pct > 0.95),
+                    "regex_id_shape": bool(df[col].astype("string").str.match(r"^[A-Za-z0-9_-]{6,}$", na=False).mean() > 0.8),
+                },
+            })
+    key_candidates.sort(key=lambda x: (-x["stability_score"], x["column"]))
+
+    integrity_checks = []
+    attrs = [c for c in df.columns if c not in {x["column"] for x in key_candidates[:3]}][:5]
+    for k in key_candidates[:3]:
+        key_col = k["column"]
+        grouped = df[[key_col] + attrs].dropna(subset=[key_col]).groupby(key_col, dropna=True)
+        conflicts = {}
+        for a in attrs:
+            v = grouped[a].nunique(dropna=True)
+            bad_ids = v[v > 1].index.tolist()[:5]
+            if bad_ids:
+                conflicts[a] = {"conflict_id_count": int((v > 1).sum()), "examples": [str(x) for x in bad_ids]}
+        integrity_checks.append({"key_column": key_col, "invariant_attribute_drift": conflicts})
+
+    key_integrity = {"key_candidates": key_candidates, "integrity_checks": integrity_checks}
+
+    candidate_sets = []
+    id_cols = [k["column"] for k in key_candidates[:2]]
+    time_like = [c for c in df.columns if any(t in c.lower() for t in ["time", "date", "visit", "wave", "month", "day"])][:2]
+    for c in id_cols:
+        candidate_sets.append([c])
+        for tcol in time_like:
+            if tcol != c:
+                candidate_sets.append([c, tcol])
+    candidate_sets = candidate_sets[:8]
+
+    grain_tests = []
+    for keys in candidate_sets:
+        dup_mask = df.duplicated(subset=keys, keep=False)
+        dup_rows = int(dup_mask.sum())
+        dup_groups = int(df[df.duplicated(subset=keys, keep=False)].groupby(keys, dropna=False).ngroups) if dup_rows else 0
+        non_keys = [c for c in df.columns if c not in keys]
+        identical_pct = 0.0
+        conflict_examples = []
+        if dup_rows and non_keys:
+            g = df[df.duplicated(subset=keys, keep=False)].groupby(keys, dropna=False)
+            identical = 0
+            total = 0
+            for group_key, gdf in g:
+                total += 1
+                if len(gdf[non_keys].drop_duplicates()) == 1:
+                    identical += 1
+                elif len(conflict_examples) < 3:
+                    conflict_examples.append({"key": group_key if isinstance(group_key, tuple) else [group_key], "rows": gdf.head(2).to_dict(orient="records")})
+            identical_pct = float((identical / total) * 100.0) if total else 0.0
+        sev = min(1.0, (dup_rows / max(1, n_rows)))
+        grain_tests.append({
+            "keys_tested": keys,
+            "dup_row_count": dup_rows,
+            "dup_groups_count": dup_groups,
+            "identical_duplicate_pct": round(identical_pct, 6),
+            "conflicting_duplicate_examples": conflict_examples,
+            "collision_severity_score": round(sev, 6),
+        })
+
+    duplicates_report = {
+        "exact_duplicate_rows": {
+            "count": int(df.duplicated(keep=False).sum()),
+            "sample_row_hashes": [
+                sha256_hex(json.dumps(r, sort_keys=True, default=str).encode("utf-8"))
+                for r in df[df.duplicated(keep=False)].head(10).to_dict(orient="records")
+            ],
+        },
+        "grain_duplicates": grain_tests,
+    }
+
+    families = _build_families(list(df.columns))
+    repeat_candidates = {"families": families}
+
+    role_scores = {"columns": []}
+    for row in column_dictionary_rows:
+        uniq = float(row["is_unique_like"])
+        inferred = row["inferred_type"]
+        scores = {
+            "id_key": round(min(1.0, uniq), 6),
+            "invariant_attr": round(min(1.0, max(0.0, 1.0 - uniq)), 6),
+            "measure": 0.8 if inferred in {"integer", "float"} else 0.2,
+            "repeat_index": 0.8 if any(x in row["column"].lower() for x in ["time", "visit", "wave", "index", "month", "day"]) else 0.1,
+            "derived": 0.6 if any(x in row["column"].lower() for x in ["total", "sum", "score", "avg", "mean"]) else 0.1,
+            "multivalue_cell": 0.7 if (cols_profile.get(row["column"], {}).get("patterns", {}).get("multi_value", {}).get("multi_token_pct", 0) > 20) else 0.1,
+            "one_hot_member": 0.8 if row["is_one_hot_like"] else 0.1,
+            "ignore": 0.05,
+        }
+        role_scores["columns"].append({"column": row["column"], "role_scores": scores, "features": {"unique_ratio": uniq, "inferred_type": inferred}})
+
+    rel = {
+        "derived_totals": [],
+        "functional_dependencies": [],
+        "one_hot_blocks": [],
+        "near_duplicate_columns": [],
+        "coded_categorical_flags": [],
+    }
+    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    for c in numeric_cols:
+        if df[c].nunique(dropna=True) <= max_categorical_cardinality:
+            rel["coded_categorical_flags"].append({"column": c, "reason": "numeric_low_cardinality"})
+
+    for i, c1 in enumerate(numeric_cols[:20]):
+        for c2 in numeric_cols[i + 1:20]:
+            overlap = df[[c1, c2]].dropna()
+            if len(overlap) >= ASSOC_MIN_OVERLAP:
+                corr = overlap[c1].corr(overlap[c2])
+                if pd.notna(corr) and abs(corr) > 0.98:
+                    rel["near_duplicate_columns"].append({"columns": [c1, c2], "pearson": float(corr)})
+
+    one_hot_groups: Dict[str, List[str]] = defaultdict(list)
+    for c in df.columns:
+        m = re.match(r"^(.*?)[_\-](yes|no|true|false|male|female|other|1|0)$", c, re.IGNORECASE)
+        if m:
+            one_hot_groups[m.group(1)].append(c)
+    for stem, cols in one_hot_groups.items():
+        if len(cols) >= 2:
+            sub = df[cols].apply(pd.to_numeric, errors="coerce").fillna(0)
+            row_sum = sub.sum(axis=1)
+            rel["one_hot_blocks"].append({
+                "group": stem,
+                "columns": cols,
+                "exclusive_pct": float((row_sum <= 1).mean() * 100.0),
+                "exactly_one_pct": float((row_sum == 1).mean() * 100.0),
+            })
+
+    curated_cols = list(dict.fromkeys(id_cols + time_like + [c for c in df.columns if c not in set(id_cols + time_like)][:5]))
+    global_glimpse = {
+        "head": df[curated_cols].head(5).to_dict(orient="records") if curated_cols else [],
+        "tail": df[curated_cols].tail(5).to_dict(orient="records") if curated_cols else [],
+        "random": df[curated_cols].sample(n=min(5, len(df)), random_state=_stable_int_seed(dataset_sha256, "global")).to_dict(orient="records") if curated_cols and len(df) else [],
+        "curated_columns": curated_cols,
+    }
+    per_family = []
+    for fam in families:
+        fam_cols = list(dict.fromkeys(id_cols + fam["columns"]))
+        per_family.append({
+            "family_id": fam["family_id"],
+            "columns": fam["columns"],
+            "rows": df[fam_cols].head(5).to_dict(orient="records") if fam_cols else [],
+        })
+    glimpses = {"global": global_glimpse, "per_family": per_family}
+
+    family_packets = []
+    col_dict_map = {r["column"]: r for r in column_dictionary_rows}
+    for fam in families:
+        fam_cols = fam["columns"]
+        family_packets.append({
+            "family_id": fam["family_id"],
+            "columns": fam_cols,
+            "detected_pattern_index_summary": {
+                "patterns": fam["patterns"],
+                "index": fam["extracted_index_set"],
+                "index_type_candidate": fam["index_type_candidate"],
+            },
+            "B_subset": [col_dict_map[c] for c in fam_cols if c in col_dict_map],
+            "C_subset": {
+                "repeat_candidate": fam,
+                "grain_collisions_touching_family": [g for g in grain_tests if any(c in fam_cols for c in g["keys_tested"])],
+            },
+            "F_subset": next((pf for pf in per_family if pf["family_id"] == fam["family_id"]), {"rows": []}),
+        })
+
+    run_id = uuid4().hex
+    base_url = str(request.base_url).rstrip("/")
+    bucket_name = os.getenv("EXPORT_BUCKET")
+    if not bucket_name:
+        raise HTTPException(status_code=500, detail="Missing EXPORT_BUCKET env var")
+
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+
+    payloads: Dict[str, bytes] = {
+        "A2": _jsonl_bytes(column_dictionary_rows),
+        "A3": _json_bytes(missing_catalog),
+        "A4": _json_bytes(key_integrity),
+        "A5": _json_bytes({"tests": grain_tests}),
+        "A6": _json_bytes(duplicates_report),
+        "A7": _json_bytes(repeat_candidates),
+        "A8": _json_bytes(role_scores),
+        "A9": _json_bytes(rel),
+        "A10": _json_bytes(glimpses),
+        "B1": _jsonl_bytes(family_packets),
+    }
+
+    uploaded_meta: Dict[str, Dict[str, Any]] = {}
+    for aid, payload in payloads.items():
+        spec = ARTIFACT_SPECS[aid]
+        object_path = f"runs/{run_id}/{spec['filename']}"
+        uploaded_meta[aid] = _upload_artifact(bucket, object_path, payload, spec["content_type"])
+
+    run_manifest = {
+        "run_id": run_id,
+        "dataset_id": dataset_id,
+        "dataset_sha256": dataset_sha256,
+        "n_rows": int(n_rows),
+        "n_cols": int(n_cols),
+        "profiling_limits": {
+            "max_categorical_cardinality": int(max_categorical_cardinality),
+            "ASSOC_MIN_OVERLAP": ASSOC_MIN_OVERLAP,
+            "ASSOC_TOL_ABS": ASSOC_TOL_ABS,
+            "ASSOC_TOL_REL": ASSOC_TOL_REL,
+        },
+        "artifacts": [
+            {
+                "artifact_id": aid,
+                "filename": ARTIFACT_SPECS[aid]["filename"],
+                "download_url": _build_artifact_url(base_url, aid, run_id, "download"),
+                "meta_url": _build_artifact_url(base_url, aid, run_id, "meta"),
+                "size_bytes": meta["size_bytes"],
+            }
+            for aid, meta in uploaded_meta.items()
+        ],
+    }
+
+    manifest_payload = _json_bytes(run_manifest)
+    manifest_object_path = f"runs/{run_id}/manifest.json"
+    manifest_meta = _upload_artifact(bucket, manifest_object_path, manifest_payload, "application/json")
+    uploaded_meta["A1"] = manifest_meta
+
+    registry_manifest = {
+        "run_id": run_id,
+        "dataset_id": dataset_id,
+        "dataset_sha256": dataset_sha256,
+        "n_rows": int(n_rows),
+        "n_cols": int(n_cols),
+        "artifact_registry": [
+            {
+                "artifact_id": aid,
+                "object_path": meta["object_path"],
+                "bucket": bucket_name,
+                "content_type": meta["content_type"],
+                "sha256": meta["sha256"],
+                "size_bytes": meta["size_bytes"],
+            }
+            for aid, meta in sorted(uploaded_meta.items(), key=lambda kv: kv[0])
+            if aid.startswith("A")
+        ],
+    }
+    _upload_artifact(bucket, manifest_object_path, _json_bytes(registry_manifest), "application/json")
+
+    return {
+        "status": "success",
+        "run_id": run_id,
+        "dataset_id": dataset_id,
+        "dataset_sha256": dataset_sha256,
+        "artifacts_url": f"{base_url}/artifacts?run_id={run_id}",
+        "manifest_url": f"{base_url}/artifacts/A1/meta?run_id={run_id}",
+    }
+
+
+@app.get("/artifacts")
+def list_artifacts(
+    request: Request,
+    run_id: str,
+    _=Depends(require_token),
+) -> Dict[str, Any]:
+    bucket_name = os.getenv("EXPORT_BUCKET")
+    if not bucket_name:
+        raise HTTPException(status_code=500, detail="Missing EXPORT_BUCKET env var")
+
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(f"runs/{run_id}/manifest.json")
+    if not blob.exists(client):
+        raise HTTPException(status_code=404, detail="run_id not found")
+
+    manifest = json.loads(blob.download_as_bytes().decode("utf-8"))
+    base_url = str(request.base_url).rstrip("/")
+    entries = []
+    for item in manifest.get("artifact_registry", []):
+        aid = item["artifact_id"]
+        entries.append({
+            **item,
+            "download_url": _build_artifact_url(base_url, aid, run_id, "download"),
+            "meta_url": _build_artifact_url(base_url, aid, run_id, "meta"),
+        })
+
+    return {
+        "run_id": run_id,
+        "dataset_id": manifest.get("dataset_id"),
+        "dataset_sha256": manifest.get("dataset_sha256"),
+        "artifacts": entries,
+    }
+
+
+@app.get("/artifacts/{artifact_id}/meta")
+def artifact_meta(
+    artifact_id: str,
+    run_id: str,
+    _=Depends(require_token),
+) -> Dict[str, Any]:
+    bucket_name = os.getenv("EXPORT_BUCKET")
+    if not bucket_name:
+        raise HTTPException(status_code=500, detail="Missing EXPORT_BUCKET env var")
+
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(f"runs/{run_id}/manifest.json")
+    if not blob.exists(client):
+        raise HTTPException(status_code=404, detail="run_id not found")
+
+    manifest = json.loads(blob.download_as_bytes().decode("utf-8"))
+    for item in manifest.get("artifact_registry", []):
+        if item.get("artifact_id") == artifact_id:
+            return item
+    raise HTTPException(status_code=404, detail="artifact not found")
+
+
+@app.get("/artifacts/{artifact_id}/download")
+def artifact_download(
+    artifact_id: str,
+    run_id: str,
+    request: Request,
+):
+    _require_api_key_from_request(request)
+
+    bucket_name = os.getenv("EXPORT_BUCKET")
+    if not bucket_name:
+        raise HTTPException(status_code=500, detail="Missing EXPORT_BUCKET env var")
+
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    manifest_blob = bucket.blob(f"runs/{run_id}/manifest.json")
+    if not manifest_blob.exists(client):
+        raise HTTPException(status_code=404, detail="run_id not found")
+
+    manifest = json.loads(manifest_blob.download_as_bytes().decode("utf-8"))
+    found = None
+    for item in manifest.get("artifact_registry", []):
+        if item.get("artifact_id") == artifact_id:
+            found = item
+            break
+    if not found:
+        raise HTTPException(status_code=404, detail="artifact not found")
+
+    data_blob = bucket.blob(found["object_path"])
+    if not data_blob.exists(client):
+        raise HTTPException(status_code=404, detail="artifact object missing")
+
+    filename = os.path.basename(found["object_path"])
+    stream = io.BytesIO(data_blob.download_as_bytes())
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return StreamingResponse(stream, media_type=found.get("content_type", "application/octet-stream"), headers=headers)
