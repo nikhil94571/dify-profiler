@@ -2824,13 +2824,109 @@ def _read_dataframe(raw_bytes: bytes, filename: Optional[str]) -> pd.DataFrame:
     return pd.read_csv(io.BytesIO(raw_bytes), low_memory=False)
 
 
+def _json_default(o: Any) -> Any:
+    """
+    Make JSON serialization robust to numpy/pandas scalars and common non-JSON types.
+
+    (Decision) Convert scalar-like objects via .item() when available.
+    Why it matters: pandas/numpy frequently produce np.int64/np.float64 that break json.dumps.
+
+    (Decision) Serialize pandas timestamps/timedeltas to ISO strings.
+    Why it matters: timestamps are common in profiling outputs; failing here crashes /full-bundle.
+    """
+    # numpy scalar (np.int64, np.float64, etc.)
+    if hasattr(o, "item") and callable(getattr(o, "item")):
+        try:
+            return o.item()
+        except Exception:
+            pass
+
+    # pandas Timestamp / Timedelta
+    if isinstance(o, pd.Timestamp):
+        return o.isoformat()
+    if isinstance(o, pd.Timedelta):
+        return str(o)
+
+    # sets, tuples -> lists
+    if isinstance(o, (set, tuple)):
+        return list(o)
+
+    # bytes -> utf-8 string (best-effort)
+    if isinstance(o, (bytes, bytearray)):
+        try:
+            return o.decode("utf-8")
+        except Exception:
+            return str(o)
+
+    # fallback
+    return str(o)
+
+
+import math
+
+def _json_sanitize(x: Any) -> Any:
+    """
+    Convert values that are not JSON-compliant (NaN/Inf) into JSON-safe values.
+
+    (Decision) Map NaN/Inf -> None.
+    Why it matters: JSON does not support NaN/Inf; leaving them crashes /full-bundle under allow_nan=False.
+    """
+    # Handle numpy/pandas scalars early (so we can catch np.nan as a float)
+    if hasattr(x, "item") and callable(getattr(x, "item")):
+        try:
+            x = x.item()
+        except Exception:
+            pass
+
+    # None / bool / int / str are already JSON-safe
+    if x is None or isinstance(x, (bool, int, str)):
+        return x
+
+    # float: replace NaN/Inf
+    if isinstance(x, float):
+        return x if math.isfinite(x) else None
+
+    # pandas Timestamp / Timedelta
+    if isinstance(x, pd.Timestamp):
+        return x.isoformat()
+    if isinstance(x, pd.Timedelta):
+        return str(x)
+
+    # dict
+    if isinstance(x, dict):
+        return {str(k): _json_sanitize(v) for k, v in x.items()}
+
+    # list/tuple/set
+    if isinstance(x, (list, tuple, set)):
+        return [_json_sanitize(v) for v in x]
+
+    # bytes -> string best effort
+    if isinstance(x, (bytes, bytearray)):
+        try:
+            return x.decode("utf-8")
+        except Exception:
+            return str(x)
+
+    # fallback: stringify
+    return str(x)
+
+
 def _json_bytes(payload: Any) -> bytes:
-    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    safe = _json_sanitize(payload)
+    return json.dumps(
+        safe,
+        ensure_ascii=False,
+        indent=2,
+        allow_nan=False,   # now safe because we've removed NaN/Inf
+    ).encode("utf-8")
 
 
 def _jsonl_bytes(rows: List[Dict[str, Any]]) -> bytes:
-    return ("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n").encode("utf-8")
-
+    safe_rows = _json_sanitize(rows)
+    return (
+        "\n".join(json.dumps(r, ensure_ascii=False, allow_nan=False) for r in safe_rows)
+        + "\n"
+    ).encode("utf-8")
 
 def _series_samples(s: pd.Series, dataset_sha256: str, col: str) -> Dict[str, List[Optional[str]]]:
     s_non_na = _non_null_series(s)
