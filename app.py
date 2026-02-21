@@ -7,7 +7,8 @@ import json
 import uuid
 import logging
 import re
-from collections import defaultdict, deque
+from collections import defaultdict, deque, Counter
+from itertools import combinations
 from datetime import timedelta
 from uuid import uuid4
 from manifest_export import upload_and_sign_text
@@ -40,7 +41,8 @@ RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "30"))          # requests
 RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))    # seconds
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-logger = logging.getLogger("profiler")
+
+logger = logging.getLogger("profiler")
 
 # Stage logger: goes to uvicorn stderr / Cloud Run logs
 stage_logger = logging.getLogger("uvicorn.error")
@@ -201,7 +203,8 @@ def infer_type(s: pd.Series) -> str:
         return "boolean"
     if pd.api.types.is_integer_dtype(s):
         return "integer"
-    if pd.api.types.is_float_dtype(s):        return "float"
+    if pd.api.types.is_float_dtype(s):
+        return "float"
     if pd.api.types.is_datetime64_any_dtype(s):
         return "datetime"
     return "text"
@@ -2784,14 +2787,16 @@ def health() -> Dict[str, str]:
 ARTIFACT_SPECS: Dict[str, Dict[str, str]] = {
     "A1": {"filename": "run_manifest.json", "content_type": "application/json"},
     "A2": {"filename": "column_dictionary.jsonl", "content_type": "application/jsonl"},
-    "A3": {"filename": "missingness_catalog.json", "content_type": "application/json"},
-    "A4": {"filename": "key_candidates_and_integrity.json", "content_type": "application/json"},
-    "A5": {"filename": "grain_tests.json", "content_type": "application/json"},
-    "A6": {"filename": "duplicates_report.json", "content_type": "application/json"},
-    "A7": {"filename": "repeat_dimension_candidates.json", "content_type": "application/json"},
-    "A8": {"filename": "role_scores.json", "content_type": "application/json"},
-    "A9": {"filename": "relationships_and_derivations.json", "content_type": "application/json"},
-    "A10": {"filename": "glimpses.json", "content_type": "application/json"},
+    "A3": {"filename": "review_queue.json", "content_type": "application/json"},
+    "A4": {"filename": "missingness_catalog.json", "content_type": "application/json"},
+    "A5": {"filename": "key_candidates_and_integrity.json", "content_type": "application/json"},
+    "A6": {"filename": "grain_tests.json", "content_type": "application/json"},
+    "A7": {"filename": "duplicates_report.json", "content_type": "application/json"},
+    "A8": {"filename": "repeat_dimension_candidates.json", "content_type": "application/json"},
+    "A9": {"filename": "role_scores.json", "content_type": "application/json"},
+    "A10": {"filename": "relationships_and_derivations.json", "content_type": "application/json"},
+    "A11": {"filename": "glimpses.json", "content_type": "application/json"},
+    "A12": {"filename": "table_layout_candidates.json", "content_type": "application/json"},
     "B1": {"filename": "family_packets.jsonl", "content_type": "application/jsonl"},
 }
 
@@ -2841,37 +2846,72 @@ def _series_samples(s: pd.Series, dataset_sha256: str, col: str) -> Dict[str, Li
     return {"head": head_vals, "tail": tail_vals, "random": random_vals}
 
 
+def _tokenize_col_name(col: str) -> List[str]:
+    return [t for t in re.split(r"[_\-]+", col.lower()) if t]
+
+
 def _build_families(columns: List[str]) -> List[Dict[str, Any]]:
-    families: Dict[str, List[str]] = defaultdict(list)
-    for c in columns:
-        m = re.match(r"^(.*?)[_\-](\d+)$", c)
-        if m:
-            families[m.group(1)].append(c)
+    family_map: Dict[str, Dict[str, Any]] = {}
+    label_index_tokens = {
+        "baseline", "base", "screen", "pre", "post", "followup", "fu", "endline", "midline", "t0", "t1", "t2", "t3"
+    }
+
+    def _add_member(family_id: str, col: str, index_token: str, pattern: str) -> None:
+        fam = family_map.setdefault(family_id, {"columns": [], "index_tokens": [], "patterns": set()})
+        fam["columns"].append(col)
+        fam["index_tokens"].append(index_token)
+        fam["patterns"].add(pattern)
+
+    for col in columns:
+        m_suffix_num = re.match(r"^(.*?)[_\-](\d+)$", col, re.IGNORECASE)
+        if m_suffix_num:
+            _add_member(m_suffix_num.group(1), col, m_suffix_num.group(2), "suffix_numeric_index")
+
+        m_prefix_num = re.match(r"^([a-z]+)(\d+)[_\-](.+)$", col, re.IGNORECASE)
+        if m_prefix_num:
+            family_id = m_prefix_num.group(3)
+            idx = f"{m_prefix_num.group(1)}{m_prefix_num.group(2)}"
+            _add_member(family_id, col, idx, "prefix_numeric_index")
+
+        toks = _tokenize_col_name(col)
+        if len(toks) >= 2:
+            if toks[-1] in label_index_tokens:
+                _add_member("_".join(toks[:-1]), col, toks[-1], "suffix_label_index")
+            if toks[0] in label_index_tokens:
+                _add_member("_".join(toks[1:]), col, toks[0], "prefix_label_index")
+
+        m_date = re.match(r"^(.*?)[_\-](20\d{2}(?:q[1-4])?|\d{4}-\d{2}|week_?\d{1,2})$", col, re.IGNORECASE)
+        if m_date:
+            _add_member(m_date.group(1), col, m_date.group(2), "datetime_like_index")
+
     out: List[Dict[str, Any]] = []
-    for stem, cols in sorted(families.items()):
+    for stem, info in sorted(family_map.items()):
+        cols = sorted(set(info["columns"]))
         if len(cols) < 2:
             continue
-        idxs = []
-        for c in cols:
-            m = re.match(r"^(.*?)[_\-](\d+)$", c)
-            if m:
-                idxs.append(int(m.group(2)))
-        idxs = sorted(set(idxs))
+        idx_tokens = [str(x) for x in info["index_tokens"]]
+        token_counts = Counter(idx_tokens)
+        shared = [t for t, cnt in token_counts.items() if cnt == len(cols)]
+        index_type = "ordinal" if all(re.fullmatch(r"\d+", t) for t in token_counts.keys()) else (
+            "datetime" if any(re.search(r"20\d{2}|week|q[1-4]|-", t, re.IGNORECASE) for t in token_counts.keys()) else "label"
+        )
         out.append({
             "family_id": stem,
-            "columns": sorted(cols),
-            "patterns": ["suffix_numeric_index"],
-            "extracted_index_set": idxs,
+            "columns": cols,
+            "patterns": sorted(info["patterns"]),
+            "extracted_index_set": sorted(set(idx_tokens)),
+            "index_by_column": {c: [idx_tokens[i]] for i, c in enumerate(info["columns"]) if c in cols},
             "shared_index_analysis": {
-                "shared": True,
-                "shared_index_set": idxs,
-                "mismatched_columns": [],
+                "shared": len(shared) > 0,
+                "shared_index_set": sorted(shared),
+                "mismatched_columns": [c for c in cols if c not in info["columns"][:len(shared)]],
             },
-            "index_type_candidate": "ordinal",
+            "index_type_candidate": index_type,
             "flags": {
-                "variable_specific_indices": False,
-                "suspected_timepoint": any(k in stem.lower() for k in ["time", "visit", "wave", "month", "day"]),
+                "variable_specific_indices": len(shared) == 0,
+                "suspected_timepoint": any(k in stem.lower() for k in ["time", "visit", "wave", "month", "day", "week", "year"]),
                 "suspected_item": any(k in stem.lower() for k in ["item", "q", "score", "phq", "gad"]),
+                "suspected_event": any(k in stem.lower() for k in ["event", "episode", "encounter", "session"]),
             },
         })
     return out
@@ -2890,6 +2930,108 @@ def _upload_artifact(bucket: storage.Bucket, object_path: str, payload: bytes, c
 
 def _build_artifact_url(base_url: str, artifact_id: str, run_id: str, mode: str) -> str:
     return f"{base_url}/artifacts/{artifact_id}/{mode}?run_id={run_id}"
+
+
+def _build_review_queue(df: pd.DataFrame, cols_profile: Dict[str, Any], max_cat: int) -> Dict[str, Any]:
+    review_rows: List[Dict[str, Any]] = []
+    for col in df.columns:
+        p = cols_profile.get(col, {})
+        cands = p.get("candidates") or []
+        top = cands[0] if cands else {}
+        second = cands[1] if len(cands) > 1 else {}
+        top_conf = float(top.get("confidence", 0.0) or 0.0)
+        second_conf = float(second.get("confidence", 0.0) or 0.0)
+        conf_gap = float(top_conf - second_conf)
+        unique_count = int(p.get("unique_count", 0) or 0)
+        inferred = str(p.get("inferred_type", "text"))
+        looks_numeric = inferred in {"integer", "float"}
+        looks_cat = 0 < unique_count <= max_cat
+        delimiter_stats = (p.get("patterns", {}).get("multi_value") or {})
+        delimiter_options = delimiter_stats.get("top_separators") or []
+        delimiter_ambiguous = len(delimiter_options) > 1
+        reasons = []
+        if top_conf < 0.90:
+            reasons.append("low_confidence")
+        if conf_gap < 0.15:
+            reasons.append("close_scores")
+        if looks_numeric and looks_cat:
+            reasons.append("numeric_vs_categorical_conflict")
+        if delimiter_ambiguous:
+            reasons.append("multi_select_delimiter_ambiguity")
+        review = p.get("review") or {}
+        if review.get("recommended"):
+            reasons.append(str(review.get("reason") or "review_recommended"))
+        if reasons:
+            review_rows.append({
+                "column": col,
+                "reasons": sorted(set(reasons)),
+                "top_candidate": top,
+                "second_candidate": second,
+                "top_confidence": round(top_conf, 6),
+                "second_confidence": round(second_conf, 6),
+                "confidence_gap": round(conf_gap, 6),
+                "inferred_type": inferred,
+                "unique_count": unique_count,
+                "delimiter_options": delimiter_options,
+                "pattern_multi_token_pct": delimiter_stats.get("multi_token_pct", 0.0),
+            })
+    review_rows.sort(key=lambda r: (-r["top_confidence"], r["column"]))
+    return {"columns_requiring_review": review_rows, "count": len(review_rows)}
+
+
+def _build_table_layout_candidates(
+    key_integrity: Dict[str, Any],
+    grain_tests: List[Dict[str, Any]],
+    repeat_candidates: Dict[str, Any],
+    role_scores: Dict[str, Any],
+    relationships: Dict[str, Any],
+    all_columns: List[str],
+) -> Dict[str, Any]:
+    best_grains = sorted(grain_tests, key=lambda g: (g.get("collision_severity_score", 1.0), g.get("dup_row_count", 10**9)))[:3]
+    families = repeat_candidates.get("families", [])
+    role_map = {r["column"]: r.get("role_scores", {}) for r in role_scores.get("columns", [])}
+    one_hot_cols = set()
+    for block in relationships.get("one_hot_blocks", []):
+        one_hot_cols.update(block.get("columns", []))
+
+    layouts = []
+    for i, g in enumerate(best_grains, start=1):
+        pk = g.get("keys_tested", [])
+        measures = [c for c in all_columns if role_map.get(c, {}).get("measure", 0) >= 0.5]
+        indexes = [c for c in all_columns if role_map.get(c, {}).get("repeat_index", 0) >= 0.5]
+        mapped = set(pk) | set(measures) | set(indexes)
+        for fam in families:
+            mapped.update(fam.get("columns", []))
+        table_name = "values_" + "_".join(pk[:2]) if pk else f"values_candidate_{i}"
+        layouts.append({
+            "layout_id": f"L{i}",
+            "score": round(1.0 - float(g.get("collision_severity_score", 1.0)), 6),
+            "tables": [
+                {
+                    "table_name": table_name,
+                    "primary_key_cols": pk,
+                    "foreign_keys": [{"from_cols": pk, "to_table": "entity_main", "to_cols": pk}] if pk else [],
+                    "column_roles": {
+                        "attribute": [c for c in all_columns if role_map.get(c, {}).get("invariant_attr", 0) >= 0.5 and c not in pk],
+                        "measure": measures,
+                        "repeat_index": indexes,
+                        "one_hot_member": sorted(one_hot_cols),
+                    },
+                    "source_columns": {
+                        "covered": sorted(mapped),
+                        "unmapped": sorted([c for c in all_columns if c not in mapped]),
+                    },
+                }
+            ],
+            "decision_trace": {
+                "grain_test_reference": g,
+                "families_used": [f.get("family_id") for f in families],
+                "role_score_thresholds": {"measure": 0.5, "repeat_index": 0.5, "invariant_attr": 0.5},
+                "one_hot_blocks_used": relationships.get("one_hot_blocks", []),
+            },
+        })
+
+    return {"candidate_layouts": layouts}
 
 
 @app.post("/full-bundle")
@@ -2921,6 +3063,15 @@ async def full_bundle(
         include_deep_profiles=True,
     )
     cols_profile = profile_result["data_profile"]["columns"]
+
+    association_upload = UploadFile(filename="bundle_assoc.csv", file=io.BytesIO(df.to_csv(index=False).encode("utf-8")), headers=file.headers)
+    association_result = await evidence_associations(
+        request=request,
+        file=association_upload,
+        dataset_id=dataset_id,
+        max_categorical_cardinality=max_categorical_cardinality,
+        _=None,
+    )
 
     missing_global: Dict[str, int] = defaultdict(int)
     missing_by_col: Dict[str, Dict[str, int]] = {}
@@ -2956,6 +3107,8 @@ async def full_bundle(
         }
         column_dictionary_rows.append(row)
 
+    review_queue = _build_review_queue(df, cols_profile, max_categorical_cardinality)
+
     missing_catalog = {
         "global_tokens": dict(sorted(missing_global.items(), key=lambda kv: (-kv[1], kv[0]))),
         "per_column_tokens": missing_by_col,
@@ -2981,23 +3134,39 @@ async def full_bundle(
         s = df[col]
         uniq_pct = float(s.nunique(dropna=True) / n_rows) if n_rows else 0.0
         miss_pct = float(s.isna().mean()) if n_rows else 0.0
-        stability = max(0.0, min(1.0, uniq_pct * (1.0 - miss_pct)))
-        if uniq_pct >= 0.8:
-            key_candidates.append({
-                "column": col,
-                "uniqueness_pct": round(uniq_pct * 100, 6),
-                "missing_pct": round(miss_pct * 100, 6),
-                "stability_score": round(stability, 6),
-                "id_like_signals": {
-                    "high_cardinality": bool(uniq_pct > 0.95),
-                    "regex_id_shape": bool(df[col].astype("string").str.match(r"^[A-Za-z0-9_-]{6,}$", na=False).mean() > 0.8),
-                },
-            })
+        entropy_signal = 1.0 - min(1.0, float((s.astype("string").value_counts(normalize=True, dropna=True).head(1).sum())) if n_rows else 0.0)
+        id_shape = bool(df[col].astype("string").str.match(r"^[A-Za-z0-9_-]{4,}$", na=False).mean() > 0.6)
+        stability = max(0.0, min(1.0, uniq_pct * (1.0 - miss_pct) * (0.7 + 0.3 * entropy_signal)))
+        key_candidates.append({
+            "column": col,
+            "uniqueness_pct": round(uniq_pct * 100, 6),
+            "missing_pct": round(miss_pct * 100, 6),
+            "stability_score": round(stability, 6),
+            "id_like_signals": {
+                "high_cardinality": bool(uniq_pct > 0.95),
+                "regex_id_shape": id_shape,
+                "entropy_like": round(entropy_signal, 6),
+            },
+        })
     key_candidates.sort(key=lambda x: (-x["stability_score"], x["column"]))
+    key_candidates = key_candidates[: min(12, len(key_candidates))]
+
+    key_candidate_cols = [k["column"] for k in key_candidates]
+
+    invariants_ranked = []
+    for col in df.columns:
+        if col in key_candidate_cols:
+            continue
+        s = df[col]
+        uniq = int(s.nunique(dropna=True))
+        miss = float(s.isna().mean()) if n_rows else 0.0
+        if uniq <= max(20, int(n_rows * 0.02)):
+            invariants_ranked.append((miss, uniq, col))
+    invariants_ranked.sort(key=lambda t: (t[0], t[1], t[2]))
+    attrs = [c for _, _, c in invariants_ranked[:12]]
 
     integrity_checks = []
-    attrs = [c for c in df.columns if c not in {x["column"] for x in key_candidates[:3]}][:5]
-    for k in key_candidates[:3]:
+    for k in key_candidates[:8]:
         key_col = k["column"]
         grouped = df[[key_col] + attrs].dropna(subset=[key_col]).groupby(key_col, dropna=True)
         conflicts = {}
@@ -3008,20 +3177,33 @@ async def full_bundle(
                 conflicts[a] = {"conflict_id_count": int((v > 1).sum()), "examples": [str(x) for x in bad_ids]}
         integrity_checks.append({"key_column": key_col, "invariant_attribute_drift": conflicts})
 
-    key_integrity = {"key_candidates": key_candidates, "integrity_checks": integrity_checks}
+    key_integrity = {"key_candidates": key_candidates, "invariant_candidates_checked": attrs, "integrity_checks": integrity_checks}
 
+    families = _build_families(list(df.columns))
+    repeat_candidates = {"families": families}
+
+    repeat_index_cols = sorted({c for fam in families for c in fam.get("columns", [])})
+    time_like = [c for c in df.columns if any(t in c.lower() for t in ["time", "date", "visit", "wave", "month", "day", "week", "year"])][:5]
+
+    pool = list(dict.fromkeys(key_candidate_cols[:8] + time_like + repeat_index_cols[:8]))
     candidate_sets = []
-    id_cols = [k["column"] for k in key_candidates[:2]]
-    time_like = [c for c in df.columns if any(t in c.lower() for t in ["time", "date", "visit", "wave", "month", "day"])][:2]
-    for c in id_cols:
-        candidate_sets.append([c])
-        for tcol in time_like:
-            if tcol != c:
-                candidate_sets.append([c, tcol])
-    candidate_sets = candidate_sets[:8]
+    for r in (1, 2, 3):
+        for combo in combinations(pool, r):
+            if any(c in key_candidate_cols[:8] for c in combo):
+                candidate_sets.append(list(combo))
+    # deterministic de-dupe + cap
+    seen = set()
+    dedup_sets = []
+    for s in candidate_sets:
+        t = tuple(s)
+        if t in seen:
+            continue
+        seen.add(t)
+        dedup_sets.append(s)
+    candidate_sets = dedup_sets[:60]
 
     grain_tests = []
-    for keys in candidate_sets:
+    for idx, keys in enumerate(candidate_sets, start=1):
         dup_mask = df.duplicated(subset=keys, keep=False)
         dup_rows = int(dup_mask.sum())
         dup_groups = int(df[df.duplicated(subset=keys, keep=False)].groupby(keys, dropna=False).ngroups) if dup_rows else 0
@@ -3041,6 +3223,7 @@ async def full_bundle(
             identical_pct = float((identical / total) * 100.0) if total else 0.0
         sev = min(1.0, (dup_rows / max(1, n_rows)))
         grain_tests.append({
+            "test_id": f"GT{idx}",
             "keys_tested": keys,
             "dup_row_count": dup_rows,
             "dup_groups_count": dup_groups,
@@ -3060,9 +3243,6 @@ async def full_bundle(
         "grain_duplicates": grain_tests,
     }
 
-    families = _build_families(list(df.columns))
-    repeat_candidates = {"families": families}
-
     role_scores = {"columns": []}
     for row in column_dictionary_rows:
         uniq = float(row["is_unique_like"])
@@ -3071,7 +3251,7 @@ async def full_bundle(
             "id_key": round(min(1.0, uniq), 6),
             "invariant_attr": round(min(1.0, max(0.0, 1.0 - uniq)), 6),
             "measure": 0.8 if inferred in {"integer", "float"} else 0.2,
-            "repeat_index": 0.8 if any(x in row["column"].lower() for x in ["time", "visit", "wave", "index", "month", "day"]) else 0.1,
+            "repeat_index": 0.8 if any(x in row["column"].lower() for x in ["time", "visit", "wave", "index", "month", "day", "week"]) else 0.1,
             "derived": 0.6 if any(x in row["column"].lower() for x in ["total", "sum", "score", "avg", "mean"]) else 0.1,
             "multivalue_cell": 0.7 if (cols_profile.get(row["column"], {}).get("patterns", {}).get("multi_value", {}).get("multi_token_pct", 0) > 20) else 0.1,
             "one_hot_member": 0.8 if row["is_one_hot_like"] else 0.1,
@@ -3079,25 +3259,17 @@ async def full_bundle(
         }
         role_scores["columns"].append({"column": row["column"], "role_scores": scores, "features": {"unique_ratio": uniq, "inferred_type": inferred}})
 
+    # Reuse existing deterministic association/dependency engine from /evidence_associations
     rel = {
-        "derived_totals": [],
-        "functional_dependencies": [],
+        "signals": association_result.get("signals", []),
+        "limits": association_result.get("limits", {}),
+        "n_rows_scanned": association_result.get("n_rows_scanned"),
+        "derived_totals": [s for s in association_result.get("signals", []) if s.get("kind") == "dependency_check"],
+        "functional_dependencies": [s for s in association_result.get("signals", []) if s.get("kind") in {"dependency_check", "id_time_duplicates"}],
         "one_hot_blocks": [],
-        "near_duplicate_columns": [],
+        "near_duplicate_columns": [s for s in association_result.get("signals", []) if s.get("kind") == "num_num_assoc" and (s.get("score") or 0) > 0.98],
         "coded_categorical_flags": [],
     }
-    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    for c in numeric_cols:
-        if df[c].nunique(dropna=True) <= max_categorical_cardinality:
-            rel["coded_categorical_flags"].append({"column": c, "reason": "numeric_low_cardinality"})
-
-    for i, c1 in enumerate(numeric_cols[:20]):
-        for c2 in numeric_cols[i + 1:20]:
-            overlap = df[[c1, c2]].dropna()
-            if len(overlap) >= ASSOC_MIN_OVERLAP:
-                corr = overlap[c1].corr(overlap[c2])
-                if pd.notna(corr) and abs(corr) > 0.98:
-                    rel["near_duplicate_columns"].append({"columns": [c1, c2], "pearson": float(corr)})
 
     one_hot_groups: Dict[str, List[str]] = defaultdict(list)
     for c in df.columns:
@@ -3115,7 +3287,12 @@ async def full_bundle(
                 "exactly_one_pct": float((row_sum == 1).mean() * 100.0),
             })
 
-    curated_cols = list(dict.fromkeys(id_cols + time_like + [c for c in df.columns if c not in set(id_cols + time_like)][:5]))
+    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    for c in numeric_cols:
+        if df[c].nunique(dropna=True) <= max_categorical_cardinality:
+            rel["coded_categorical_flags"].append({"column": c, "reason": "numeric_low_cardinality"})
+
+    curated_cols = list(dict.fromkeys(key_candidate_cols[:2] + time_like[:2] + [c for c in df.columns if c not in set(key_candidate_cols[:2] + time_like[:2])][:5]))
     global_glimpse = {
         "head": df[curated_cols].head(5).to_dict(orient="records") if curated_cols else [],
         "tail": df[curated_cols].tail(5).to_dict(orient="records") if curated_cols else [],
@@ -3124,7 +3301,7 @@ async def full_bundle(
     }
     per_family = []
     for fam in families:
-        fam_cols = list(dict.fromkeys(id_cols + fam["columns"]))
+        fam_cols = list(dict.fromkeys(key_candidate_cols[:2] + fam["columns"]))
         per_family.append({
             "family_id": fam["family_id"],
             "columns": fam["columns"],
@@ -3152,6 +3329,15 @@ async def full_bundle(
             "F_subset": next((pf for pf in per_family if pf["family_id"] == fam["family_id"]), {"rows": []}),
         })
 
+    table_layout_candidates = _build_table_layout_candidates(
+        key_integrity=key_integrity,
+        grain_tests=grain_tests,
+        repeat_candidates=repeat_candidates,
+        role_scores=role_scores,
+        relationships=rel,
+        all_columns=list(df.columns),
+    )
+
     run_id = uuid4().hex
     base_url = str(request.base_url).rstrip("/")
     bucket_name = os.getenv("EXPORT_BUCKET")
@@ -3163,14 +3349,16 @@ async def full_bundle(
 
     payloads: Dict[str, bytes] = {
         "A2": _jsonl_bytes(column_dictionary_rows),
-        "A3": _json_bytes(missing_catalog),
-        "A4": _json_bytes(key_integrity),
-        "A5": _json_bytes({"tests": grain_tests}),
-        "A6": _json_bytes(duplicates_report),
-        "A7": _json_bytes(repeat_candidates),
-        "A8": _json_bytes(role_scores),
-        "A9": _json_bytes(rel),
-        "A10": _json_bytes(glimpses),
+        "A3": _json_bytes(review_queue),
+        "A4": _json_bytes(missing_catalog),
+        "A5": _json_bytes(key_integrity),
+        "A6": _json_bytes({"tests": grain_tests}),
+        "A7": _json_bytes(duplicates_report),
+        "A8": _json_bytes(repeat_candidates),
+        "A9": _json_bytes(role_scores),
+        "A10": _json_bytes(rel),
+        "A11": _json_bytes(glimpses),
+        "A12": _json_bytes(table_layout_candidates),
         "B1": _jsonl_bytes(family_packets),
     }
 
@@ -3180,7 +3368,22 @@ async def full_bundle(
         object_path = f"runs/{run_id}/{spec['filename']}"
         uploaded_meta[aid] = _upload_artifact(bucket, object_path, payload, spec["content_type"])
 
+    manifest_artifacts = []
+    for aid, meta in sorted(uploaded_meta.items(), key=lambda kv: kv[0]):
+        manifest_artifacts.append({
+            "artifact_id": aid,
+            "filename": ARTIFACT_SPECS[aid]["filename"],
+            "object_path": meta["object_path"],
+            "bucket": bucket_name,
+            "content_type": meta["content_type"],
+            "sha256": meta["sha256"],
+            "size_bytes": meta["size_bytes"],
+            "download_url": _build_artifact_url(base_url, aid, run_id, "download"),
+            "meta_url": _build_artifact_url(base_url, aid, run_id, "meta"),
+        })
+
     run_manifest = {
+        "schema_version": "a1.v1",
         "run_id": run_id,
         "dataset_id": dataset_id,
         "dataset_sha256": dataset_sha256,
@@ -3188,47 +3391,36 @@ async def full_bundle(
         "n_cols": int(n_cols),
         "profiling_limits": {
             "max_categorical_cardinality": int(max_categorical_cardinality),
+            "ASSOC_MAX_ROWS": ASSOC_MAX_ROWS,
+            "ASSOC_TOP_K_PAIRS": ASSOC_TOP_K_PAIRS,
+            "ASSOC_MAX_NUMERIC_COLS": ASSOC_MAX_NUMERIC_COLS,
+            "ASSOC_MAX_CAT_COLS": ASSOC_MAX_CAT_COLS,
+            "ASSOC_MAX_CAT_CARD": ASSOC_MAX_CAT_CARD,
             "ASSOC_MIN_OVERLAP": ASSOC_MIN_OVERLAP,
             "ASSOC_TOL_ABS": ASSOC_TOL_ABS,
             "ASSOC_TOL_REL": ASSOC_TOL_REL,
         },
-        "artifacts": [
-            {
-                "artifact_id": aid,
-                "filename": ARTIFACT_SPECS[aid]["filename"],
-                "download_url": _build_artifact_url(base_url, aid, run_id, "download"),
-                "meta_url": _build_artifact_url(base_url, aid, run_id, "meta"),
-                "size_bytes": meta["size_bytes"],
-            }
-            for aid, meta in uploaded_meta.items()
-        ],
+        "artifact_registry": manifest_artifacts,
     }
 
-    manifest_payload = _json_bytes(run_manifest)
     manifest_object_path = f"runs/{run_id}/manifest.json"
+    manifest_payload = _json_bytes(run_manifest)
     manifest_meta = _upload_artifact(bucket, manifest_object_path, manifest_payload, "application/json")
-    uploaded_meta["A1"] = manifest_meta
 
-    registry_manifest = {
-        "run_id": run_id,
-        "dataset_id": dataset_id,
-        "dataset_sha256": dataset_sha256,
-        "n_rows": int(n_rows),
-        "n_cols": int(n_cols),
-        "artifact_registry": [
-            {
-                "artifact_id": aid,
-                "object_path": meta["object_path"],
-                "bucket": bucket_name,
-                "content_type": meta["content_type"],
-                "sha256": meta["sha256"],
-                "size_bytes": meta["size_bytes"],
-            }
-            for aid, meta in sorted(uploaded_meta.items(), key=lambda kv: kv[0])
-            if aid.startswith("A")
-        ],
+    # Add A1 record into manifest and persist once more under strict single schema
+    a1_entry = {
+        "artifact_id": "A1",
+        "filename": ARTIFACT_SPECS["A1"]["filename"],
+        "object_path": manifest_object_path,
+        "bucket": bucket_name,
+        "content_type": manifest_meta["content_type"],
+        "sha256": manifest_meta["sha256"],
+        "size_bytes": manifest_meta["size_bytes"],
+        "download_url": _build_artifact_url(base_url, "A1", run_id, "download"),
+        "meta_url": _build_artifact_url(base_url, "A1", run_id, "meta"),
     }
-    _upload_artifact(bucket, manifest_object_path, _json_bytes(registry_manifest), "application/json")
+    run_manifest["artifact_registry"] = [a1_entry] + manifest_artifacts
+    _upload_artifact(bucket, manifest_object_path, _json_bytes(run_manifest), "application/json")
 
     return {
         "status": "success",

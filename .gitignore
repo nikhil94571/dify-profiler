@@ -39,3 +39,4 @@ downloaded_*.xlsx
 #Patch
 *.patch
 *.rej
+Outputs/
