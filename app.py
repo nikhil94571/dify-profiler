@@ -2943,74 +2943,167 @@ def _series_samples(s: pd.Series, dataset_sha256: str, col: str) -> Dict[str, Li
 
 
 def _tokenize_col_name(col: str) -> List[str]:
-    return [t for t in re.split(r"[_\-]+", col.lower()) if t]
+    # Split snake/kebab/space + camelCase + numeric boundaries
+    base = re.sub(r"[\s\-]+", "_", str(col))
+    base = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", base)
+    base = re.sub(r"([A-Za-z])([0-9])", r"\1_\2", base)
+    base = re.sub(r"([0-9])([A-Za-z])", r"\1_\2", base)
+    return [t for t in re.split(r"[_]+", base.lower()) if t]
 
 
-def _build_families(columns: List[str]) -> List[Dict[str, Any]]:
+def _build_families(columns: List[str]) -> Dict[str, Any]:
     family_map: Dict[str, Dict[str, Any]] = {}
+    rejected: List[Dict[str, Any]] = []
     label_index_tokens = {
         "baseline", "base", "screen", "pre", "post", "followup", "fu", "endline", "midline", "t0", "t1", "t2", "t3"
     }
+    repeat_keywords = {"row", "col", "item", "wave", "visit", "session", "trial", "tp", "timepoint", "question", "q"}
 
-    def _add_member(family_id: str, col: str, index_token: str, pattern: str) -> None:
-        fam = family_map.setdefault(family_id, {"columns": [], "index_tokens": [], "patterns": set()})
+    def _norm_stem(stem: str) -> str:
+        toks = _tokenize_col_name(stem)
+        return "_".join(toks)
+
+    def _add_member(family_id: str, col: str, index_token: str, pattern: str, *, raw_stem: Optional[str] = None, keyword: Optional[str] = None, camelcase_split_used: bool = False) -> None:
+        fam = family_map.setdefault(family_id, {
+            "columns": [],
+            "index_tokens": [],
+            "patterns": set(),
+            "index_by_column": {},
+            "stem_evidence": {
+                "raw_stem": raw_stem or family_id,
+                "normalized_stem": _norm_stem(raw_stem or family_id),
+                "camelcase_split_used": bool(camelcase_split_used),
+            },
+            "keyword": keyword,
+        })
         fam["columns"].append(col)
         fam["index_tokens"].append(index_token)
         fam["patterns"].add(pattern)
+        fam["index_by_column"][col] = [str(index_token)]
+        if keyword and not fam.get("keyword"):
+            fam["keyword"] = keyword
 
     for col in columns:
-        m_suffix_num = re.match(r"^(.*?)[_\-](\d+)$", col, re.IGNORECASE)
+        clean = str(col)
+        toks = _tokenize_col_name(clean)
+        camel_split = clean != re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", clean)
+
+        # Stage A: suffix keyword + numeric, e.g. Q6Main_cell_groupRow12
+        m_kw_num = re.match(r"^(.*?)(row|col|item|wave|visit|session|trial|tp|timepoint|question|q)[_\-]?(\d+)$", clean, re.IGNORECASE)
+        if m_kw_num:
+            raw_stem = m_kw_num.group(1)
+            keyword = m_kw_num.group(2).lower()
+            idx = m_kw_num.group(3)
+            fid = _norm_stem(raw_stem)
+            _add_member(fid, clean, idx, "suffix_keyword_numeric", raw_stem=raw_stem, keyword=keyword, camelcase_split_used=camel_split)
+
+        # Generic suffix numeric with separator
+        m_suffix_num = re.match(r"^(.*?)[_\-](\d+)$", clean, re.IGNORECASE)
         if m_suffix_num:
-            _add_member(m_suffix_num.group(1), col, m_suffix_num.group(2), "suffix_numeric_index")
+            fid = _norm_stem(m_suffix_num.group(1))
+            _add_member(fid, clean, m_suffix_num.group(2), "suffix_numeric_index", raw_stem=m_suffix_num.group(1), camelcase_split_used=camel_split)
 
-        m_prefix_num = re.match(r"^([a-z]+)(\d+)[_\-](.+)$", col, re.IGNORECASE)
-        if m_prefix_num:
-            family_id = m_prefix_num.group(3)
-            idx = f"{m_prefix_num.group(1)}{m_prefix_num.group(2)}"
-            _add_member(family_id, col, idx, "prefix_numeric_index")
+        # Generic suffix numeric without separator (DASS1)
+        m_suffix_num_no_sep = re.match(r"^(.*?)(\d+)$", clean, re.IGNORECASE)
+        if m_suffix_num_no_sep and not m_kw_num:
+            stem = m_suffix_num_no_sep.group(1)
+            idx = m_suffix_num_no_sep.group(2)
+            # require meaningful stem length to reduce false positives
+            if len(_tokenize_col_name(stem)) >= 1 and len(stem) >= 2:
+                fid = _norm_stem(stem)
+                _add_member(fid, clean, idx, "suffix_numeric_nosep", raw_stem=stem, camelcase_split_used=camel_split)
 
-        toks = _tokenize_col_name(col)
+        # Prefix label indices from tokenized names
         if len(toks) >= 2:
             if toks[-1] in label_index_tokens:
-                _add_member("_".join(toks[:-1]), col, toks[-1], "suffix_label_index")
+                _add_member("_".join(toks[:-1]), clean, toks[-1], "suffix_label_index", raw_stem="_".join(toks[:-1]), camelcase_split_used=camel_split)
             if toks[0] in label_index_tokens:
-                _add_member("_".join(toks[1:]), col, toks[0], "prefix_label_index")
+                _add_member("_".join(toks[1:]), clean, toks[0], "prefix_label_index", raw_stem="_".join(toks[1:]), camelcase_split_used=camel_split)
 
-        m_date = re.match(r"^(.*?)[_\-](20\d{2}(?:q[1-4])?|\d{4}-\d{2}|week_?\d{1,2})$", col, re.IGNORECASE)
-        if m_date:
-            _add_member(m_date.group(1), col, m_date.group(2), "datetime_like_index")
-
-    out: List[Dict[str, Any]] = []
+    families: List[Dict[str, Any]] = []
     for stem, info in sorted(family_map.items()):
         cols = sorted(set(info["columns"]))
-        if len(cols) < 2:
-            continue
         idx_tokens = [str(x) for x in info["index_tokens"]]
-        token_counts = Counter(idx_tokens)
-        shared = [t for t, cnt in token_counts.items() if cnt == len(cols)]
-        index_type = "ordinal" if all(re.fullmatch(r"\d+", t) for t in token_counts.keys()) else (
-            "datetime" if any(re.search(r"20\d{2}|week|q[1-4]|-", t, re.IGNORECASE) for t in token_counts.keys()) else "label"
-        )
-        out.append({
+        idx_num = sorted({int(t) for t in idx_tokens if re.fullmatch(r"\d+", t)})
+        dense_ok = False
+        missing_idx: List[int] = []
+        if len(idx_num) >= 3:
+            low, high = min(idx_num), max(idx_num)
+            expected = set(range(low, high + 1))
+            missing_idx = sorted(expected - set(idx_num))
+            dense_ok = len(missing_idx) <= max(1, int(0.2 * len(expected)))
+
+        keyword = info.get("keyword")
+        has_keyword_signal = bool(keyword in repeat_keywords)
+        index_type = "ordinal" if all(re.fullmatch(r"\d+", t) for t in idx_tokens) else "label"
+
+        reject_reason = None
+        if len(cols) < 3:
+            reject_reason = "insufficient_family_size"
+        elif index_type == "ordinal" and not dense_ok and len(idx_num) >= 3:
+            reject_reason = "non_dense_indices"
+        elif (not has_keyword_signal) and ("suffix_keyword_numeric" not in info["patterns"]) and len(cols) < 4:
+            reject_reason = "no_repeat_keyword_and_insufficient_family_evidence"
+
+        if reject_reason:
+            rejected.append({
+                "candidate_stem": stem,
+                "columns_count": len(cols),
+                "reason": reject_reason,
+                "patterns": sorted(info["patterns"]),
+            })
+            continue
+
+        conf = 0.45
+        conf += min(0.25, 0.03 * len(cols))
+        conf += 0.2 if has_keyword_signal else 0.0
+        conf += 0.1 if dense_ok else 0.0
+        conf = min(0.99, conf)
+
+        recommended_repeat = keyword if keyword in repeat_keywords else ("index" if index_type == "ordinal" else "label")
+        families.append({
             "family_id": stem,
+            "detection_confidence": round(conf, 6),
+            "columns_count": len(cols),
             "columns": cols,
+            "columns_preview": cols[:8],
             "patterns": sorted(info["patterns"]),
-            "extracted_index_set": sorted(set(idx_tokens)),
-            "index_by_column": {c: [idx_tokens[i]] for i, c in enumerate(info["columns"]) if c in cols},
-            "shared_index_analysis": {
-                "shared": len(shared) > 0,
-                "shared_index_set": sorted(shared),
-                "mismatched_columns": [c for c in cols if c not in info["columns"][:len(shared)]],
+            "index_pattern": {
+                "kind": "suffix_keyword_numeric" if "suffix_keyword_numeric" in info["patterns"] else sorted(info["patterns"])[0],
+                "keyword": keyword,
+                "index_type_candidate": index_type,
+                "extracted_index_set_preview": [str(x) for x in sorted(set(idx_tokens))[:10]],
+                "is_dense_sequence": bool(dense_ok) if index_type == "ordinal" else None,
+                "missing_indices": [str(x) for x in missing_idx[:20]],
             },
-            "index_type_candidate": index_type,
+            "extracted_index_set": sorted(set(idx_tokens)),
+            "index_by_column": info.get("index_by_column", {}),
+            "stem_evidence": info.get("stem_evidence", {}),
+            "recommended_repeat_dimension_name": recommended_repeat,
+            "downstream_hints": {
+                "likely_member_role": "measure",
+                "test_composite_keys_with": ["id_candidate", recommended_repeat],
+            },
             "flags": {
-                "variable_specific_indices": len(shared) == 0,
-                "suspected_timepoint": any(k in stem.lower() for k in ["time", "visit", "wave", "month", "day", "week", "year"]),
-                "suspected_item": any(k in stem.lower() for k in ["item", "q", "score", "phq", "gad"]),
-                "suspected_event": any(k in stem.lower() for k in ["event", "episode", "encounter", "session"]),
+                "variable_specific_indices": False,
+                "suspected_timepoint": recommended_repeat in {"wave", "visit", "session", "timepoint", "tp"},
+                "suspected_item": recommended_repeat in {"item", "question", "q", "row", "col"},
+                "suspected_event": recommended_repeat in {"session", "visit", "trial"},
             },
         })
-    return out
+
+    return {
+        "artifact": "A8",
+        "purpose": "repeat_family_detection",
+        "families": sorted(families, key=lambda f: (-float(f.get("detection_confidence", 0.0)), -int(f.get("columns_count", 0)), str(f.get("family_id", "")))),
+        "rejected_candidates": sorted(rejected, key=lambda r: (-int(r.get("columns_count", 0)), str(r.get("candidate_stem", ""))))[:100],
+        "debug_trace": {
+            "n_columns_scanned": len(columns),
+            "n_candidate_stems": len(family_map),
+            "n_accepted_families": len(families),
+            "camelcase_split_enabled": True,
+        },
+    }
 
 
 def _upload_artifact(bucket: storage.Bucket, object_path: str, payload: bytes, content_type: str) -> Dict[str, Any]:
@@ -3028,51 +3121,213 @@ def _build_artifact_url(base_url: str, artifact_id: str, run_id: str, mode: str)
     return f"{base_url}/artifacts/{artifact_id}/{mode}?run_id={run_id}"
 
 
+def _candidate_evidence_summary(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    ev = candidate.get("evidence") or {}
+    out: Dict[str, Any] = {}
+    keep_scalar_keys = [
+        "suffix_unit_pct",
+        "strict_numeric_pct",
+        "date_parse_pct",
+        "multi_token_pct",
+        "numeric_range_pct",
+        "year_range_pct",
+        "level_pct",
+        "strict_pct",
+        "currency_pct",
+        "percent_pct",
+        "thousands_sep_pct",
+        "inferred_type",
+    ]
+    for k in keep_scalar_keys:
+        if k in ev and isinstance(ev.get(k), (int, float, str, bool)):
+            out[k] = ev[k]
+    if "unit_plan" in ev:
+        out["unit_plan_detected"] = bool(ev.get("unit_plan"))
+    if "delimiter" in ev and isinstance(ev.get("delimiter"), str):
+        out["delimiter"] = ev.get("delimiter")
+    return out
+
+
+def _is_one_hot_like_column(col: str, p: Dict[str, Any], s: pd.Series) -> bool:
+    candidates = p.get("candidates") or []
+    top = candidates[0] if candidates else {}
+    top_type = str(top.get("type") or "")
+    unique_count = int(p.get("unique_count", 0) or 0)
+    if unique_count == 0:
+        return False
+    pattern_hint = bool(re.search(r"(_|\b)(yes|no|true|false|male|female|other|0|1)$", col, re.IGNORECASE))
+    if top_type == "categorical" and unique_count <= 2 and pattern_hint:
+        return True
+    if top_type in {"categorical", "mixed", "text"} and unique_count <= 2:
+        non_na = s.dropna().astype("string").str.strip().str.lower()
+        if len(non_na) == 0:
+            return False
+        values = {v for v in non_na.unique().tolist() if v is not None}
+        binary_lexicons = [
+            {"yes", "no"},
+            {"true", "false"},
+            {"y", "n"},
+            {"t", "f"},
+            {"0", "1"},
+            {"male", "female"},
+            {"present", "absent"},
+        ]
+        return any(values.issubset(lex) for lex in binary_lexicons)
+    return top_type in {"integer", "float", "numeric"} and unique_count <= 2 and pattern_hint
+
+
+def _candidate_family(candidate_type: str) -> str:
+    if candidate_type in {"numeric", "numeric_with_unit", "percent", "numeric_range"}:
+        return "numeric"
+    if candidate_type in {"date", "datetime"}:
+        return "temporal"
+    if candidate_type in {"categorical", "categorical_multi"}:
+        return "categorical"
+    if candidate_type in {"range_like"}:
+        return "range"
+    return "textual"
+
+
+def _parse_repeat_structure_name(col: str) -> Optional[Dict[str, Any]]:
+    patterns = [
+        (r"^(.*?)(row|r)(\d+)$", "row"),
+        (r"^(.*?)(col|c)(\d+)$", "col"),
+        (r"^(.*?)(item|q|question)(\d+)$", "item"),
+        (r"^(.*?)(trial|block|tp|wave|visit|session)(\d+)$", "index"),
+    ]
+    clean = re.sub(r"[\s\-]+", "_", str(col)).strip("_")
+    for pat, axis_default in patterns:
+        m = re.match(pat, clean, re.IGNORECASE)
+        if m:
+            base, keyword, idx = m.group(1), m.group(2), m.group(3)
+            return {
+                "base_name": base,
+                "index_keyword": keyword.lower(),
+                "index_value": int(idx),
+                "repeat_axis_type": axis_default if axis_default != "index" else keyword.lower(),
+                "family_candidate": re.sub(r"[_\-]+$", "", base),
+            }
+    return None
+
+
 def _build_review_queue(df: pd.DataFrame, cols_profile: Dict[str, Any], max_cat: int) -> Dict[str, Any]:
+    policy = {
+        "review_rules_version": "v2",
+        "low_confidence_threshold": 0.9,
+        "close_gap_threshold": 0.15,
+        "dynamic_candidate_preview_enabled": True,
+    }
     review_rows: List[Dict[str, Any]] = []
     for col in df.columns:
         p = cols_profile.get(col, {})
         cands = p.get("candidates") or []
         top = cands[0] if cands else {}
         second = cands[1] if len(cands) > 1 else {}
+        third = cands[2] if len(cands) > 2 else {}
         top_conf = float(top.get("confidence", 0.0) or 0.0)
         second_conf = float(second.get("confidence", 0.0) or 0.0)
+        third_conf = float(third.get("confidence", 0.0) or 0.0)
         conf_gap = float(top_conf - second_conf)
+        conf_gap_1_3 = float(top_conf - third_conf) if third else None
         unique_count = int(p.get("unique_count", 0) or 0)
-        inferred = str(p.get("inferred_type", "text"))
-        looks_numeric = inferred in {"integer", "float"}
-        looks_cat = 0 < unique_count <= max_cat
+        raw_inferred = str(p.get("inferred_type", "text"))
+        top_type = str(top.get("type") or "")
+        second_type = str(second.get("type") or "")
         delimiter_stats = (p.get("patterns", {}).get("multi_value") or {})
         delimiter_options = delimiter_stats.get("top_separators") or []
         delimiter_ambiguous = len(delimiter_options) > 1
-        reasons = []
-        if top_conf < 0.90:
+
+        reasons: List[str] = []
+        reason_detail: List[str] = []
+        if top_conf < policy["low_confidence_threshold"]:
             reasons.append("low_confidence")
-        if conf_gap < 0.15:
-            reasons.append("close_scores")
-        if looks_numeric and looks_cat:
-            reasons.append("numeric_vs_categorical_conflict")
+            reason_detail.append(f"low_confidence:top_conf={round(top_conf, 6)}")
+        if conf_gap < policy["close_gap_threshold"]:
+            reasons.append("ambiguous_top_candidates")
+            reason_detail.append(f"ambiguous_top_candidates:gap_1_2={round(conf_gap, 6)}")
+
+        fam1 = _candidate_family(top_type)
+        fam2 = _candidate_family(second_type)
+        if fam1 != fam2 and second_type:
+            reasons.append("dtype_candidate_conflict")
+            reason_detail.append(f"dtype_candidate_conflict:{top_type}_vs_{second_type}")
+
+        raw_dtype_family = "numeric" if raw_inferred in {"integer", "float"} else ("temporal" if raw_inferred == "datetime" else "textual")
+        if top_type and _candidate_family(top_type) != raw_dtype_family:
+            reasons.append("dtype_candidate_conflict")
+            reason_detail.append(f"dtype_candidate_conflict:raw_{raw_inferred}_vs_{top_type}")
+
         if delimiter_ambiguous:
-            reasons.append("multi_select_delimiter_ambiguity")
+            reasons.append("delimiter_ambiguity")
+            reason_detail.append(f"delimiter_ambiguity:options={','.join(delimiter_options[:4])}")
+
         review = p.get("review") or {}
+        review_reason = str(review.get("reason") or "")
         if review.get("recommended"):
-            reasons.append(str(review.get("reason") or "review_recommended"))
+            if any(x in review_reason for x in ["type_requires_transform", "parse_requires_transform", "op_requires_transform"]):
+                reasons.append("transform_required")
+                reason_detail.append(f"transform_required:{review_reason}")
+            else:
+                reasons.append("ambiguous_top_candidates")
+
+        preview_n = 2
+        if top_conf < 0.75 or conf_gap < 0.10:
+            preview_n = 3
+        if conf_gap_1_3 is not None and conf_gap_1_3 < 0.10 and len(cands) > 3:
+            preview_n = 4
+        preview_n = min(preview_n, len(cands))
+        preview = [
+            {
+                "rank": i + 1,
+                "type": c.get("type"),
+                "confidence": round(float(c.get("confidence", 0.0) or 0.0), 6),
+                "parse": c.get("parse"),
+                "op": c.get("op"),
+            }
+            for i, c in enumerate(cands[:preview_n])
+        ]
+
+        risk_score = 0.0
+        if "transform_required" in reasons:
+            risk_score += 0.45
+        if "ambiguous_top_candidates" in reasons:
+            risk_score += 0.25
+        if "low_confidence" in reasons:
+            risk_score += 0.20
+        if "delimiter_ambiguity" in reasons:
+            risk_score += 0.05
+        if "dtype_candidate_conflict" in reasons:
+            risk_score += 0.05
+        risk_score = min(0.99, risk_score + max(0.0, 0.1 - max(conf_gap, 0.0)))
+
         if reasons:
             review_rows.append({
                 "column": col,
-                "reasons": sorted(set(reasons)),
-                "top_candidate": top,
-                "second_candidate": second,
+                "review_priority": "high" if risk_score >= 0.75 else ("medium" if risk_score >= 0.45 else "low"),
+                "risk_score": round(risk_score, 6),
+                "reason_codes": sorted(set(reasons)),
+                "reason_detail": sorted(set(reason_detail)),
+                "raw_inferred_type": raw_inferred,
+                "candidate_count_total": len(cands),
+                "candidate_preview": preview,
+                "omitted_candidate_count": max(0, len(cands) - len(preview)),
+                "candidate_gaps": {
+                    "gap_1_2": round(conf_gap, 6),
+                    "gap_1_3": round(conf_gap_1_3, 6) if conf_gap_1_3 is not None else None,
+                },
                 "top_confidence": round(top_conf, 6),
                 "second_confidence": round(second_conf, 6),
                 "confidence_gap": round(conf_gap, 6),
-                "inferred_type": inferred,
                 "unique_count": unique_count,
                 "delimiter_options": delimiter_options,
                 "pattern_multi_token_pct": delimiter_stats.get("multi_token_pct", 0.0),
+                "evidence_snippets": {
+                    "parse_failure_examples": (p.get("patterns", {}).get("date_like", {}).get("parse_failure_examples", []) or [])[:3],
+                    "multi_value_examples": (p.get("patterns", {}).get("multi_value_examples", {}) or {}).get("examples", [])[:3],
+                },
             })
-    review_rows.sort(key=lambda r: (-r["top_confidence"], r["column"]))
-    return {"columns_requiring_review": review_rows, "count": len(review_rows)}
+    review_rows.sort(key=lambda r: (0 if "transform_required" in r["reason_codes"] else 1, -r["risk_score"], r["top_confidence"], r["confidence_gap"], r["column"]))
+    return {"policy": policy, "columns_requiring_review": review_rows, "count": len(review_rows)}
 
 
 def _build_table_layout_candidates(
@@ -3083,51 +3338,232 @@ def _build_table_layout_candidates(
     relationships: Dict[str, Any],
     all_columns: List[str],
 ) -> Dict[str, Any]:
+    def _role_ranking_for_col(col: str) -> List[Dict[str, Any]]:
+        row = next((r for r in role_scores.get("columns", []) if r.get("column") == col), None)
+        if not row:
+            return []
+        rc = row.get("role_candidates")
+        if isinstance(rc, list) and rc:
+            return sorted(rc, key=lambda x: (-float(x.get("score", 0.0) or 0.0), str(x.get("role") or "")))
+        rs = row.get("role_scores", {})
+        return sorted(
+            [{"role": k, "score": float(v or 0.0), "evidence": {}} for k, v in rs.items()],
+            key=lambda x: (-x["score"], x["role"]),
+        )
+
+    def _rationale_unique_grain(g: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if int(g.get("dup_row_count", 10**9) or 10**9) == 0 and float(g.get("collision_severity_score", 1.0) or 1.0) <= 1e-9:
+            key = ",".join(g.get("keys_tested", []))
+            return {
+                "code": "grain_unique_single_key",
+                "text": f"{key} uniquely identifies rows ({int(g.get('dup_row_count', 0))} duplicate rows under tested key).",
+                "evidence": {"A6": {"dup_row_count": int(g.get("dup_row_count", 0)), "collision_severity_score": float(g.get("collision_severity_score", 0.0) or 0.0)}},
+            }
+        return {
+            "code": "grain_candidate_ambiguous",
+            "text": f"{','.join(g.get('keys_tested', [])) or 'candidate key'} is a candidate row grain, but duplicate/collision evidence remains ambiguous.",
+            "evidence": {"A6": {"dup_row_count": int(g.get("dup_row_count", 0) or 0), "collision_severity_score": float(g.get("collision_severity_score", 1.0) or 1.0)}},
+        }
+
     best_grains = sorted(grain_tests, key=lambda g: (g.get("collision_severity_score", 1.0), g.get("dup_row_count", 10**9)))[:3]
     families = repeat_candidates.get("families", [])
-    role_map = {r["column"]: r.get("role_scores", {}) for r in role_scores.get("columns", [])}
-    one_hot_cols = set()
-    for block in relationships.get("one_hot_blocks", []):
-        one_hot_cols.update(block.get("columns", []))
+    key_seeds = key_integrity.get("single_column_key_seed_candidates", [])
+    stress_by_col = {x.get("candidate_column"): x for x in key_integrity.get("candidate_key_stress_tests", [])}
+    relationship_support = relationships.get("dependency_candidates", [])
 
     layouts = []
     for i, g in enumerate(best_grains, start=1):
-        pk = g.get("keys_tested", [])
-        measures = [c for c in all_columns if role_map.get(c, {}).get("measure", 0) >= 0.5]
-        indexes = [c for c in all_columns if role_map.get(c, {}).get("repeat_index", 0) >= 0.5]
-        mapped = set(pk) | set(measures) | set(indexes)
-        for fam in families:
-            mapped.update(fam.get("columns", []))
-        table_name = "values_" + "_".join(pk[:2]) if pk else f"values_candidate_{i}"
+        pk = list(g.get("keys_tested", []) or [])
+        role_assignments: Dict[str, Dict[str, Any]] = {}
+        for c in all_columns:
+            ranked = _role_ranking_for_col(c)
+            primary = ranked[0] if ranked else {"role": "unknown", "score": 0.0}
+            alts = [r for r in ranked[1:3] if float(r.get("score", 0.0) or 0.0) >= 0.35]
+            role_assignments[c] = {
+                "primary_role": primary.get("role", "unknown"),
+                "primary_score": round(float(primary.get("score", 0.0) or 0.0), 6),
+                "alternate_roles": [{"role": a.get("role"), "score": round(float(a.get("score", 0.0) or 0.0), 6)} for a in alts],
+            }
+
+        repeat_dims = [
+            c for c, ra in role_assignments.items()
+            if ra["primary_role"] in {"time_index", "repeat_index_embedded_in_name"}
+            and c not in pk and ra["primary_score"] >= 0.5
+        ][:3]
+        entity_attrs = [c for c, ra in role_assignments.items() if ra["primary_role"] in {"invariant_attr", "coded_categorical"} and c not in pk][:30]
+        event_measures = [c for c, ra in role_assignments.items() if ra["primary_role"] in {"measure_numeric", "measure_item"} and c not in pk and c not in repeat_dims][:40]
+
+        tables = []
+        entity_table_name = "entity_" + (pk[0].lower() if pk else f"candidate_{i}")
+        tables.append({
+            "table_id": "T1",
+            "table_name": entity_table_name,
+            "kind": "entity",
+            "grain": pk,
+            "columns_preview": {
+                "keys": pk,
+                "attributes": entity_attrs[:12],
+                "sample_measures_if_any": [],
+            },
+            "column_counts": {
+                "keys": len(pk),
+                "attributes": len(entity_attrs),
+                "measures": 0,
+            },
+            "foreign_keys": [],
+            "primary_role_assignments_preview": {c: role_assignments[c] for c in (pk + entity_attrs[:8])},
+        })
+
+        if repeat_dims or event_measures:
+            event_keys = list(dict.fromkeys(pk + repeat_dims))
+            tables.append({
+                "table_id": "T2",
+                "table_name": "event_" + (pk[0].lower() if pk else f"candidate_{i}"),
+                "kind": "event_repeat",
+                "grain": event_keys,
+                "repeat_dimension_candidates": repeat_dims,
+                "columns_preview": {
+                    "keys": event_keys,
+                    "attributes": [],
+                    "measures": event_measures[:15],
+                },
+                "column_counts": {
+                    "keys": len(event_keys),
+                    "attributes": 0,
+                    "measures": len(event_measures),
+                },
+                "foreign_keys": [{"from_cols": pk, "to_table": entity_table_name, "to_cols": pk}] if pk else [],
+                "primary_role_assignments_preview": {c: role_assignments[c] for c in (event_keys + event_measures[:8])},
+            })
+
+        fam_tables = []
+        for idx, fam in enumerate(families[:3], start=1):
+            fam_cols = [c for c in fam.get("columns", []) if c in all_columns]
+            fam_measures = [c for c in fam_cols if role_assignments.get(c, {}).get("primary_role") in {"measure_numeric", "measure_item", "coded_categorical"}]
+            fam_keys = list(dict.fromkeys(pk + repeat_dims[:1]))
+            fam_tables.append({
+                "table_id": f"TF{idx}",
+                "table_name": f"family_{str(fam.get('family_id') or idx).lower()}",
+                "kind": "family_repeat",
+                "grain": fam_keys,
+                "repeat_dimension_candidates": repeat_dims[:1],
+                "columns_preview": {
+                    "keys": fam_keys,
+                    "attributes": [],
+                    "measures": fam_measures[:15],
+                },
+                "column_counts": {
+                    "keys": len(fam_keys),
+                    "attributes": 0,
+                    "measures": len(fam_measures),
+                },
+                "foreign_keys": [{"from_cols": pk, "to_table": entity_table_name, "to_cols": pk}] if pk else [],
+                "family_reference": fam,
+            })
+        tables.extend(fam_tables)
+
+        covered_by_layout = set()
+        for t in tables:
+            covered_by_layout.update(t.get("columns_preview", {}).get("keys", []))
+            covered_by_layout.update(t.get("columns_preview", {}).get("attributes", []))
+            covered_by_layout.update(t.get("columns_preview", {}).get("measures", []))
+        role_scored = {c for c, ra in role_assignments.items() if ra.get("primary_score", 0.0) >= 0.5}
+        covered_by_role_only = sorted([c for c in role_scored if c not in covered_by_layout])
+        ambiguous = sorted([c for c, ra in role_assignments.items() if len(ra.get("alternate_roles", [])) > 0 and c not in covered_by_role_only])
+        unmapped = sorted([c for c in all_columns if c not in covered_by_layout and c not in role_scored])
+
+        dep_support = [d for d in relationship_support if (d.get("determinant") in pk or d.get("dependent") in pk)]
+        stress = stress_by_col.get(pk[0], {}) if len(pk) == 1 else {}
+        drift_quality = 1.0 - min(1.0, float((stress.get("n_drifted_attributes", 0) or 0) / max(1, stress.get("attributes_checked_count", 1) or 1)))
+        family_quality = 1.0 if families else 0.4
+        coverage_quality = len(covered_by_layout) / max(1, len(all_columns))
+        simplicity_penalty = max(0.0, (len(tables) - 2) * 0.05)
+        collision_quality = 1.0 - min(1.0, float(g.get("collision_severity_score", 1.0) or 1.0))
+        dep_quality = min(1.0, len(dep_support) / 5.0)
+        score = (
+            0.30 * collision_quality +
+            0.18 * drift_quality +
+            0.15 * family_quality +
+            0.12 * dep_quality +
+            0.15 * coverage_quality +
+            0.10 * (1.0 - simplicity_penalty)
+        )
+
+        rationale = [_rationale_unique_grain(g)]
+        if drift_quality >= 0.7 and len(entity_attrs) >= 3:
+            rationale.append({
+                "code": "high_invariance_entity_attributes",
+                "text": f"{len(entity_attrs)} columns are likely invariant under {','.join(pk) or 'candidate key'} (drift threshold 0.3).",
+                "evidence": {"A5": {"drift_quality": round(drift_quality, 6), "candidate": pk[0] if pk else None}},
+            })
+        if families and repeat_dims:
+            rationale.append({
+                "code": "family_repeat_structure_detected",
+                "text": f"A repeated family structure was detected with candidate repeat dimension {repeat_dims[0]}.",
+                "evidence": {"A9": {"repeat_dimension": repeat_dims[0]}, "A8": {"family_count": len(families)}},
+            })
+
         layouts.append({
             "layout_id": f"L{i}",
-            "score": round(1.0 - float(g.get("collision_severity_score", 1.0)), 6),
-            "tables": [
+            "score": round(score, 6),
+            "summary": {
+                "current_row_grain": pk,
+                "proposed_model": "entity + family tables" if families else ("entity + event table" if repeat_dims else "single-entity-centric"),
+                "rationale": [r["text"] for r in rationale if r],
+            },
+            "grain": {
+                "keys_tested": pk,
+                "dup_row_count": int(g.get("dup_row_count", 0) or 0),
+                "collision_severity_score": round(float(g.get("collision_severity_score", 1.0) or 1.0), 6),
+                "evidence_refs": ["A6", "A9", "A10"],
+            },
+            "tables": tables,
+            "coverage_summary": {
+                "covered_by_layout_count": len(covered_by_layout),
+                "covered_by_role_only_count": len(covered_by_role_only),
+                "ambiguous_count": len(ambiguous),
+                "unmapped_count": len(unmapped),
+            },
+            "column_placement": {
+                "covered_by_layout": sorted(covered_by_layout),
+                "covered_by_role_only": covered_by_role_only,
+                "ambiguous": ambiguous,
+                "unmapped": unmapped,
+            },
+            "ambiguities": [
                 {
-                    "table_name": table_name,
-                    "primary_key_cols": pk,
-                    "foreign_keys": [{"from_cols": pk, "to_table": "entity_main", "to_cols": pk}] if pk else [],
-                    "column_roles": {
-                        "attribute": [c for c in all_columns if role_map.get(c, {}).get("invariant_attr", 0) >= 0.5 and c not in pk],
-                        "measure": measures,
-                        "repeat_index": indexes,
-                        "one_hot_member": sorted(one_hot_cols),
-                    },
-                    "source_columns": {
-                        "covered": sorted(mapped),
-                        "unmapped": sorted([c for c in all_columns if c not in mapped]),
-                    },
+                    "column": c,
+                    "primary_role": role_assignments[c]["primary_role"],
+                    "alternate_roles": role_assignments[c]["alternate_roles"],
+                    "why": "multiple plausible role assignments above threshold",
                 }
+                for c in ambiguous[:25]
             ],
-            "decision_trace": {
-                "grain_test_reference": g,
+            "debug_trace": {
+                "role_thresholds": {"primary_min": 0.5, "alternate_min": 0.35},
                 "families_used": [f.get("family_id") for f in families],
-                "role_score_thresholds": {"measure": 0.5, "repeat_index": 0.5, "invariant_attr": 0.5},
-                "one_hot_blocks_used": relationships.get("one_hot_blocks", []),
+                "evidence_links": {"A5": "key seed + stress tests", "A6": "grain tests", "A9": "role candidates", "A10": "relationship support"},
+                "rationale_items": rationale,
+                "scoring_components": {
+                    "collision_quality": round(collision_quality, 6),
+                    "drift_quality": round(drift_quality, 6),
+                    "family_quality": round(family_quality, 6),
+                    "dependency_support_quality": round(dep_quality, 6),
+                    "coverage_quality": round(coverage_quality, 6),
+                    "simplicity_penalty": round(simplicity_penalty, 6),
+                },
             },
         })
 
-    return {"candidate_layouts": layouts}
+    layouts = sorted(layouts, key=lambda x: (-float(x.get("score", 0.0) or 0.0), x.get("layout_id", "")))
+    return {
+        "version": "2",
+        "layout_candidates": layouts,
+        "debug": {
+            "candidate_layout_count": len(layouts),
+            "all_columns_count": len(all_columns),
+        },
+    }
 
 
 @app.post("/full-bundle")
@@ -3160,6 +3596,50 @@ async def full_bundle(
     )
     cols_profile = profile_result["data_profile"]["columns"]
 
+    # Canonical per-column evidence primitives used across downstream artifacts.
+    # This prevents diverging field calculations between A2/A5/A9 and dependents.
+    column_signal_map: Dict[str, Dict[str, Any]] = {}
+    for col in df.columns:
+        p = cols_profile.get(col, {})
+        candidates = p.get("candidates") or []
+        top = candidates[0] if candidates else {}
+        column_signal_map[col] = {
+            "raw_inferred_type": p.get("inferred_type", "text"),
+            "unique_count": int(p.get("unique_count", int(df[col].nunique(dropna=True)) or 0)),
+            "unique_ratio": float((int(p.get("unique_count", int(df[col].nunique(dropna=True)) or 0)) / n_rows) if n_rows else 0.0),
+            "missing_count": int(p.get("missing_count", int(df[col].isna().sum()) or 0)),
+            "missing_pct": float(p.get("missing_pct", round((int(p.get("missing_count", int(df[col].isna().sum()) or 0)) / n_rows * 100.0) if n_rows else 0.0, 6))),
+            "parsed_as_numeric_pct": float((p.get("numeric_profile") or {}).get("parseable_pct", 0.0) or 0.0),
+            "parsed_as_datetime_pct": float((p.get("date_profile") or {}).get("parseable_pct", 0.0) or 0.0),
+            "top_candidate_type": str(top.get("type") or ""),
+            "top_candidate_confidence": float(top.get("confidence", 0.0) or 0.0),
+            "top_candidate_parse": top.get("parse"),
+            "top_candidate_op": top.get("op"),
+        }
+
+    artifact_inputs: Dict[str, Any] = {
+        "dataset": {
+            "source": "uploaded_csv",
+            "dataset_id": dataset_id,
+            "dataset_sha256": dataset_sha256,
+            "n_rows": int(n_rows),
+            "n_columns": int(n_cols),
+        },
+        "A1": {"uses": ["dataset", "profile_result", "association_result", "all_artifact_outputs"]},
+        "A2": {"uses": ["dataset", "cols_profile", "column_signal_map"]},
+        "A3": {"uses": ["dataset", "cols_profile", "column_signal_map"]},
+        "A4": {"uses": ["dataset", "cols_profile", "column_signal_map"]},
+        "A5": {"uses": ["dataset", "cols_profile", "column_signal_map"]},
+        "A6": {"uses": ["A5", "A8", "A9", "dataset", "column_signal_map"]},
+        "A7": {"uses": ["dataset", "A6"]},
+        "A8": {"uses": ["dataset_columns", "tokenized_column_names"]},
+        "A9": {"uses": ["A2", "A5", "A8", "column_signal_map", "cols_profile"]},
+        "A10": {"uses": ["association_result", "dataset"]},
+        "A11": {"uses": ["A5", "A8", "A9", "A10", "dataset"]},
+        "A12": {"uses": ["A5", "A6", "A8", "A9", "A10", "dataset"]},
+        "B1": {"uses": ["A8", "A2", "A6", "A11"]},
+    }
+
     association_upload = UploadFile(filename="bundle_assoc.csv", file=io.BytesIO(df.to_csv(index=False).encode("utf-8")), headers=file.headers)
     association_result = await evidence_associations(
         request=request,
@@ -3171,83 +3651,196 @@ async def full_bundle(
 
     missing_global: Dict[str, int] = defaultdict(int)
     missing_by_col: Dict[str, Dict[str, int]] = {}
+    token_norm_global: Dict[str, int] = defaultdict(int)
+    token_norm_meta: Dict[str, Dict[str, Any]] = {}
+    true_na_total = 0
+    token_missing_like_total = 0
+    per_column_missingness: List[Dict[str, Any]] = []
     column_dictionary_rows: List[Dict[str, Any]] = []
 
     for col in df.columns:
         p = cols_profile.get(col, {})
+        sig = column_signal_map.get(col, {})
         missing_tokens = p.get("missing_like_tokens", {})
         missing_by_col[col] = missing_tokens
         for tkn, cnt in missing_tokens.items():
             missing_global[tkn] += int(cnt)
 
-        inferred_type = p.get("inferred_type", "text")
-        top_candidate = (p.get("candidates") or [{}])[0]
-        type_conf = float(top_candidate.get("confidence", 0.0) or 0.0)
-        one_hot_like = bool(inferred_type in ("integer", "float") and p.get("unique_count", 0) <= 2)
-        is_unique_like = float((p.get("unique_count", 0) / n_rows) if n_rows else 0.0)
+        raw_inferred_type = sig.get("raw_inferred_type", p.get("inferred_type", "text"))
+        candidates = p.get("candidates") or []
+        top_candidate = candidates[0] if candidates else {}
+        second_candidate = candidates[1] if len(candidates) > 1 else {}
+        type_conf = float(sig.get("top_candidate_confidence", top_candidate.get("confidence", 0.0) or 0.0) or 0.0)
+        unique_ratio = float(sig.get("unique_ratio", (p.get("unique_count", 0) / n_rows) if n_rows else 0.0) or 0.0)
+        one_hot_like = _is_one_hot_like_column(col, p, df[col])
+        top_frequent = p.get("samples", {}).get("top_frequent", [])[:8]
+
+        missing_count = int(sig.get("missing_count", p.get("missing_count", int(df[col].isna().sum()))))
+        missing_pct = float(sig.get("missing_pct", p.get("missing_pct", round((missing_count / n_rows * 100.0) if n_rows else 0.0, 6))))
+        token_count = int(sum(int(v) for v in missing_tokens.values()))
+        true_na_count = int(max(0, missing_count - token_count))
+        true_na_total += true_na_count
+        token_missing_like_total += token_count
+
+        for raw_token, cnt in missing_tokens.items():
+            normalized = raw_token.strip().lower() if isinstance(raw_token, str) else str(raw_token)
+            token_norm_global[normalized] += int(cnt)
+            if normalized not in token_norm_meta:
+                token_norm_meta[normalized] = {"raw_examples": set(), "columns": set()}
+            token_norm_meta[normalized]["raw_examples"].add(raw_token)
+            token_norm_meta[normalized]["columns"].add(col)
+
+        per_column_missingness.append({
+            "column": col,
+            "missing_count": missing_count,
+            "missing_pct": round(missing_pct, 6),
+            "true_na_count": true_na_count,
+            "token_missing_like_count": token_count,
+            "token_breakdown": missing_tokens,
+            "missingness_mode": "mixed" if (true_na_count > 0 and token_count > 0) else ("token_only" if token_count > 0 else ("true_na_only" if true_na_count > 0 else "none")),
+        })
 
         row = {
             "column": col,
-            "inferred_type": inferred_type,
-            "type_confidence": round(type_conf, 6),
+            "raw_inferred_type": raw_inferred_type,
+            "top_candidate": {
+                "type": top_candidate.get("type"),
+                "confidence": round(type_conf, 6),
+                "parse": top_candidate.get("parse"),
+                "op": top_candidate.get("op"),
+                "evidence_summary": _candidate_evidence_summary(top_candidate),
+            },
+            "candidate_diagnostics": {
+                "candidate_count": len(candidates),
+                "second_candidate_type": second_candidate.get("type"),
+                "second_candidate_confidence": round(float(second_candidate.get("confidence", 0.0) or 0.0), 6),
+                "confidence_gap_1_2": round(type_conf - float(second_candidate.get("confidence", 0.0) or 0.0), 6),
+            },
             "missing_tokens_observed": missing_tokens,
-            "missing_pct": p.get("missing_pct", 0.0),
+            "missing_pct": missing_pct,
             "unique_count": p.get("unique_count", 0),
-            "is_unique_like": round(is_unique_like, 6),
-            "top_levels": [x.get("value") for x in (p.get("samples", {}).get("top_frequent", [])[:8])],
-            "level_counts_sample": p.get("samples", {}).get("top_frequent", [])[:8],
+            "unique_ratio": round(unique_ratio, 6),
+            "top_levels": [x.get("value") for x in top_frequent],
+            "profiler_samples": top_frequent,
+            "a2_samples": _series_samples(df[col], dataset_sha256, col),
             "is_one_hot_like": one_hot_like,
             "numeric_profile": p.get("numeric_profile"),
             "datetime_profile": p.get("date_profile"),
-            "samples": _series_samples(df[col], dataset_sha256, col),
+            "high_uniqueness_candidate": bool(unique_ratio >= 0.98),
+            "artifact_inputs": artifact_inputs["A2"]["uses"],
         }
         column_dictionary_rows.append(row)
 
     review_queue = _build_review_queue(df, cols_profile, max_categorical_cardinality)
+    review_queue["artifact"] = "A3"
+    review_queue["purpose"] = "review_queue"
+    review_queue["inputs"] = artifact_inputs["A3"]
 
-    missing_catalog = {
-        "global_tokens": dict(sorted(missing_global.items(), key=lambda kv: (-kv[1], kv[0]))),
-        "per_column_tokens": missing_by_col,
-        "candidate_classification": [
-            {
-                "token": t,
-                "class_candidate": "sentinel_numeric" if re.fullmatch(r"\d+", t or "") else (
-                    "refused" if "prefer not" in (t or "").lower() else (
-                        "not_applicable" if (t or "").upper() in {"N/A", "NA"} else "missing"
+    token_classification = []
+    for tok_norm, cnt in sorted(token_norm_global.items(), key=lambda kv: (-kv[1], kv[0])):
+        raw_examples = sorted(token_norm_meta.get(tok_norm, {}).get("raw_examples", set()))
+        cls = "sentinel_numeric" if re.fullmatch(r"-?\d+(\.\d+)?", tok_norm or "") else (
+            "refused" if "prefer not" in tok_norm else (
+                "not_applicable" if tok_norm in {"n/a", "na", "not applicable"} else (
+                    "dont_know" if tok_norm in {"dk", "don't know", "dont know"} else (
+                        "blank_string" if tok_norm in {"", "<whitespace_only>"} else "missing"
                     )
-                ),
-                "evidence": {
-                    "columns": [c for c, toks in missing_by_col.items() if t in toks],
-                    "global_count": c,
-                },
-            }
-            for t, c in sorted(missing_global.items(), key=lambda kv: (-kv[1], kv[0]))
-        ],
-    }
-
-    key_candidates = []
-    for col in df.columns:
-        s = df[col]
-        uniq_pct = float(s.nunique(dropna=True) / n_rows) if n_rows else 0.0
-        miss_pct = float(s.isna().mean()) if n_rows else 0.0
-        entropy_signal = 1.0 - min(1.0, float((s.astype("string").value_counts(normalize=True, dropna=True).head(1).sum())) if n_rows else 0.0)
-        id_shape = bool(df[col].astype("string").str.match(r"^[A-Za-z0-9_-]{4,}$", na=False).mean() > 0.6)
-        stability = max(0.0, min(1.0, uniq_pct * (1.0 - miss_pct) * (0.7 + 0.3 * entropy_signal)))
-        key_candidates.append({
-            "column": col,
-            "uniqueness_pct": round(uniq_pct * 100, 6),
-            "missing_pct": round(miss_pct * 100, 6),
-            "stability_score": round(stability, 6),
-            "id_like_signals": {
-                "high_cardinality": bool(uniq_pct > 0.95),
-                "regex_id_shape": id_shape,
-                "entropy_like": round(entropy_signal, 6),
+                )
+            )
+        )
+        token_classification.append({
+            "raw_token_examples": raw_examples,
+            "normalized_token": tok_norm,
+            "class_candidate": cls,
+            "evidence": {
+                "columns": sorted(token_norm_meta.get(tok_norm, {}).get("columns", set())),
+                "global_count": int(cnt),
             },
         })
-    key_candidates.sort(key=lambda x: (-x["stability_score"], x["column"]))
-    key_candidates = key_candidates[: min(12, len(key_candidates))]
 
-    key_candidate_cols = [k["column"] for k in key_candidates]
+    columns_with_any_missing = int(sum(1 for r in per_column_missingness if r["missing_count"] > 0))
+    notes: List[str] = []
+    if token_missing_like_total == 0:
+        notes.append("No explicit token-based missingness detected in parsed values.")
+    if true_na_total > 0:
+        notes.append(f"Missingness is present as parser-level NA values in {columns_with_any_missing} columns.")
+
+    missing_catalog = {
+        "artifact": "A4",
+        "purpose": "missingness_catalog",
+        "inputs": artifact_inputs["A4"],
+        "summary": {
+            "columns_with_any_missing": columns_with_any_missing,
+            "total_missing_cells": int(sum(r["missing_count"] for r in per_column_missingness)),
+            "explicit_missing_tokens_detected": bool(token_missing_like_total > 0),
+            "notes": notes,
+        },
+        "global_missingness": {
+            "true_na_total": int(true_na_total),
+            "token_missing_like_total": int(token_missing_like_total),
+            "whitespace_only_total": int(missing_global.get("<WHITESPACE_ONLY>", 0)),
+        },
+        "global_tokens": dict(sorted(missing_global.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "token_classification": token_classification,
+        "per_column": per_column_missingness,
+        "audit_trace": {
+            "token_detection_scope": "parsed_non_na_string_values",
+            "normalization": ["strip_whitespace", "casefold"],
+            "classification_rules_version": "v2",
+        },
+    }
+
+    key_seed_candidates = []
+    excluded_seed_columns = []
+    for col in df.columns:
+        s = df[col]
+        sig = column_signal_map.get(col, {})
+        s_str = s.astype("string")
+        uniq_pct = float(sig.get("unique_ratio", (s.nunique(dropna=True) / n_rows) if n_rows else 0.0) or 0.0)
+        miss_pct = float((sig.get("missing_count", int(s.isna().sum())) / n_rows) if n_rows else 0.0)
+        entropy_signal = 1.0 - min(1.0, float((s_str.value_counts(normalize=True, dropna=True).head(1).sum())) if n_rows else 0.0)
+        id_shape = bool(s_str.str.match(r"^[A-Za-z0-9_-]{4,}$", na=False).mean() > 0.6)
+        is_url_like = bool(s_str.str.contains(r"^https?://", na=False, regex=True).mean() > 0.3)
+        is_file_path_like = bool(s_str.str.contains(r"[A-Za-z]:\\|/|\\", na=False, regex=True).mean() > 0.5)
+        name_semantic_risk = bool(re.search(r"url|uri|link|image|img|photo|avatar|file|path", col, re.IGNORECASE))
+        likely_external_resource_id = bool(is_url_like or (name_semantic_risk and "id" not in col.lower()))
+        likely_measurement_value = bool(pd.api.types.is_numeric_dtype(s) and uniq_pct < 0.95 and any(k in col.lower() for k in ["score", "total", "mean", "avg", "pct", "percent", "amount", "value"]))
+
+        semantic_risk_flags = []
+        if is_url_like:
+            semantic_risk_flags.append("url_like")
+        if is_file_path_like:
+            semantic_risk_flags.append("file_path_like")
+        if likely_external_resource_id:
+            semantic_risk_flags.append("external_resource_identifier")
+        if likely_measurement_value:
+            semantic_risk_flags.append("likely_measurement_value")
+        if name_semantic_risk:
+            semantic_risk_flags.append("name_semantic_risk")
+
+        stability = max(0.0, min(1.0, uniq_pct * (1.0 - miss_pct) * (0.7 + 0.3 * entropy_signal)))
+        key_seed_candidates.append({
+            "column": col,
+            "seed_score": round(stability, 6),
+            "evidence": {
+                "unique_ratio": round(uniq_pct, 6),
+                "null_pct": round(miss_pct * 100, 6),
+                "id_like_name": bool(re.search(r"(^|_)(id|key|uuid|guid)($|_)", col, re.IGNORECASE)),
+                "regex_id_shape": id_shape,
+                "entropy_like": round(entropy_signal, 6),
+                "value_pattern": "url_like" if is_url_like else ("numeric_id_like" if pd.api.types.is_numeric_dtype(s) and uniq_pct >= 0.95 else "string_id_like" if id_shape else "unknown"),
+            },
+            "semantic_risk_flags": semantic_risk_flags,
+            "use_as": "row_locator_only" if semantic_risk_flags else "composite_key_seed_or_primary_id_candidate",
+            "not_final_key": True,
+        })
+        if semantic_risk_flags:
+            excluded_seed_columns.append({"column": col, "reason": "+".join(semantic_risk_flags)})
+
+    key_seed_candidates.sort(key=lambda x: (-x["seed_score"], x["column"]))
+    key_seed_candidates = key_seed_candidates[: min(12, len(key_seed_candidates))]
+
+    key_candidate_cols = [k["column"] for k in key_seed_candidates]
 
     invariants_ranked = []
     for col in df.columns:
@@ -3261,110 +3854,519 @@ async def full_bundle(
     invariants_ranked.sort(key=lambda t: (t[0], t[1], t[2]))
     attrs = [c for _, _, c in invariants_ranked[:12]]
 
-    integrity_checks = []
-    for k in key_candidates[:8]:
+    candidate_key_stress_tests = []
+    for k in key_seed_candidates[:8]:
         key_col = k["column"]
         grouped = df[[key_col] + attrs].dropna(subset=[key_col]).groupby(key_col, dropna=True)
-        conflicts = {}
+        drifted = []
         for a in attrs:
             v = grouped[a].nunique(dropna=True)
-            bad_ids = v[v > 1].index.tolist()[:5]
-            if bad_ids:
-                conflicts[a] = {"conflict_id_count": int((v > 1).sum()), "examples": [str(x) for x in bad_ids]}
-        integrity_checks.append({"key_column": key_col, "invariant_attribute_drift": conflicts})
+            conflict_groups = int((v > 1).sum())
+            if conflict_groups > 0:
+                bad_ids = v[v > 1].index.tolist()[:3]
+                eg = []
+                for bid in bad_ids[:2]:
+                    rows = df[df[key_col] == bid][[key_col, a]].drop_duplicates().head(2).to_dict(orient="records")
+                    eg.append({"id": str(bid), "rows": rows})
+                drifted.append({
+                    "attribute": a,
+                    "drift_groups": conflict_groups,
+                    "drift_rate": round(float(conflict_groups / max(1, grouped.ngroups)), 6),
+                    "example_conflicts": eg,
+                })
+        drifted = sorted(drifted, key=lambda d: (-d["drift_groups"], d["attribute"]))
+        candidate_key_stress_tests.append({
+            "candidate_column": key_col,
+            "attributes_checked_count": len(attrs),
+            "n_drifted_attributes": len(drifted),
+            "top_drifted_attributes": drifted[:8],
+            "interpretation": "Likely row identifier but not entity-invariant across records" if drifted else "Likely stable single-column identifier",
+        })
 
-    key_integrity = {"key_candidates": key_candidates, "invariant_candidates_checked": attrs, "integrity_checks": integrity_checks}
+    recommended_seed_columns = [k["column"] for k in key_seed_candidates if not k.get("semantic_risk_flags")][:8]
+    key_integrity = {
+        "artifact": "A5",
+        "purpose": "key_seed_candidates_and_stress_tests",
+        "inputs": artifact_inputs["A5"],
+        "single_column_key_seed_candidates": key_seed_candidates,
+        "candidate_key_stress_tests": candidate_key_stress_tests,
+        "handoff_to_A6": {
+            "recommended_seed_columns": recommended_seed_columns,
+            "excluded_seed_columns": excluded_seed_columns,
+            "recommended_a6_seed_columns": recommended_seed_columns,
+            "excluded_from_seeding_reasons": excluded_seed_columns,
+        },
+        "invariant_candidates_checked": attrs,
+    }
 
-    families = _build_families(list(df.columns))
-    repeat_candidates = {"families": families}
+    repeat_candidates = _build_families(list(df.columns))
+    repeat_candidates["inputs"] = artifact_inputs["A8"]
+    families = repeat_candidates.get("families", [])
 
     repeat_index_cols = sorted({c for fam in families for c in fam.get("columns", [])})
-    time_like = [c for c in df.columns if any(t in c.lower() for t in ["time", "date", "visit", "wave", "month", "day", "week", "year"])][:5]
+    family_repeat_dims = [f.get("recommended_repeat_dimension_name") for f in families if f.get("recommended_repeat_dimension_name")]
+    role_time_candidates = [
+        c for c in df.columns
+        if (float((cols_profile.get(c, {}).get("date_profile") or {}).get("parseable_pct", 0.0) or 0.0) >= 60.0)
+        or any(t in c.lower() for t in ["time", "date", "visit", "wave", "month", "day", "week", "year", "session", "trial", "tp"])
+    ]
+    repeat_name_candidates = [
+        c for c in df.columns
+        if _parse_repeat_structure_name(c) is not None
+    ]
 
-    pool = list(dict.fromkeys(key_candidate_cols[:8] + time_like + repeat_index_cols[:8]))
+    seed_cols = list(dict.fromkeys((key_integrity.get("handoff_to_A6", {}).get("recommended_seed_columns") or []) + key_candidate_cols[:8]))[:10]
+    repeat_candidates_pool = list(dict.fromkeys(repeat_index_cols + repeat_name_candidates + [c for c in df.columns if any(k in c.lower() for k in ["wave", "visit", "session", "trial", "row", "item", "tp", "timepoint"])][:10]))[:12]
+    time_like = list(dict.fromkeys(role_time_candidates))[:8]
+
+    pool = list(dict.fromkeys(seed_cols + repeat_candidates_pool + time_like))
     candidate_sets = []
-    for r in (1, 2, 3):
-        for combo in combinations(pool, r):
-            if any(c in key_candidate_cols[:8] for c in combo):
-                candidate_sets.append(list(combo))
+    for seed in seed_cols[:8]:
+        candidate_sets.append([seed])
+        for rcol in repeat_candidates_pool[:8]:
+            if rcol != seed:
+                candidate_sets.append([seed, rcol])
+        for tcol in time_like[:6]:
+            if tcol != seed:
+                candidate_sets.append([seed, tcol])
+        for rcol in repeat_candidates_pool[:6]:
+            for tcol in time_like[:4]:
+                if len({seed, rcol, tcol}) == 3:
+                    candidate_sets.append([seed, rcol, tcol])
+
     # deterministic de-dupe + cap
     seen = set()
     dedup_sets = []
-    for s in candidate_sets:
-        t = tuple(s)
+    for ss in candidate_sets:
+        t = tuple(ss)
         if t in seen:
             continue
         seen.add(t)
-        dedup_sets.append(s)
-    candidate_sets = dedup_sets[:60]
+        dedup_sets.append(ss)
+    candidate_sets = dedup_sets[:120]
 
     grain_tests = []
     for idx, keys in enumerate(candidate_sets, start=1):
         dup_mask = df.duplicated(subset=keys, keep=False)
         dup_rows = int(dup_mask.sum())
         dup_groups = int(df[df.duplicated(subset=keys, keep=False)].groupby(keys, dropna=False).ngroups) if dup_rows else 0
+        uniq_rows = int((~df.duplicated(subset=keys, keep=False)).sum())
+        uniqueness_rate = float(uniq_rows / max(1, n_rows))
         non_keys = [c for c in df.columns if c not in keys]
         identical_pct = 0.0
-        conflict_examples = []
+        conflict_summaries = []
+        non_key_conflicting_groups = 0
+        non_key_identical_groups = 0
+
         if dup_rows and non_keys:
             g = df[df.duplicated(subset=keys, keep=False)].groupby(keys, dropna=False)
-            identical = 0
-            total = 0
+            total_groups = 0
             for group_key, gdf in g:
-                total += 1
-                if len(gdf[non_keys].drop_duplicates()) == 1:
-                    identical += 1
-                elif len(conflict_examples) < 3:
-                    conflict_examples.append({"key": group_key if isinstance(group_key, tuple) else [group_key], "rows": gdf.head(2).to_dict(orient="records")})
-            identical_pct = float((identical / total) * 100.0) if total else 0.0
-        sev = min(1.0, (dup_rows / max(1, n_rows)))
+                total_groups += 1
+                dedup_non_key = gdf[non_keys].drop_duplicates()
+                if len(dedup_non_key) == 1:
+                    non_key_identical_groups += 1
+                    continue
+                non_key_conflicting_groups += 1
+                if len(conflict_summaries) < 5:
+                    row_ids = list(gdf.index[:2])
+                    if len(row_ids) >= 2:
+                        a = gdf.loc[row_ids[0], non_keys]
+                        b = gdf.loc[row_ids[1], non_keys]
+                        differing = [c for c in non_keys if (a[c] != b[c]) and not (pd.isna(a[c]) and pd.isna(b[c]))]
+                    else:
+                        differing = []
+                    conflict_summaries.append({
+                        "key": list(group_key) if isinstance(group_key, tuple) else [group_key],
+                        "differing_columns_count": len(differing),
+                        "differing_columns_preview": differing[:5],
+                        "row_refs": [f"r{int(i)}" for i in row_ids],
+                    })
+            identical_pct = float((non_key_identical_groups / max(1, total_groups)) * 100.0)
+        conflict_group_pct = float(non_key_conflicting_groups / max(1, dup_groups)) if dup_groups else 0.0
+
+        fam_hits = [f.get("family_id") for f in families if any(c in f.get("columns", []) for c in keys)]
+        repeat_dimension_present = any(k in repeat_candidates_pool for k in keys)
+        temporal_dimension_present = any(k in time_like for k in keys)
+        pivot_safety = "safe" if dup_rows == 0 else ("conditional" if conflict_group_pct <= 0.2 else "unsafe")
+        decision = "best_available_composite_key" if len(keys) > 1 else ("candidate_single_key" if dup_rows == 0 else "failed_single_key")
+
         grain_tests.append({
             "test_id": f"GT{idx}",
             "keys_tested": keys,
+            "uniqueness_rate": round(uniqueness_rate, 6),
             "dup_row_count": dup_rows,
             "dup_groups_count": dup_groups,
             "identical_duplicate_pct": round(identical_pct, 6),
-            "conflicting_duplicate_examples": conflict_examples,
-            "collision_severity_score": round(sev, 6),
+            "non_key_conflict_group_pct": round(conflict_group_pct, 6),
+            "non_key_conflict_summary": conflict_summaries,
+            "family_evidence": {
+                "families_touched": fam_hits,
+                "repeat_dimension_present": repeat_dimension_present,
+                "temporal_dimension_present": temporal_dimension_present,
+            },
+            "pivot_safety": pivot_safety,
+            "decision": decision,
+            "collision_severity_score": round(min(1.0, (0.6 * (dup_rows / max(1, n_rows)) + 0.4 * conflict_group_pct)), 6),
+            "same_key_identical_nonkeys_groups": int(non_key_identical_groups),
+            "same_key_conflicting_nonkeys_groups": int(non_key_conflicting_groups),
         })
 
-    duplicates_report = {
-        "exact_duplicate_rows": {
-            "count": int(df.duplicated(keep=False).sum()),
-            "sample_row_hashes": [
-                sha256_hex(json.dumps(r, sort_keys=True, default=str).encode("utf-8"))
-                for r in df[df.duplicated(keep=False)].head(10).to_dict(orient="records")
-            ],
+    grain_tests = sorted(grain_tests, key=lambda g: (g.get("collision_severity_score", 1.0), -g.get("uniqueness_rate", 0.0), g.get("dup_row_count", 10**9), len(g.get("keys_tested", []))))
+    best_test = grain_tests[0] if grain_tests else None
+    runner_ups = [
+        {
+            "keys": gt.get("keys_tested", []),
+            "dup_row_count": gt.get("dup_row_count", 0),
+            "reason_failed": "expected repeats / likely longitudinal rows" if (gt.get("dup_row_count", 0) > 0 and len(gt.get("keys_tested", [])) == 1) else "lower_ranked_alternative",
+        }
+        for gt in grain_tests[1:4]
+    ]
+
+    row_grain_status = "failed"
+    if best_test:
+        if best_test.get("dup_row_count", 0) == 0:
+            row_grain_status = "validated"
+        elif best_test.get("pivot_safety") == "conditional":
+            row_grain_status = "ambiguous"
+
+    grain_validation = {
+        "artifact": "A6",
+        "purpose": "grain_validation",
+        "inputs": artifact_inputs["A6"],
+        "row_grain_assessment": {
+            "status": row_grain_status,
+            "best_candidate": {
+                "keys": best_test.get("keys_tested", []) if best_test else [],
+                "uniqueness_rate": best_test.get("uniqueness_rate", 0.0) if best_test else 0.0,
+                "dup_row_count": best_test.get("dup_row_count", 0) if best_test else 0,
+                "dup_groups_count": best_test.get("dup_groups_count", 0) if best_test else 0,
+                "non_key_conflict_group_pct": best_test.get("non_key_conflict_group_pct", 0.0) if best_test else 0.0,
+                "pivot_safety": best_test.get("pivot_safety", "unsafe") if best_test else "unsafe",
+                "decision": best_test.get("decision", "none") if best_test else "none",
+            },
+            "runner_ups": runner_ups,
         },
-        "grain_duplicates": grain_tests,
+        "tests": grain_tests,
+        "evidence_links": {"repeat_families": "A8", "role_scores": "A9", "seed_candidates": "A5"},
+        "candidate_generation": {
+            "seed_columns": seed_cols,
+            "repeat_dimension_candidates": repeat_candidates_pool,
+            "time_like_candidates": time_like,
+            "family_repeat_dimensions": family_repeat_dims,
+            "pool_size": len(pool),
+        },
     }
 
-    role_scores = {"columns": []}
+    exact_dup_mask = df.duplicated(keep=False)
+    exact_dup_rows = df[exact_dup_mask].copy()
+    cluster_map: Dict[str, List[int]] = defaultdict(list)
+    if len(exact_dup_rows):
+        for idx_row, row in exact_dup_rows.iterrows():
+            h = sha256_hex(json.dumps(row.to_dict(), sort_keys=True, default=str).encode("utf-8"))
+            cluster_map[h].append(int(idx_row))
+
+    exact_clusters = []
+    for i, (h, idxs) in enumerate(sorted(cluster_map.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:50], start=1):
+        exact_clusters.append({
+            "cluster_id": f"ED{i}",
+            "row_count": len(idxs),
+            "row_refs": [f"r{x}" for x in idxs[:20]],
+            "row_hash": h,
+            "all_columns_identical": True,
+        })
+
+    best_near = best_test or {}
+    duplicates_report = {
+        "artifact": "A7",
+        "purpose": "duplicate_report",
+        "inputs": artifact_inputs["A7"],
+        "summary": {
+            "n_rows": int(n_rows),
+            "rows_in_exact_duplicate_clusters": int(exact_dup_mask.sum()),
+            "exact_duplicate_cluster_count": len(cluster_map),
+            "exact_duplicate_prevalence_pct": round(float(exact_dup_mask.mean() * 100.0) if n_rows else 0.0, 6),
+            "safe_drop_exact_duplicates": "recommended_after_review" if len(cluster_map) > 0 else "not_applicable",
+        },
+        "exact_duplicate_clusters": exact_clusters,
+        "near_duplicate_checks": {
+            "grain_ref": "A6",
+            "best_grain": best_near.get("keys_tested", []),
+            "same_key_identical_nonkeys_groups": int(best_near.get("same_key_identical_nonkeys_groups", 0) or 0),
+            "same_key_conflicting_nonkeys_groups": int(best_near.get("same_key_conflicting_nonkeys_groups", 0) or 0),
+        },
+        "actions": [
+            {
+                "action": "drop_exact_duplicates",
+                "status": "recommended_after_review" if len(cluster_map) > 0 else "no_action",
+                "why": "all sampled clusters are fully identical" if len(cluster_map) > 0 else "no exact duplicate clusters detected",
+            }
+        ],
+        "grain_context_ref": "A6",
+    }
+
+    role_scores = {
+        "artifact": "A9",
+        "purpose": "role_type_detection",
+        "inputs": artifact_inputs["A9"],
+        "evidence_primitives": {
+            "source": "column_signal_map",
+            "fields": [
+                "raw_inferred_type", "unique_count", "unique_ratio", "missing_pct",
+                "parsed_as_numeric_pct", "parsed_as_datetime_pct",
+                "top_candidate_type", "top_candidate_confidence", "top_candidate_parse", "top_candidate_op",
+            ],
+        },
+        "columns": [],
+    }
+    family_member_cols = {c for fam in families for c in fam.get("columns", [])}
+    family_repeat_names = {f.get("recommended_repeat_dimension_name") for f in families if f.get("recommended_repeat_dimension_name")}
     for row in column_dictionary_rows:
-        uniq = float(row["is_unique_like"])
-        inferred = row["inferred_type"]
-        scores = {
-            "id_key": round(min(1.0, uniq), 6),
-            "invariant_attr": round(min(1.0, max(0.0, 1.0 - uniq)), 6),
-            "measure": 0.8 if inferred in {"integer", "float"} else 0.2,
-            "repeat_index": 0.8 if any(x in row["column"].lower() for x in ["time", "visit", "wave", "index", "month", "day", "week"]) else 0.1,
-            "derived": 0.6 if any(x in row["column"].lower() for x in ["total", "sum", "score", "avg", "mean"]) else 0.1,
-            "multivalue_cell": 0.7 if (cols_profile.get(row["column"], {}).get("patterns", {}).get("multi_value", {}).get("multi_token_pct", 0) > 20) else 0.1,
-            "one_hot_member": 0.8 if row["is_one_hot_like"] else 0.1,
-            "ignore": 0.05,
-        }
-        role_scores["columns"].append({"column": row["column"], "role_scores": scores, "features": {"unique_ratio": uniq, "inferred_type": inferred}})
+        uniq = float(row["unique_ratio"])
+        inferred = row["raw_inferred_type"]
+        top_candidate = row.get("top_candidate") or {}
+        top_type = str(top_candidate.get("type") or "")
+        top_conf = float(top_candidate.get("confidence", 0.0) or 0.0)
+        parsed_as_numeric_pct = float((row.get("numeric_profile") or {}).get("parseable_pct", 0.0) or 0.0)
+        parsed_as_datetime_pct = float((row.get("datetime_profile") or {}).get("parseable_pct", 0.0) or 0.0)
+        unique_count = int(row.get("unique_count", 0) or 0)
+        sample_values = ((row.get("a2_samples") or {}).get("random") or [])[:5]
+        repeat_parse = _parse_repeat_structure_name(row["column"])
+
+        measure_numeric = max(parsed_as_numeric_pct / 100.0, 1.0 if top_type in {"numeric", "numeric_with_unit", "percent", "numeric_range"} else 0.0)
+        likert_hint = bool(measure_numeric >= 0.8 and unique_count <= 11 and unique_count > 0)
+        family_member_hint = row["column"] in family_member_cols
+        coded_cat_hint = bool(measure_numeric >= 0.8 and unique_count <= max_categorical_cardinality)
+        identifier_numeric_hint = bool(measure_numeric >= 0.8 and uniq >= 0.98 and unique_count > max_categorical_cardinality)
+
+        role_candidates = [
+            {
+                "role": "id_key",
+                "score": round(min(1.0, uniq * (0.7 + 0.3 * top_conf)), 6),
+                "evidence": {"unique_ratio": round(uniq, 6), "top_candidate_confidence": round(top_conf, 6)},
+            },
+            {
+                "role": "time_index",
+                "score": round(min(1.0, max(parsed_as_datetime_pct / 100.0, 0.8 if any(x in row["column"].lower() for x in ["date", "time", "timestamp", "year", "month", "day"]) else 0.0)), 6),
+                "evidence": {"parsed_as_datetime_pct": round(parsed_as_datetime_pct, 6), "name_hint": any(x in row["column"].lower() for x in ["date", "time", "timestamp", "year", "month", "day"])},
+            },
+            {
+                "role": "measure_numeric",
+                "score": round(min(1.0, measure_numeric * (0.8 if not identifier_numeric_hint else 0.4)), 6),
+                "evidence": {"parsed_as_numeric_pct": round(parsed_as_numeric_pct, 6), "top_candidate_type": top_type, "identifier_numeric_hint": identifier_numeric_hint},
+            },
+            {
+                "role": "measure_item",
+                "score": round(0.9 if (likert_hint and family_member_hint) else (0.85 if likert_hint else (0.65 if family_member_hint else 0.2)), 6),
+                "evidence": {"parsed_as_numeric_pct": round(parsed_as_numeric_pct, 6), "unique_count": unique_count, "value_range_small_integer": likert_hint, "family_member_hint": family_member_hint},
+            },
+            {
+                "role": "coded_categorical",
+                "score": round(0.8 if coded_cat_hint else 0.2, 6),
+                "evidence": {"parsed_as_numeric_pct": round(parsed_as_numeric_pct, 6), "unique_count": unique_count, "max_categorical_cardinality": int(max_categorical_cardinality)},
+            },
+            {
+                "role": "repeat_index_embedded_in_name",
+                "score": round(0.82 if repeat_parse else 0.1, 6),
+                "evidence": {"repeat_name_parse": repeat_parse},
+            },
+            {
+                "role": "invariant_attr",
+                "score": round(min(1.0, max(0.0, 1.0 - uniq)), 6),
+                "evidence": {"unique_ratio": round(uniq, 6)},
+            },
+            {
+                "role": "derived",
+                "score": round(0.7 if any(x in row["column"].lower() for x in ["total", "sum", "score", "avg", "mean"]) else 0.1, 6),
+                "evidence": {"name_hint": any(x in row["column"].lower() for x in ["total", "sum", "score", "avg", "mean"])},
+            },
+            {
+                "role": "multivalue_cell",
+                "score": round(0.8 if (cols_profile.get(row["column"], {}).get("patterns", {}).get("multi_value", {}).get("multi_token_pct", 0) > 20 and not re.search(r"url|link", row["column"], re.IGNORECASE)) else 0.1, 6),
+                "evidence": {"multi_token_pct": cols_profile.get(row["column"], {}).get("patterns", {}).get("multi_value", {}).get("multi_token_pct", 0.0)},
+            },
+            {
+                "role": "one_hot_member",
+                "score": 0.8 if row["is_one_hot_like"] else 0.1,
+                "evidence": {"is_one_hot_like": bool(row["is_one_hot_like"])},
+            },
+        ]
+        role_candidates = sorted(role_candidates, key=lambda r: (-r["score"], r["role"]))
+        role_decision = role_candidates[0]["role"] if role_candidates else "ignore"
+        review_reasons = []
+        if top_conf < 0.75:
+            review_reasons.append("low_top_candidate_confidence")
+        if parsed_as_numeric_pct >= 80.0 and top_type in {"text", "mixed"}:
+            review_reasons.append("numeric_parse_vs_candidate_mismatch")
+        if parsed_as_datetime_pct >= 80.0 and top_type not in {"date", "datetime"}:
+            review_reasons.append("datetime_parse_vs_candidate_mismatch")
+
+        scores = {c["role"]: c["score"] for c in role_candidates}
+        role_scores["columns"].append({
+            "column": row["column"],
+            "role_scores": scores,
+            "role_candidates": role_candidates,
+            "role_decision": role_decision,
+            "review_required": bool(review_reasons),
+            "review_reasons": review_reasons,
+            "audit": {
+                "top_candidate_type": top_type,
+                "top_candidate_confidence": round(top_conf, 6),
+                "parsed_as_datetime_pct": round(parsed_as_datetime_pct, 6),
+                "parsed_as_numeric_pct": round(parsed_as_numeric_pct, 6),
+                "sample_values": sample_values,
+            },
+            "evidence_used": {
+                "unique_ratio": uniq,
+                "unique_count": unique_count,
+                "top_candidate": top_candidate,
+                "repeat_name_parse": repeat_parse,
+                "family_member_hint": family_member_hint,
+                "family_repeat_dimensions": sorted([x for x in family_repeat_names if x]),
+                "missing_pct": row.get("missing_pct", 0.0),
+                "numeric_profile_parseable_pct": parsed_as_numeric_pct,
+                "datetime_profile_parseable_pct": parsed_as_datetime_pct,
+            },
+            "evidence_not_used": [],
+            "features": {"unique_ratio": uniq, "raw_inferred_type": inferred, "top_candidate_type": top_type},
+        })
 
     # Reuse existing deterministic association/dependency engine from /evidence_associations
+    raw_signals = association_result.get("signals", [])
+    parsed_signals = []
+    for s in raw_signals:
+        ev = s.get("evidence_json")
+        if isinstance(ev, str):
+            try:
+                ev_obj = json.loads(ev)
+            except Exception:
+                ev_obj = {"raw": ev}
+        else:
+            ev_obj = ev if isinstance(ev, dict) else {}
+        parsed_signals.append({
+            "kind": s.get("kind"),
+            "columns": s.get("columns", []),
+            "score": s.get("score"),
+            "metric": s.get("metric"),
+            "evidence": ev_obj,
+        })
+
+    near_duplicate_candidates = []
+    dependency_candidates = []
+    derived_total_candidates = []
+    time_column_candidates = []
+    family_screening_correlations = []
+    included_audit_signals = []
+    suppressed_count = 0
+
+    for s in parsed_signals:
+        kind = str(s.get("kind") or "")
+        score = float(s.get("score", 0.0) or 0.0)
+        cols = s.get("columns") or []
+        ev = s.get("evidence") or {}
+
+        if kind == "numeric_numeric_corr":
+            abs_r = abs(score)
+            overlap = int(ev.get("n_overlap", 0) or 0)
+            if abs_r >= 0.98 and overlap >= ASSOC_MIN_OVERLAP:
+                near_duplicate_candidates.append({
+                    "a": cols[0] if len(cols) > 0 else None,
+                    "b": cols[1] if len(cols) > 1 else None,
+                    "confidence": round(abs_r, 6),
+                    "evidence": {"abs_pearson_r": round(abs_r, 6), "overlap": overlap},
+                    "action": "review_for_duplicate_or_alias",
+                })
+                included_audit_signals.append(s)
+            elif abs_r >= 0.85:
+                family_screening_correlations.append({
+                    "a": cols[0] if len(cols) > 0 else None,
+                    "b": cols[1] if len(cols) > 1 else None,
+                    "correlation": round(score, 6),
+                    "evidence": {"abs_pearson_r": round(abs_r, 6), "overlap": overlap},
+                    "purpose": "family_screening",
+                })
+                included_audit_signals.append(s)
+            else:
+                suppressed_count += 1
+            continue
+
+        if kind == "dependency_check":
+            if s.get("metric") == "best_fitting_aggregate_rule_ok_rate":
+                derived_total_candidates.append({
+                    "target": ev.get("total_col"),
+                    "components": ev.get("item_cols", []),
+                    "identity_type": ev.get("best_rule"),
+                    "confidence": round(float(ev.get("best_ok_rate", score) or 0.0), 6),
+                    "evidence": {
+                        "rows_checked": int(ev.get("n", 0) or 0),
+                        "rows_matching": int(round(float(ev.get("best_ok_rate", 0.0) or 0.0) * float(ev.get("n", 0) or 0))),
+                        "tolerance_abs": ev.get("tol_abs"),
+                        "tolerance_rel": ev.get("tol_rel"),
+                    },
+                })
+            else:
+                dependency_candidates.append({
+                    "determinant": cols[0] if len(cols) > 0 else None,
+                    "dependent": cols[1] if len(cols) > 1 else None,
+                    "coverage": round(score, 6),
+                    "violations": int(ev.get("violations", 0) or 0),
+                    "action": "candidate_invariant_attribute",
+                    "evidence": ev,
+                })
+            included_audit_signals.append(s)
+            continue
+
+        if kind == "time_col_candidate":
+            time_column_candidates.append({
+                "column": cols[0] if cols else None,
+                "confidence": round(score, 6),
+                "evidence": {
+                    "datetime_parse_rate": float(ev.get("parse_success_pct", 0.0) or 0.0),
+                    "monotonic_fraction_within_id": float(ev.get("monotonic_increasing_pct", 0.0) or 0.0),
+                },
+            })
+            included_audit_signals.append(s)
+            continue
+
+        if kind in {"id_time_duplicates"}:
+            dependency_candidates.append({
+                "determinant": ev.get("id_col"),
+                "dependent": ev.get("time_col"),
+                "coverage": round(1.0 - score, 6),
+                "violations": int(ev.get("dup_rows", 0) or 0),
+                "action": "check_time_grain_duplicates",
+                "evidence": ev,
+            })
+            included_audit_signals.append(s)
+            continue
+
+        suppressed_count += 1
+
+    near_duplicate_candidates = sorted(near_duplicate_candidates, key=lambda x: (-x["confidence"], x["a"] or "", x["b"] or ""))[:20]
+    family_screening_correlations = sorted(family_screening_correlations, key=lambda x: (-abs(x["correlation"]), x["a"] or "", x["b"] or ""))[:20]
+    derived_total_candidates = sorted(derived_total_candidates, key=lambda x: (-x["confidence"], str(x["target"])))[:20]
+    dependency_candidates = sorted(dependency_candidates, key=lambda x: (-x["coverage"], str(x["determinant"]), str(x["dependent"])))[:30]
+    time_column_candidates = sorted(time_column_candidates, key=lambda x: (-x["confidence"], str(x["column"])))[:20]
+
     rel = {
-        "signals": association_result.get("signals", []),
+        "artifact": "A10",
+        "purpose": "structural_relationships_evidence_for_table_grain_and_derived_feature_detection",
+        "inputs": artifact_inputs["A10"],
         "limits": association_result.get("limits", {}),
         "n_rows_scanned": association_result.get("n_rows_scanned"),
-        "derived_totals": [s for s in association_result.get("signals", []) if s.get("kind") == "dependency_check"],
-        "functional_dependencies": [s for s in association_result.get("signals", []) if s.get("kind") in {"dependency_check", "id_time_duplicates"}],
+        "derived_total_candidates": derived_total_candidates,
+        "near_duplicate_candidates": near_duplicate_candidates,
+        "dependency_candidates": dependency_candidates,
+        "time_column_candidates": time_column_candidates,
+        "family_screening_correlations": family_screening_correlations,
         "one_hot_blocks": [],
-        "near_duplicate_columns": [s for s in association_result.get("signals", []) if s.get("kind") == "num_num_assoc" and (s.get("score") or 0) > 0.98],
         "coded_categorical_flags": [],
+        "audit_trail_signals": {
+            "included_count": len(included_audit_signals),
+            "suppressed_count": int(max(0, suppressed_count)),
+            "suppression_rules": ["generic_pairwise_corr_not_actionable"],
+            "included_signals": included_audit_signals,
+        },
     }
 
     one_hot_groups: Dict[str, List[str]] = defaultdict(list)
@@ -3388,28 +4390,239 @@ async def full_bundle(
         if df[c].nunique(dropna=True) <= max_categorical_cardinality:
             rel["coded_categorical_flags"].append({"column": c, "reason": "numeric_low_cardinality"})
 
-    curated_cols = list(dict.fromkeys(key_candidate_cols[:2] + time_like[:2] + [c for c in df.columns if c not in set(key_candidate_cols[:2] + time_like[:2])][:5]))
-    global_glimpse = {
-        "head": df[curated_cols].head(5).to_dict(orient="records") if curated_cols else [],
-        "tail": df[curated_cols].tail(5).to_dict(orient="records") if curated_cols else [],
-        "random": df[curated_cols].sample(n=min(5, len(df)), random_state=_stable_int_seed(dataset_sha256, "global")).to_dict(orient="records") if curated_cols and len(df) else [],
-        "curated_columns": curated_cols,
-    }
-    per_family = []
-    for fam in families:
-        fam_cols = list(dict.fromkeys(key_candidate_cols[:2] + fam["columns"]))
-        per_family.append({
-            "family_id": fam["family_id"],
-            "columns": fam["columns"],
-            "rows": df[fam_cols].head(5).to_dict(orient="records") if fam_cols else [],
+    role_rows = role_scores.get("columns", [])
+    role_by_col = {r.get("column"): r for r in role_rows}
+    key_seed_map = {k.get("column"): k for k in key_integrity.get("single_column_key_seed_candidates", [])}
+    relationship_time_cols = [x.get("column") for x in rel.get("time_column_candidates", []) if x.get("column")]
+
+    def _is_low_signal_col(c: str) -> bool:
+        s = df[c].astype("string")
+        uniq_ratio = float(s.nunique(dropna=True) / max(1, len(df)))
+        long_token_ratio = float(s.str.len().fillna(0).gt(48).mean())
+        url_ratio = float(s.str.contains(r"^https?://", na=False, regex=True).mean())
+        name_risky = bool(re.search(r"url|uri|link|image|img|photo|avatar|file|path|hash|token", c, re.IGNORECASE))
+        return bool(name_risky or url_ratio > 0.25 or (uniq_ratio > 0.95 and long_token_ratio > 0.6))
+
+    def _sample_rows_for_panel(cols: List[str], panel_id: str, *, head_n: int = 5, tail_n: int = 5, rand_n: int = 5) -> List[Dict[str, Any]]:
+        if not cols:
+            return []
+        seed = _stable_int_seed(dataset_sha256, panel_id)
+        rows: List[Tuple[int, str]] = []
+        rows += [(i, "head") for i in list(df.head(min(head_n, len(df))).index)]
+        rows += [(i, "tail") for i in list(df.tail(min(tail_n, len(df))).index)]
+        if len(df) > 0:
+            rnd_idx = df.sample(n=min(rand_n, len(df)), random_state=seed).index.tolist()
+            rows += [(i, "random") for i in rnd_idx]
+        seen = set()
+        out = []
+        for idx, bucket in rows:
+            if idx in seen:
+                continue
+            seen.add(idx)
+            rec = {"_row_index": int(idx), "_sample_bucket": bucket}
+            for c in cols:
+                v = df.at[idx, c]
+                rec[c] = None if pd.isna(v) else v
+            out.append(rec)
+        return out
+
+    panel_specs: List[Dict[str, Any]] = []
+
+    key_cols = [c for c in key_candidate_cols if c in df.columns][:3]
+    time_cols = [c for c in list(dict.fromkeys(relationship_time_cols + time_like)) if c in df.columns][:3]
+    repeat_cols = [c for c in df.columns if (role_by_col.get(c, {}).get("role_scores", {}).get("repeat_index_embedded_in_name", 0.0) >= 0.5)][:3]
+    grain_cols = list(dict.fromkeys(key_cols + time_cols + repeat_cols))
+    grain_uncertainty = bool(any((role_by_col.get(c, {}).get("review_required") for c in grain_cols)) or len(grain_cols) < 2)
+    if grain_uncertainty:
+        extra = [c for c in df.columns if c not in grain_cols and not _is_low_signal_col(c)][:4]
+        grain_cols = list(dict.fromkeys(grain_cols + extra))[:10]
+    else:
+        grain_cols = grain_cols[:6]
+    panel_specs.append({
+        "panel_id": "grain_preview",
+        "purpose": "Inspect candidate row grain and repeat dimensions",
+        "columns": grain_cols,
+        "selection_trace": [
+            {
+                "column": c,
+                "reason": "top key candidate" if c in key_cols else ("time-like candidate" if c in time_cols else "repeat index candidate"),
+                "source_artifact": "A5" if c in key_cols else "A9",
+                "rank": (key_cols.index(c) + 1) if c in key_cols else None,
+                "confidence": role_by_col.get(c, {}).get("role_scores", {}).get("time_index") if c in time_cols else role_by_col.get(c, {}).get("role_scores", {}).get("repeat_index_embedded_in_name"),
+                "fallback_rule": "expanded_due_to_low_confidence" if (grain_uncertainty and c not in key_cols + time_cols + repeat_cols) else None,
+            }
+            for c in grain_cols
+        ],
+    })
+
+    attr_candidates = [c for c in df.columns if role_by_col.get(c, {}).get("role_scores", {}).get("invariant_attr", 0.0) >= 0.5 and c not in grain_cols and not _is_low_signal_col(c)]
+    entity_cols = list(dict.fromkeys(key_cols[:1] + attr_candidates[:7]))
+    panel_specs.append({
+        "panel_id": "entity_attributes_preview",
+        "purpose": "Likely invariant descriptors per entity",
+        "columns": entity_cols,
+        "selection_trace": [
+            {
+                "column": c,
+                "reason": "entity key anchor" if c in key_cols[:1] else "high invariant_attr role score",
+                "source_artifact": "A5" if c in key_cols[:1] else "A9",
+                "confidence": role_by_col.get(c, {}).get("role_scores", {}).get("invariant_attr"),
+                "rank": key_cols.index(c) + 1 if c in key_cols else None,
+                "fallback_rule": None,
+            }
+            for c in entity_cols
+        ],
+    })
+
+    measure_candidates = [c for c in df.columns if max(role_by_col.get(c, {}).get("role_scores", {}).get("measure_numeric", 0.0), role_by_col.get(c, {}).get("role_scores", {}).get("measure_item", 0.0)) >= 0.5 and c not in grain_cols and not _is_low_signal_col(c)]
+    measure_cols = list(dict.fromkeys(key_cols[:1] + measure_candidates[:8]))
+    panel_specs.append({
+        "panel_id": "measure_preview",
+        "purpose": "Inspect likely numeric/scale/question variables",
+        "columns": measure_cols,
+        "selection_trace": [
+            {
+                "column": c,
+                "reason": "measure candidate",
+                "source_artifact": "A9",
+                "confidence": max(role_by_col.get(c, {}).get("role_scores", {}).get("measure_numeric", 0.0), role_by_col.get(c, {}).get("role_scores", {}).get("measure_item", 0.0)) if c not in key_cols[:1] else None,
+                "rank": None,
+                "fallback_rule": None,
+            }
+            for c in measure_cols
+        ],
+    })
+
+    text_candidates = [c for c in df.columns if role_by_col.get(c, {}).get("role_scores", {}).get("coded_categorical", 0.0) >= 0.5 and c not in grain_cols and c not in measure_cols and not _is_low_signal_col(c)]
+    text_cols = text_candidates[:8]
+    panel_specs.append({
+        "panel_id": "text_code_preview",
+        "purpose": "Inspect categorical labels/free-text/code fields",
+        "columns": text_cols,
+        "selection_trace": [
+            {
+                "column": c,
+                "reason": "coded categorical / text role",
+                "source_artifact": "A9",
+                "confidence": role_by_col.get(c, {}).get("role_scores", {}).get("coded_categorical"),
+                "rank": None,
+                "fallback_rule": None,
+            }
+            for c in text_cols
+        ],
+    })
+
+    family_panels = []
+    for fam in families[:3]:
+        fam_cols = [c for c in fam.get("columns", []) if c in df.columns and not _is_low_signal_col(c)]
+        cols = list(dict.fromkeys(key_cols[:1] + repeat_cols[:1] + fam_cols[:8]))
+        family_panels.append({
+            "panel_id": f"family_{fam.get('family_id')}_preview",
+            "purpose": "Question block / repeated measures preview",
+            "columns": cols,
+            "selection_trace": [
+                {
+                    "column": c,
+                    "reason": "family membership",
+                    "source_artifact": "A8",
+                    "confidence": None,
+                    "rank": None,
+                    "fallback_rule": None,
+                }
+                for c in cols
+            ],
+            "family_reference": fam,
         })
-    glimpses = {"global": global_glimpse, "per_family": per_family}
+
+    if not family_panels:
+        stems: Dict[str, List[str]] = defaultdict(list)
+        for c in df.columns:
+            m = re.match(r"^(.*?)(?:[_\-]?)(\d+)$", c)
+            if m:
+                stems[m.group(1)].append(c)
+        pseudo = sorted([(k, v) for k, v in stems.items() if len(v) >= 3], key=lambda kv: (-len(kv[1]), kv[0]))[:2]
+        for stem, cols_raw in pseudo:
+            cols = list(dict.fromkeys(key_cols[:1] + sorted(cols_raw)[:8]))
+            family_panels.append({
+                "panel_id": f"pseudo_family_{stem}_preview",
+                "purpose": "Fallback patterned column cluster when family detection is weak",
+                "columns": cols,
+                "selection_trace": [
+                    {
+                        "column": c,
+                        "reason": "patterned stem cluster fallback",
+                        "source_artifact": "A11_fallback",
+                        "confidence": None,
+                        "rank": None,
+                        "fallback_rule": "no_family_detected_pattern_cluster",
+                    }
+                    for c in cols
+                ],
+                "family_reference": {"family_id": f"pseudo_{stem}", "columns": sorted(cols_raw)},
+            })
+
+    panels = []
+    for p in panel_specs + family_panels:
+        cols = [c for c in p.get("columns", []) if c in df.columns][:10]
+        if not cols:
+            continue
+        rows = _sample_rows_for_panel(
+            cols,
+            p["panel_id"],
+            head_n=6 if (p["panel_id"] == "grain_preview" and grain_uncertainty) else 5,
+            tail_n=6 if (p["panel_id"] == "grain_preview" and grain_uncertainty) else 5,
+            rand_n=8 if (p["panel_id"] == "grain_preview" and grain_uncertainty) else 5,
+        )
+        panels.append({
+            "panel_id": p["panel_id"],
+            "purpose": p["purpose"],
+            "columns": cols,
+            "selection_trace": p["selection_trace"],
+            "rows": rows,
+            "family_reference": p.get("family_reference"),
+        })
+
+    glimpses = {
+        "artifact": "A11",
+        "version": "2",
+        "intent": "human_readable_preview_with_audit_trace",
+        "inputs": artifact_inputs["A11"],
+        "row_samples": {
+            "sampling_policy": {
+                "head_n": 5,
+                "tail_n": 5,
+                "random_n": 5,
+                "seed": "dataset_sha256-derived",
+                "seed_basis": dataset_sha256,
+            },
+            "selection_policy": {
+                "panel_strategy": ["ID/GRAIN", "Entity attributes", "Measure", "Text/code", "Family/pseudo-family"],
+                "demotion_rules": ["url_or_path_like", "near_unique_long_metadata_strings"],
+                "adaptive_expansion": {
+                    "grain_panel_expands_when_confidence_low": True,
+                    "pseudo_family_fallback_when_no_families": True,
+                },
+                "source_artifacts": ["A5", "A8", "A9", "A10"],
+            },
+            "panels": panels,
+        },
+    }
+
+    per_family = []
+    for p in panels:
+        if p.get("family_reference"):
+            per_family.append({
+                "family_id": p["family_reference"].get("family_id"),
+                "columns": p["family_reference"].get("columns", []),
+                "rows": p.get("rows", [])[:5],
+            })
 
     family_packets = []
     col_dict_map = {r["column"]: r for r in column_dictionary_rows}
     for fam in families:
         fam_cols = fam["columns"]
         family_packets.append({
+            "inputs": artifact_inputs["B1"],
             "family_id": fam["family_id"],
             "columns": fam_cols,
             "detected_pattern_index_summary": {
@@ -3433,6 +4646,13 @@ async def full_bundle(
         relationships=rel,
         all_columns=list(df.columns),
     )
+    table_layout_candidates["artifact"] = "A12"
+    table_layout_candidates["purpose"] = "table_layout_candidates"
+    table_layout_candidates["inputs"] = artifact_inputs["A12"]
+    table_layout_candidates["evidence_primitives"] = {
+        "source": "column_signal_map",
+        "fields": ["unique_ratio", "top_candidate_type", "top_candidate_confidence", "parsed_as_numeric_pct", "parsed_as_datetime_pct"],
+    }
 
     run_id = uuid4().hex
     base_url = str(request.base_url).rstrip("/")
@@ -3448,7 +4668,7 @@ async def full_bundle(
         "A3": _json_bytes(review_queue),
         "A4": _json_bytes(missing_catalog),
         "A5": _json_bytes(key_integrity),
-        "A6": _json_bytes({"tests": grain_tests}),
+        "A6": _json_bytes(grain_validation),
         "A7": _json_bytes(duplicates_report),
         "A8": _json_bytes(repeat_candidates),
         "A9": _json_bytes(role_scores),
@@ -3479,6 +4699,20 @@ async def full_bundle(
         })
 
     run_manifest = {
+        "artifact": "A1",
+        "purpose": "run_manifest",
+        "inputs": artifact_inputs["A1"],
+        "evidence_primitives": {
+            "source": "column_signal_map",
+            "fields": [
+                "unique_ratio",
+                "missing_pct",
+                "parsed_as_numeric_pct",
+                "parsed_as_datetime_pct",
+                "top_candidate_type",
+                "top_candidate_confidence",
+            ],
+        },
         "schema_version": "a1.v1",
         "run_id": run_id,
         "dataset_id": dataset_id,
@@ -3503,8 +4737,7 @@ async def full_bundle(
     manifest_payload = _json_bytes(run_manifest)
     manifest_meta = _upload_artifact(bucket, manifest_object_path, manifest_payload, "application/json")
 
-    # Add A1 record into manifest and persist once more under strict single schema
-    a1_entry = {
+    # Add A1 record into manifest and persist once more under strict single schema    a1_entry = {
         "artifact_id": "A1",
         "filename": ARTIFACT_SPECS["A1"]["filename"],
         "object_path": manifest_object_path,
