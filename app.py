@@ -4621,14 +4621,15 @@ async def full_bundle(
     col_dict_map = {r["column"]: r for r in column_dictionary_rows}
     for fam in families:
         fam_cols = fam["columns"]
+        index_pattern = fam.get("index_pattern") or {}
         family_packets.append({
             "inputs": artifact_inputs["B1"],
             "family_id": fam["family_id"],
             "columns": fam_cols,
             "detected_pattern_index_summary": {
                 "patterns": fam["patterns"],
-                "index": fam["extracted_index_set"],
-                "index_type_candidate": fam["index_type_candidate"],
+                "index": fam.get("extracted_index_set", []),
+                "index_type_candidate": fam.get("index_type_candidate") or index_pattern.get("index_type_candidate"),
             },
             "B_subset": [col_dict_map[c] for c in fam_cols if c in col_dict_map],
             "C_subset": {
@@ -4654,8 +4655,7 @@ async def full_bundle(
         "fields": ["unique_ratio", "top_candidate_type", "top_candidate_confidence", "parsed_as_numeric_pct", "parsed_as_datetime_pct"],
     }
 
-    run_id = uuid4().hex
-    base_url = str(request.base_url).rstrip("/")
+    run_id = uuid4().hex    base_url = str(request.base_url).rstrip("/")
     bucket_name = os.getenv("EXPORT_BUCKET")
     if not bucket_name:
         raise HTTPException(status_code=500, detail="Missing EXPORT_BUCKET env var")
