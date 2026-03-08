@@ -5516,6 +5516,8 @@ class ArtifactViewRequest(BaseModel):
     limits: Optional[Dict[str, int]] = None
     policy_overrides: Optional[Dict[str, Dict[str, Any]]] = None
     replace_policies: Optional[List[str]] = None
+    transform_overrides: Optional[Dict[str, Any]] = None
+    replace_transforms: Optional[List[str]] = None
     value_filter: Optional[Any] = None
     debug: bool = False
 
@@ -5535,6 +5537,8 @@ class ArtifactBundleRequest(BaseModel):
     per_artifact: Optional[Dict[str, ArtifactBundleScope]] = None
     policy_overrides: Optional[Dict[str, Dict[str, Any]]] = None
     replace_policies: Optional[List[str]] = None
+    transform_overrides: Optional[Dict[str, Any]] = None
+    replace_transforms: Optional[List[str]] = None
     debug: bool = False
 
     class Config:
@@ -5642,6 +5646,8 @@ _DECODE_CACHE_MAX = int(os.getenv("ARTIFACT_VIEW_CACHE_MAX", "32"))
 
 MAX_POLICY_OVERRIDE_KEYS = int(os.getenv("MAX_POLICY_OVERRIDE_KEYS", "25"))
 MAX_POLICY_OVERRIDE_BYTES = int(os.getenv("MAX_POLICY_OVERRIDE_BYTES", "65536"))
+MAX_TRANSFORM_OVERRIDE_KEYS = int(os.getenv("MAX_TRANSFORM_OVERRIDE_KEYS", "25"))
+MAX_TRANSFORM_OVERRIDE_BYTES = int(os.getenv("MAX_TRANSFORM_OVERRIDE_BYTES", "65536"))
 MAX_CAP = int(os.getenv("MAX_CAP", "500"))
 MAX_POLICY_INT = int(os.getenv("MAX_POLICY_INT", "1000"))
 MAX_POLICY_LIST_LEN = int(os.getenv("MAX_POLICY_LIST_LEN", "200"))
@@ -5705,6 +5711,44 @@ def _parse_policy_key(policy_key: str) -> Tuple[str, str]:
     if len(parts) != 2 or not parts[0] or not parts[1]:
         raise HTTPException(status_code=422, detail=f"Invalid policy key: {policy_key}")
     return parts[0], parts[1]
+
+
+def _parse_transform_key(transform_key: str) -> Tuple[str, str]:
+    key = str(transform_key or "").strip()
+    if key.startswith("artifact_transforms."):
+        key = key[len("artifact_transforms."):]
+    parts = key.split(".")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise HTTPException(status_code=422, detail=f"Invalid transform key: {transform_key}")
+    return parts[0], parts[1]
+
+
+def _normalize_transform_ops(raw_ops: Any) -> Dict[str, Dict[str, Any]]:
+    normalized: Dict[str, Dict[str, Any]] = {}
+    if isinstance(raw_ops, dict):
+        iterable = raw_ops.items()
+    elif isinstance(raw_ops, list):
+        iterable = ((None, op) for op in raw_ops)
+    else:
+        return normalized
+
+    next_idx = 1
+    for key, op in iterable:
+        if not isinstance(op, dict):
+            continue
+        op_name = str(key or op.get("name") or f"op_{next_idx}").strip()
+        if not op_name:
+            op_name = f"op_{next_idx}"
+        if op_name in normalized:
+            suffix = 2
+            while f"{op_name}_{suffix}" in normalized:
+                suffix += 1
+            op_name = f"{op_name}_{suffix}"
+        op_copy = dict(op)
+        op_copy["name"] = op_name
+        normalized[op_name] = op_copy
+        next_idx += 1
+    return normalized
 
 
 def _deep_merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -5834,6 +5878,58 @@ def _build_effective_policies(    base_policies: Dict[str, Any],
             scoped = {scope_artifact_id: dict((effective.get(scope_artifact_id) or {}))}
         report["policy_effective"] = scoped
         report["policy_clamps"] = clamps
+
+    return effective
+
+
+def _build_effective_transforms(
+    base_transforms: Dict[str, Any],
+    transform_overrides: Optional[Dict[str, Any]],
+    replace_transforms: Optional[Iterable[str]],
+    report: Optional[Dict[str, Any]] = None,
+    scope_artifact_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    effective: Dict[str, Dict[str, Dict[str, Any]]] = {
+        str(artifact_id): _normalize_transform_ops(raw_ops)
+        for artifact_id, raw_ops in dict(base_transforms or {}).items()
+    }
+    override_payload = transform_overrides or {}
+    payload_bytes = len(json.dumps(override_payload, default=_json_default).encode("utf-8"))
+    if payload_bytes > MAX_TRANSFORM_OVERRIDE_BYTES:
+        raise HTTPException(status_code=422, detail="transform_overrides payload too large")
+    if len(override_payload) > MAX_TRANSFORM_OVERRIDE_KEYS:
+        raise HTTPException(status_code=422, detail="Too many transform_overrides keys")
+
+    replace_set = set(replace_transforms or [])
+    received: Dict[str, Any] = {}
+    replace_applied: Set[str] = set()
+
+    for transform_key, override in override_payload.items():
+        if not isinstance(override, dict):
+            raise HTTPException(status_code=422, detail=f"transform_overrides[{transform_key}] must be an object")
+        artifact_id, transform_name = _parse_transform_key(transform_key)
+        received[transform_key] = override
+
+        artifact_transforms = dict(effective.get(artifact_id) or {})
+        existing_transform = artifact_transforms.get(transform_name)
+        if not isinstance(existing_transform, dict):
+            existing_transform = {}
+
+        should_replace = transform_key in replace_set
+        merged = dict(override) if should_replace else _deep_merge_dict(existing_transform, override)
+        merged["name"] = transform_name
+        artifact_transforms[transform_name] = merged
+        effective[artifact_id] = artifact_transforms
+        if should_replace:
+            replace_applied.add(transform_key)
+
+    if report is not None:
+        report["transform_overrides_received"] = received
+        scoped: Dict[str, Any] = effective
+        if scope_artifact_id is not None:
+            scoped = {scope_artifact_id: dict((effective.get(scope_artifact_id) or {}))}
+        report["transform_effective"] = scoped
+        report["replace_transforms_applied"] = sorted(replace_applied)
 
     return effective
 
@@ -6403,6 +6499,7 @@ def _op_join_array_by_key(root: Dict[str, Any], op: Dict[str, Any], report: Dict
         row[write_field] = derived
         touched += 1
     report.setdefault("transform_ops_applied", []).append({
+        "name": str(op.get("name") or ""),
         "type": "join_array_by_key",
         "target": target_path,
         "source": source_path,
@@ -6420,7 +6517,7 @@ def _op_derive_fields(root: Dict[str, Any], op: Dict[str, Any], report: Dict[str
         return
     for field_name, spec in fields.items():
         target[str(field_name)] = _derive_value(spec, root=root, source=target, target=target)
-    report.setdefault("transform_ops_applied", []).append({"type": "derive_fields", "target": target_path, "field_count": len(fields)})
+    report.setdefault("transform_ops_applied", []).append({"name": str(op.get("name") or ""), "type": "derive_fields", "target": target_path, "field_count": len(fields)})
 
 
 def _op_slice_preview(root: Dict[str, Any], op: Dict[str, Any], report: Dict[str, Any]) -> None:
@@ -6443,6 +6540,7 @@ def _op_slice_preview(root: Dict[str, Any], op: Dict[str, Any], report: Dict[str
         return
     _path_set(root, target_path, values[:limit])
     report.setdefault("transform_ops_applied", []).append({
+        "name": str(op.get("name") or ""),
         "type": "slice_preview",
         "target": target_path,
         "before": len(values),
@@ -6458,10 +6556,13 @@ def _apply_transform_stage(
 ) -> Any:
     if not isinstance(node, dict):
         return node
-    artifact_transforms = (transforms.get(artifact_id) or []) if isinstance(transforms, dict) else []
-    for op in artifact_transforms:
+    artifact_transforms = _normalize_transform_ops((transforms.get(artifact_id) or {}) if isinstance(transforms, dict) else {})
+    for transform_name in sorted(artifact_transforms.keys()):
+        op = artifact_transforms.get(transform_name)
         if not isinstance(op, dict):
             continue
+        op = dict(op)
+        op["name"] = transform_name
         op_type = str(op.get("type", "")).strip().lower()
         if op_type == "join_array_by_key":
             _op_join_array_by_key(node, op, report)
@@ -6555,9 +6656,12 @@ def apply_llm_pruning(
     limits: Optional[Dict[str, int]],
     policy_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
     replace_policies: Optional[Iterable[str]] = None,
+    transform_overrides: Optional[Dict[str, Any]] = None,
+    replace_transforms: Optional[Iterable[str]] = None,
     value_filter: Optional[Any] = None,
     debug: bool = False,
     effective_policies: Optional[Dict[str, Any]] = None,
+    effective_transforms: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Any, Dict[str, Any]]:
     mode_config = _resolve_pruning_mode(mode)
 
@@ -6606,7 +6710,22 @@ def apply_llm_pruning(
     if debug and policy_clamps:
         report.setdefault("policy_clamps", []).extend(policy_clamps)
 
-    if mode == "raw" and not drop_keys and not keep_keys and not limits and not value_filter and not policy_overrides:
+    resolved_transforms = effective_transforms or _build_effective_transforms(
+        base_transforms=tier3_cfg.get("transforms", {}),
+        transform_overrides=transform_overrides,
+        replace_transforms=replace_transforms,
+        report=report if debug else None,
+        scope_artifact_id=artifact_id,
+    )
+    if debug and effective_transforms is not None:
+        report["transform_effective"] = {artifact_id: dict((resolved_transforms.get(artifact_id) or {}))}
+        report["transform_overrides_received"] = transform_overrides or {}
+        replace_set = set(replace_transforms or [])
+        report["replace_transforms_applied"] = sorted([
+            key for key in (transform_overrides or {}).keys() if key in replace_set
+        ])
+
+    if mode == "raw" and not drop_keys and not keep_keys and not limits and not value_filter and not policy_overrides and not transform_overrides:
         report["drop_requested_not_found"] = [k for k in requested_drop_keys if report["seen_keys"].get(k, 0) == 0]
         report["dropped_keys"] = dict(report["dropped_keys"])
         report["kept_key_hits"] = dict(report["kept_key_hits"])
@@ -6617,7 +6736,7 @@ def apply_llm_pruning(
     transformed = _apply_transform_stage(
         node=working_payload,
         artifact_id=artifact_id,
-        transforms=tier3_cfg.get("transforms", {}),
+        transforms=resolved_transforms,
         report=report,
     )
     pruned = _recursive_prune_keys(
@@ -6657,7 +6776,7 @@ def apply_llm_pruning(
 def _run_pruning_smoke_checks() -> None:
     mode_cfg = _resolve_pruning_mode("llm_baseline")
     assert mode_cfg["tier3"]["limits"].get("A6.tests") == 15
-    assert isinstance(mode_cfg["tier3"].get("transforms", {}).get("A8"), list)
+    assert isinstance(mode_cfg["tier3"].get("transforms", {}).get("A8"), dict)
 
     sample_a9 = {
         "columns": [            {"column": "z_measure", "primary_role": "measure"},
@@ -6791,6 +6910,8 @@ def artifact_view_get(
         limits=limits_map,
         policy_overrides=None,
         replace_policies=None,
+        transform_overrides=None,
+        replace_transforms=None,
         value_filter=None,
         debug=debug,
     )
@@ -6813,11 +6934,17 @@ def artifact_view_post(
     if kind == "other":
         raise HTTPException(status_code=415, detail="Artifact view supports only JSON/JSONL. Use /download for raw bytes.")
 
-    mode_config = _resolve_pruning_mode(global_scope.mode or "raw")
+    mode_config = _resolve_pruning_mode(req.mode)
     bundle_effective_policies = _build_effective_policies(
         base_policies=mode_config.get("tier3", {}).get("policies", {}),
         policy_overrides=req.policy_overrides,
         replace_policies=req.replace_policies,
+        report=None,
+    )
+    bundle_effective_transforms = _build_effective_transforms(
+        base_transforms=mode_config.get("tier3", {}).get("transforms", {}),
+        transform_overrides=req.transform_overrides,
+        replace_transforms=req.replace_transforms,
         report=None,
     )
 
@@ -6831,11 +6958,12 @@ def artifact_view_post(
         limits=req.limits,
         policy_overrides=req.policy_overrides,
         replace_policies=req.replace_policies,
+        transform_overrides=req.transform_overrides,
+        replace_transforms=req.replace_transforms,
         value_filter=req.value_filter,
         debug=req.debug,
+        effective_transforms=bundle_effective_transforms,
     )
-
-    response["_bundle_policy_effective"] = bundle_effective_policies
 
     if req.debug and kind == "json" and isinstance(pruned, dict):
         with_report = dict(pruned)
@@ -6877,6 +7005,8 @@ def artifact_bundle_view_post(
             limits=effective_limits,
             policy_overrides=req.policy_overrides,
             replace_policies=req.replace_policies,
+            transform_overrides=req.transform_overrides,
+            replace_transforms=req.replace_transforms,
             value_filter=effective_value_filter,
             debug=req.debug,
         )
