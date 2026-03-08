@@ -81,6 +81,50 @@
         },
         "A9": {}
       },
+      "artifact_transforms": {
+        "A8": [
+          {
+            "type": "join_array_by_key",
+            "target_array_path": "families_index",
+            "source_array_path": "families",
+            "join_key": "family_id",
+            "write_field": "family_signature",
+            "field_map": {
+              "normalized_stem": {
+                "from": "source.stem_evidence.normalized_stem"
+              },
+              "raw_stem": {
+                "from": "source.stem_evidence.raw_stem"
+              },
+              "pattern_kind": {
+                "from": "source.patterns[0]",
+                "fallback_from": "target.patterns[0]"
+              },
+              "suffix_keyword": {
+                "from": "target.repeat_dim",
+                "fallback_from": "target.recommended_repeat_dimension_name"
+              },
+              "suffix_keyword_title": {
+                "from": "target.repeat_dim",
+                "fallback_from": "target.recommended_repeat_dimension_name",
+                "transform": "title"
+              },
+              "columns_preview": {
+                "from": "source.columns_preview",
+                "slice": 3,
+                "k_max": 8
+              },
+              "columns_count": {
+                "from": "source.columns_count"
+              },
+              "signature_label": {
+                "from": "source.stem_evidence.normalized_stem",
+                "template": "{source.family_id}:{value}"
+              }
+            }
+          }
+        ]
+      },
       "artifact_policies": {
         "A6": {
           "tests_policy": {

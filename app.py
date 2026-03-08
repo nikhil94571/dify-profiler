@@ -5586,6 +5586,7 @@ def _adapt_pruning_modes_from_ledger(ledger: Dict[str, Any]) -> Dict[str, Dict[s
         "tier3": {
             "limits": {},
             "policies": {},
+            "transforms": {},
         },
     }
 
@@ -5599,6 +5600,7 @@ def _adapt_pruning_modes_from_ledger(ledger: Dict[str, Any]) -> Dict[str, Dict[s
         artifact_drops = mode_cfg.get("artifact_drops") or {}
         artifact_limits = mode_cfg.get("artifact_limits") or {}
         artifact_policies = mode_cfg.get("artifact_policies") or {}
+        artifact_transforms = mode_cfg.get("artifact_transforms") or {}
 
         flattened_limits: Dict[str, int] = {}
         if isinstance(artifact_limits, dict):
@@ -5624,6 +5626,7 @@ def _adapt_pruning_modes_from_ledger(ledger: Dict[str, Any]) -> Dict[str, Dict[s
             "tier3": {
                 "limits": flattened_limits,
                 "policies": dict(artifact_policies),
+                "transforms": dict(artifact_transforms),
             },
         }
 
@@ -5640,6 +5643,8 @@ MAX_POLICY_OVERRIDE_KEYS = int(os.getenv("MAX_POLICY_OVERRIDE_KEYS", "25"))
 MAX_POLICY_OVERRIDE_BYTES = int(os.getenv("MAX_POLICY_OVERRIDE_BYTES", "65536"))
 MAX_CAP = int(os.getenv("MAX_CAP", "500"))
 MAX_POLICY_INT = int(os.getenv("MAX_POLICY_INT", "1000"))
+MAX_POLICY_LIST_LEN = int(os.getenv("MAX_POLICY_LIST_LEN", "200"))
+MAX_POLICY_STR_LEN = int(os.getenv("MAX_POLICY_STR_LEN", "2048"))
 MAX_LIMITS_VALUE = int(os.getenv("MAX_LIMITS_VALUE", "5000"))
 
 
@@ -5731,10 +5736,39 @@ def _clamp_policy_number(
     return number
 
 
-def _apply_policy_numeric_guardrails(node: Any, path: str, clamps: List[Dict[str, Any]]) -> Any:
+def _clamp_structure_sizes(node: Any, path: str, clamps: List[Dict[str, Any]]) -> Any:
     if isinstance(node, dict):
         guarded: Dict[str, Any] = {}
         for key, value in node.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            guarded[key] = _clamp_structure_sizes(value, child_path, clamps)
+        return guarded
+    if isinstance(node, list):
+        if len(node) > MAX_POLICY_LIST_LEN:
+            clamps.append({
+                "path": path,
+                "from": len(node),
+                "to": MAX_POLICY_LIST_LEN,
+                "reason": "max_policy_list_len",
+            })
+            node = node[:MAX_POLICY_LIST_LEN]
+        return [_clamp_structure_sizes(item, f"{path}[{idx}]", clamps) for idx, item in enumerate(node)]
+    if isinstance(node, str) and len(node) > MAX_POLICY_STR_LEN:
+        clamps.append({
+            "path": path,
+            "from": len(node),
+            "to": MAX_POLICY_STR_LEN,
+            "reason": "max_policy_str_len",
+        })
+        return node[:MAX_POLICY_STR_LEN]
+    return node
+
+
+def _apply_policy_numeric_guardrails(node: Any, path: str, clamps: List[Dict[str, Any]]) -> Any:
+    sized = _clamp_structure_sizes(node, path, clamps)
+    if isinstance(sized, dict):
+        guarded: Dict[str, Any] = {}
+        for key, value in sized.items():
             child_path = f"{path}.{key}" if path else str(key)
             if isinstance(value, bool):
                 guarded[key] = value
@@ -5745,9 +5779,9 @@ def _apply_policy_numeric_guardrails(node: Any, path: str, clamps: List[Dict[str
             else:
                 guarded[key] = _apply_policy_numeric_guardrails(value, child_path, clamps)
         return guarded
-    if isinstance(node, list):
-        return [_apply_policy_numeric_guardrails(item, f"{path}[{idx}]", clamps) for idx, item in enumerate(node)]
-    return node
+    if isinstance(sized, list):
+        return [_apply_policy_numeric_guardrails(item, f"{path}[{idx}]", clamps) for idx, item in enumerate(sized)]
+    return sized
 
 
 def _build_effective_policies(
@@ -6194,25 +6228,252 @@ def _apply_typed_array_policy(
     return items
 
 
+def _path_parts(path: str) -> List[str]:
+    parts: List[str] = []
+    for token in [p for p in str(path or "").split(".") if p]:
+        if token.endswith("]") and "[" in token:
+            base, _, index = token[:-1].partition("[")
+            if base:
+                parts.append(base)
+            parts.append(index)
+        else:
+            parts.append(token)
+    return parts
+
+
+def _path_get(node: Any, path: str, default: Any = None) -> Any:
+    cur = node
+    for part in _path_parts(path):
+        if isinstance(cur, list):
+            if not part.isdigit():
+                return default
+            idx = int(part)
+            if idx < 0 or idx >= len(cur):
+                return default
+            cur = cur[idx]
+            continue
+        if isinstance(cur, dict):
+            if part not in cur:
+                return default
+            cur = cur[part]
+            continue
+        return default
+    return cur
+
+
+def _path_set(node: Any, path: str, value: Any) -> bool:
+    parts = _path_parts(path)
+    if not parts:
+        return False
+    cur = node
+    for part in parts[:-1]:
+        if isinstance(cur, dict):
+            if part not in cur or not isinstance(cur[part], (dict, list)):
+                cur[part] = {}
+            cur = cur[part]
+        elif isinstance(cur, list) and part.isdigit():
+            idx = int(part)
+            if idx < 0 or idx >= len(cur):
+                return False
+            cur = cur[idx]
+        else:
+            return False
+
+    last = parts[-1]
+    if isinstance(cur, dict):
+        cur[last] = value
+        return True
+    if isinstance(cur, list) and last.isdigit():
+        idx = int(last)
+        if idx < 0 or idx >= len(cur):
+            return False
+        cur[idx] = value
+        return True
+    return False
+
+
+def _render_template(template: str, context: Dict[str, Any]) -> str:
+    out = str(template)
+    for key, val in context.items():
+        out = out.replace("{" + key + "}", "" if val is None else str(val))
+    return out
+
+
+def _derive_value(spec: Any, root: Dict[str, Any], source: Optional[Dict[str, Any]], target: Optional[Dict[str, Any]]) -> Any:
+    if not isinstance(spec, dict):
+        return spec
+
+    if "const" in spec:
+        return spec.get("const")
+
+    if "from" in spec:
+        raw_path = str(spec.get("from") or "")
+        if raw_path.startswith("source."):
+            value = _path_get(source or {}, raw_path[len("source."):])
+        elif raw_path.startswith("target."):
+            value = _path_get(target or {}, raw_path[len("target."):])
+        else:
+            value = _path_get(source or {}, raw_path)
+            if value is None:
+                value = _path_get(target or {}, raw_path)
+            if value is None:
+                value = _path_get(root, raw_path)
+        if value is None and spec.get("fallback_from"):
+            value = _derive_value({"from": spec.get("fallback_from")}, root, source, target)
+    else:
+        value = None
+
+    if "slice" in spec and isinstance(value, list):
+        try:
+            k = int(spec.get("slice", len(value)))
+        except (TypeError, ValueError):
+            k = len(value)
+        try:
+            k_max = int(spec.get("k_max", k))
+        except (TypeError, ValueError):
+            k_max = k
+        value = value[:max(0, min(k, k_max))]
+
+    transform = str(spec.get("transform", "")).strip().lower()
+    if isinstance(value, str):
+        if transform == "lower":
+            value = value.lower()
+        elif transform == "upper":
+            value = value.upper()
+        elif transform == "title":
+            value = value.title()
+
+    if "template" in spec:
+        ctx = {
+            "value": value,
+            "source": source,
+            "target": target,
+        }
+        if isinstance(source, dict):
+            for k, v in source.items():
+                ctx[f"source.{k}"] = v
+        if isinstance(target, dict):
+            for k, v in target.items():
+                ctx[f"target.{k}"] = v
+        value = _render_template(str(spec.get("template")), ctx)
+
+    return value
+
+
+def _op_join_array_by_key(root: Dict[str, Any], op: Dict[str, Any], report: Dict[str, Any]) -> None:
+    target_path = str(op.get("target_array_path") or "")
+    source_path = str(op.get("source_array_path") or "")
+    join_key = str(op.get("join_key") or "")
+    write_field = str(op.get("write_field") or "")
+    field_map = op.get("field_map") or {}
+    if not target_path or not source_path or not join_key or not write_field or not isinstance(field_map, dict):
+        return
+
+    target = _path_get(root, target_path)
+    source = _path_get(root, source_path)
+    if not isinstance(target, list) or not isinstance(source, list):
+        return
+
+    source_index: Dict[Any, Dict[str, Any]] = {}
+    for row in source:
+        if isinstance(row, dict) and join_key in row and row.get(join_key) is not None:
+            source_index[row.get(join_key)] = row
+
+    touched = 0
+    for row in target:
+        if not isinstance(row, dict):
+            continue
+        join_val = row.get(join_key)
+        if join_val is None:
+            continue
+        src = source_index.get(join_val)
+        if not isinstance(src, dict):
+            continue
+        derived: Dict[str, Any] = {}
+        for out_key, spec in field_map.items():
+            derived[str(out_key)] = _derive_value(spec, root=root, source=src, target=row)
+        row[write_field] = derived
+        touched += 1
+    report.setdefault("transform_ops_applied", []).append({
+        "type": "join_array_by_key",
+        "target": target_path,
+        "source": source_path,
+        "rows_touched": touched,
+    })
+
+
+def _op_derive_fields(root: Dict[str, Any], op: Dict[str, Any], report: Dict[str, Any]) -> None:
+    target_path = str(op.get("target_object_path") or "")
+    fields = op.get("fields") or {}
+    if not target_path or not isinstance(fields, dict):
+        return
+    target = _path_get(root, target_path)
+    if not isinstance(target, dict):
+        return
+    for field_name, spec in fields.items():
+        target[str(field_name)] = _derive_value(spec, root=root, source=target, target=target)
+    report.setdefault("transform_ops_applied", []).append({"type": "derive_fields", "target": target_path, "field_count": len(fields)})
+
+
+def _op_slice_preview(root: Dict[str, Any], op: Dict[str, Any], report: Dict[str, Any]) -> None:
+    target_path = str(op.get("target_path") or "")
+    if not target_path:
+        return
+    values = _path_get(root, target_path)
+    if not isinstance(values, list):
+        return
+    try:
+        k = int(op.get("k", len(values)))
+    except (TypeError, ValueError):
+        k = len(values)
+    try:
+        k_max = int(op.get("k_max", k))
+    except (TypeError, ValueError):
+        k_max = k
+    limit = max(0, min(k, k_max))
+    if len(values) <= limit:
+        return
+    _path_set(root, target_path, values[:limit])
+    report.setdefault("transform_ops_applied", []).append({
+        "type": "slice_preview",
+        "target": target_path,
+        "before": len(values),
+        "after": limit,
+    })
+
+
 def _apply_transform_stage(
     node: Any,
     artifact_id: str,
-    policies: Dict[str, Any],
+    transforms: Dict[str, Any],
     report: Dict[str, Any],
 ) -> Any:
     if not isinstance(node, dict):
         return node
-    artifact_policies = (policies.get(artifact_id) or {}) if isinstance(policies, dict) else {}
-    applied = []
+    artifact_transforms = (transforms.get(artifact_id) or []) if isinstance(transforms, dict) else []
+    for op in artifact_transforms:
+        if not isinstance(op, dict):
+            continue
+        op_type = str(op.get("type", "")).strip().lower()
+        if op_type == "join_array_by_key":
+            _op_join_array_by_key(node, op, report)
+        elif op_type == "derive_fields":
+            _op_derive_fields(node, op, report)
+        elif op_type == "slice_preview":
+            _op_slice_preview(node, op, report)
+    return node
+
+
+def _build_policies_by_target(artifact_policies: Dict[str, Any]) -> Dict[str, Tuple[str, Dict[str, Any]]]:
+    by_target: Dict[str, Tuple[str, Dict[str, Any]]] = {}
     for policy_name, policy in artifact_policies.items():
         if not isinstance(policy, dict):
             continue
-        policy_type = _resolve_policy_type(policy_name, policy)
-        if policy_type in {"augment_array_elements", "join_array_by_key", "sample_values"}:
-            applied.append({"policy": policy_name, "type": policy_type, "target": _resolve_policy_target_path(policy_name, policy)})
-    if applied:
-        report["transform_policies_seen"] = applied
-    return node
+        target = _resolve_policy_target_path(policy_name, policy)
+        if not target:
+            continue
+        by_target[target] = (policy_name, policy)
+    return by_target
 
 def _apply_limits(
     node: Any,
@@ -6250,31 +6511,19 @@ def _apply_limits(
     if isinstance(node, dict):
         next_dict: Dict[str, Any] = {}
         artifact_policies = (policies.get(artifact_id) or {}) if isinstance(policies, dict) else {}
+        policies_by_target = _build_policies_by_target(artifact_policies) if isinstance(artifact_policies, dict) else {}
         for key, value in node.items():
             child_path = f"{path}.{key}" if path else key
-            applied_typed_policy = False
-            if isinstance(value, list) and isinstance(artifact_policies, dict):
-                for policy_name, policy in artifact_policies.items():
-                    if not isinstance(policy, dict):
-                        continue
-                    if _resolve_policy_target_path(policy_name, policy) != child_path:
-                        continue
-                    typed_selected = _apply_typed_array_policy(
-                        node=root_node or node,
-                        items=value,
-                        policy_name=policy_name,
-                        policy=policy,
-                        value_filter=value_filter,
-                        report=report,
-                    )
-                    limit = _resolve_limit_for_path(effective_limits, artifact_id, child_path)
-                    if limit is not None and len(typed_selected) > limit:
-                        report["truncated_arrays"].append({"path": child_path, "before": len(typed_selected), "after": limit})
-                        typed_selected = typed_selected[:limit]
-                    next_dict[key] = typed_selected
-                    applied_typed_policy = True
-                    break
-            if applied_typed_policy:
+            if isinstance(value, list) and child_path in policies_by_target:
+                policy_name, policy = policies_by_target[child_path]
+                next_dict[key] = _apply_typed_array_policy(
+                    node=root_node or node,
+                    items=value,
+                    policy_name=policy_name,
+                    policy=policy,
+                    value_filter=value_filter,
+                    report=report,
+                )
                 continue
             next_dict[key] = _apply_limits(
                 value,
@@ -6362,7 +6611,7 @@ def apply_llm_pruning(
     transformed = _apply_transform_stage(
         node=working_payload,
         artifact_id=artifact_id,
-        policies=resolved_policies,
+        transforms=tier3_cfg.get("transforms", {}),
         report=report,
     )
 
@@ -6403,6 +6652,7 @@ def apply_llm_pruning(
 def _run_pruning_smoke_checks() -> None:
     mode_cfg = _resolve_pruning_mode("llm_baseline")
     assert mode_cfg["tier3"]["limits"].get("A6.tests") == 15
+    assert isinstance(mode_cfg["tier3"].get("transforms", {}).get("A8"), list)
 
     sample_a9 = {
         "columns": [
@@ -6445,6 +6695,34 @@ def _run_pruning_smoke_checks() -> None:
     )
     first_test = (pruned_a6.get("tests") or [{}])[0]
     assert _normalize_keys_tested(first_test.get("keys_tested")) == ("order_id",)
+
+    sample_a8 = {
+        "families": [
+            {
+                "family_id": "f1",
+                "stem_evidence": {"normalized_stem": "metric", "raw_stem": "Metric"},
+                "patterns": ["suffix_keyword_numeric"],
+                "columns_preview": ["metric_q1", "metric_q2", "metric_q3", "metric_q4"],
+                "columns_count": 4,
+            }
+        ],
+        "families_index": [
+            {"family_id": "f1", "repeat_dim": "quarter", "patterns": ["suffix_keyword_numeric"]}
+        ],
+    }
+    pruned_a8, _ = apply_llm_pruning(
+        payload=sample_a8,
+        artifact_id="A8",
+        mode="llm_baseline",
+        keep_keys=[],
+        drop_keys=[],
+        limits=None,
+        value_filter=None,
+        debug=True,
+    )
+    first_family = (pruned_a8.get("families_index") or [{}])[0]
+    assert isinstance(first_family.get("family_signature"), dict)
+    assert "families" not in pruned_a8
 
 
 if os.getenv("RUN_PRUNING_SMOKE_TESTS", "").strip().lower() in {"1", "true", "yes"}:
