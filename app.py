@@ -12,13 +12,14 @@ from collections import defaultdict, deque, Counter
 from itertools import combinations
 from datetime import timedelta
 from uuid import uuid4
+from urllib.parse import urlencode
 from manifest_export import upload_and_sign_text
 
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from google.cloud import storage
 import google.auth
 from google.auth import impersonated_credentials
@@ -1709,7 +1710,7 @@ async def _run_full_profile(
 # -----------------------------
 # Main endpoint (unchanged external behavior)
 # -----------------------------
-@app.post("/profile")
+@app.post("/profile", include_in_schema=False, deprecated=True)
 async def profile(
     request: Request,
     file: UploadFile = File(...),
@@ -1728,7 +1729,7 @@ async def profile(
 # -----------------------------
 # Dify-safe: shallow summary
 # -----------------------------
-@app.post("/profile_summary")
+@app.post("/profile_summary", include_in_schema=False, deprecated=True)
 async def profile_summary(
     request: Request,
     file: UploadFile = File(...),
@@ -1808,7 +1809,7 @@ async def profile_summary(
 # -----------------------------
 # Dify-safe: one column detail (returned as JSON string)
 # -----------------------------
-@app.post("/profile_column_detail")
+@app.post("/profile_column_detail", include_in_schema=False, deprecated=True)
 async def profile_column_detail(
     request: Request,
     file: UploadFile = File(...),
@@ -1954,7 +1955,7 @@ def _add_signal(out: List[Dict[str, Any]], *, kind: str, columns: List[str], sco
         "evidence_json": _safe_json(evidence),
     })
 
-@app.post("/evidence_associations")
+@app.post("/evidence_associations", include_in_schema=False, deprecated=True)
 async def evidence_associations(
     request: Request,
     file: UploadFile = File(...),
@@ -2671,7 +2672,7 @@ class XlsxExportRequest(BaseModel):
     filename: str | None = None
 
 
-@app.post("/export/light-contract-xlsx")
+@app.post("/export/light-contract-xlsx", include_in_schema=False, deprecated=True)
 def export_light_contract_xlsx(
     req: XlsxExportRequest,
     _: None = Depends(require_token),
@@ -2751,7 +2752,7 @@ def export_light_contract_xlsx(
 
 from fastapi import HTTPException
 
-@app.post("/export/manifest-txt")
+@app.post("/export/manifest-txt", include_in_schema=False, deprecated=True)
 def export_manifest_txt(body: dict):
     run_id = body.get("run_id")
     manifest_text = body.get("manifest_text")
@@ -3152,6 +3153,42 @@ def _upload_artifact(bucket: storage.Bucket, object_path: str, payload: bytes, c
 
 def _build_artifact_url(base_url: str, artifact_id: str, run_id: str, mode: str) -> str:
     return f"{base_url}/artifacts/{artifact_id}/{mode}?run_id={run_id}"
+
+
+def _build_artifact_view_get_url(
+    base_url: str,
+    artifact_id: str,
+    run_id: str,
+    mode: Optional[str] = None,
+    keep: Optional[Iterable[str]] = None,
+    drop: Optional[Iterable[str]] = None,
+    limits: Optional[Dict[str, int]] = None,
+) -> str:
+    query: Dict[str, Any] = {"run_id": run_id}
+    if mode:
+        query["mode"] = mode
+    if keep:
+        query["keep"] = ",".join(str(k) for k in keep)
+    if drop:
+        query["drop"] = ",".join(str(k) for k in drop)
+    if limits:
+        query["limits"] = ",".join(f"{k}:{v}" for k, v in limits.items())
+    return f"{base_url}/artifacts/{artifact_id}?{urlencode(query)}"
+
+
+def _build_artifact_view_post_url(base_url: str, artifact_id: str) -> str:
+    return f"{base_url}/artifacts/{artifact_id}/view"
+
+
+def _enrich_artifact_entry_with_urls(base_url: str, run_id: str, item: Dict[str, Any]) -> Dict[str, Any]:
+    aid = item["artifact_id"]
+    return {
+        **item,
+        "download_url": _build_artifact_url(base_url, aid, run_id, "download"),
+        "meta_url": _build_artifact_url(base_url, aid, run_id, "meta"),
+        "view_get_url": _build_artifact_view_get_url(base_url, aid, run_id, mode="llm_baseline"),
+        "view_post_url": _build_artifact_view_post_url(base_url, aid),
+    }
 
 
 def _candidate_evidence_summary(candidate: Dict[str, Any]) -> Dict[str, Any]:
@@ -5308,6 +5345,8 @@ async def full_bundle(
             "size_bytes": meta["size_bytes"],
             "download_url": _build_artifact_url(base_url, aid, run_id, "download"),
             "meta_url": _build_artifact_url(base_url, aid, run_id, "meta"),
+            "view_get_url": _build_artifact_view_get_url(base_url, aid, run_id, mode="llm_baseline"),
+            "view_post_url": _build_artifact_view_post_url(base_url, aid),
         })
 
     run_manifest = {
@@ -5360,6 +5399,8 @@ async def full_bundle(
         "size_bytes": manifest_meta["size_bytes"],
         "download_url": _build_artifact_url(base_url, "A1", run_id, "download"),
         "meta_url": _build_artifact_url(base_url, "A1", run_id, "meta"),
+        "view_get_url": _build_artifact_view_get_url(base_url, "A1", run_id, mode="llm_baseline"),
+        "view_post_url": _build_artifact_view_post_url(base_url, "A1"),
     }
     run_manifest["artifact_registry"] = [a1_entry] + manifest_artifacts
     _upload_artifact(bucket, manifest_object_path, _json_bytes(run_manifest), "application/json")
@@ -5394,12 +5435,7 @@ def list_artifacts(
     base_url = str(request.base_url).rstrip("/")
     entries = []
     for item in manifest.get("artifact_registry", []):
-        aid = item["artifact_id"]
-        entries.append({
-            **item,
-            "download_url": _build_artifact_url(base_url, aid, run_id, "download"),
-            "meta_url": _build_artifact_url(base_url, aid, run_id, "meta"),
-        })
+        entries.append(_enrich_artifact_entry_with_urls(base_url=base_url, run_id=run_id, item=item))
 
     return {
         "run_id": run_id,
@@ -5411,6 +5447,7 @@ def list_artifacts(
 
 @app.get("/artifacts/{artifact_id}/meta")
 def artifact_meta(
+    request: Request,
     artifact_id: str,
     run_id: str,
     _=Depends(require_token),
@@ -5426,9 +5463,10 @@ def artifact_meta(
         raise HTTPException(status_code=404, detail="run_id not found")
 
     manifest = json.loads(blob.download_as_bytes().decode("utf-8"))
+    base_url = str(request.base_url).rstrip("/")
     for item in manifest.get("artifact_registry", []):
         if item.get("artifact_id") == artifact_id:
-            return item
+            return _enrich_artifact_entry_with_urls(base_url=base_url, run_id=run_id, item=item)
     raise HTTPException(status_code=404, detail="artifact not found")
 
 
@@ -5475,8 +5513,31 @@ class ArtifactViewRequest(BaseModel):
     keep: Optional[List[str]] = None
     drop: Optional[List[str]] = None
     limits: Optional[Dict[str, int]] = None
+    policy_overrides: Optional[Dict[str, Dict[str, Any]]] = None
+    replace_policies: Optional[List[str]] = None
     value_filter: Optional[Any] = None
     debug: bool = False
+
+
+class ArtifactBundleScope(BaseModel):
+    mode: Optional[str] = None
+    keep: Optional[List[str]] = None
+    drop: Optional[List[str]] = None
+    limits: Optional[Dict[str, int]] = None
+    value_filter: Optional[Any] = None
+
+
+class ArtifactBundleRequest(BaseModel):
+    run_id: str
+    artifact_ids: List[str]
+    global_scope: ArtifactBundleScope = Field(default_factory=lambda: ArtifactBundleScope(mode="raw"), alias="global")
+    per_artifact: Optional[Dict[str, ArtifactBundleScope]] = None
+    policy_overrides: Optional[Dict[str, Dict[str, Any]]] = None
+    replace_policies: Optional[List[str]] = None
+    debug: bool = False
+
+    class Config:
+        allow_population_by_field_name = True
 
 
 LLM_PRUNING_LEDGER_PATH = os.getenv(
@@ -5574,6 +5635,14 @@ PRUNING_MODE_LEDGER: Dict[str, Dict[str, Any]] = _adapt_pruning_modes_from_ledge
 _DECODE_CACHE: Dict[Tuple[str, str, str], Tuple[str, Any]] = {}
 _DECODE_CACHE_MAX = int(os.getenv("ARTIFACT_VIEW_CACHE_MAX", "32"))
 
+MAX_POLICY_OVERRIDE_KEYS = int(os.getenv("MAX_POLICY_OVERRIDE_KEYS", "25"))
+MAX_POLICY_OVERRIDE_BYTES = int(os.getenv("MAX_POLICY_OVERRIDE_BYTES", "65536"))
+MAX_CAP = int(os.getenv("MAX_CAP", "500"))
+MAX_TOPK_PER_ROLE = int(os.getenv("MAX_TOPK_PER_ROLE", "200"))
+MAX_INCLUDE_ALL_CAP = int(os.getenv("MAX_INCLUDE_ALL_CAP", "500"))
+MAX_HARD_CAP_TOTAL = int(os.getenv("MAX_HARD_CAP_TOTAL", "1000"))
+MAX_LIMITS_VALUE = int(os.getenv("MAX_LIMITS_VALUE", "5000"))
+
 
 def parse_csv_list(s: str) -> List[str]:
     if not s:
@@ -5601,6 +5670,142 @@ def parse_limits_csv(s: str) -> Dict[str, int]:
     return out
 
 
+def _clamp_limit_value(path: str, value: int, report: List[Dict[str, Any]]) -> int:
+    if value < 0:
+        report.append({"path": path, "from": value, "to": 0, "reason": "negative_not_allowed"})
+        return 0
+    if value > MAX_LIMITS_VALUE:
+        report.append({"path": path, "from": value, "to": MAX_LIMITS_VALUE, "reason": "max_limits_value"})
+        return MAX_LIMITS_VALUE
+    return value
+
+
+def _guard_limits_map(limits: Optional[Dict[str, int]], path_prefix: str, clamps: List[Dict[str, Any]]) -> Optional[Dict[str, int]]:
+    if not limits:
+        return limits
+    guarded: Dict[str, int] = {}
+    for k, v in limits.items():
+        try:
+            as_int = int(v)
+        except (ValueError, TypeError):
+            continue
+        guarded[str(k)] = _clamp_limit_value(f"{path_prefix}.{k}", as_int, clamps)
+    return guarded
+
+
+def _parse_policy_key(policy_key: str) -> Tuple[str, str]:
+    key = str(policy_key or "").strip()
+    if key.startswith("artifact_policies."):
+        key = key[len("artifact_policies."):]
+    parts = key.split(".")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise HTTPException(status_code=422, detail=f"Invalid policy key: {policy_key}")
+    return parts[0], parts[1]
+
+
+def _deep_merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge_dict(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def _clamp_policy_number(
+    path: str,
+    number: int,
+    field_name: str,
+    clamps: List[Dict[str, Any]],
+) -> int:
+    limit = None
+    reason = None
+    if field_name == "hard_cap_total":
+        limit = MAX_HARD_CAP_TOTAL
+        reason = "max_hard_cap_total"
+    elif "include_roles_topk" in path:
+        limit = MAX_TOPK_PER_ROLE
+        reason = "max_topk_per_role"
+    elif field_name == "include_review_required_topk":
+        limit = MAX_TOPK_PER_ROLE
+        reason = "max_include_review_required_topk"
+    elif field_name == "cap" and "include_roles_all" in path:
+        limit = MAX_INCLUDE_ALL_CAP
+        reason = "max_include_roles_all_cap"
+    elif field_name in {"k", "limit", "max_items"}:
+        limit = MAX_CAP
+        reason = "max_generic_policy_cap"
+    if limit is not None and number > limit:
+        clamps.append({"path": path, "from": number, "to": limit, "reason": reason})
+        return limit
+    if number < 0:
+        clamps.append({"path": path, "from": number, "to": 0, "reason": "negative_not_allowed"})
+        return 0
+    return number
+
+
+def _apply_policy_numeric_guardrails(node: Any, path: str, clamps: List[Dict[str, Any]]) -> Any:
+    if isinstance(node, dict):
+        guarded: Dict[str, Any] = {}
+        for key, value in node.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            if isinstance(value, bool):
+                guarded[key] = value
+            elif isinstance(value, int):
+                guarded[key] = _clamp_policy_number(child_path, value, str(key), clamps)
+            elif isinstance(value, float) and value.is_integer():
+                guarded[key] = _clamp_policy_number(child_path, int(value), str(key), clamps)
+            else:
+                guarded[key] = _apply_policy_numeric_guardrails(value, child_path, clamps)
+        return guarded
+    if isinstance(node, list):
+        return [_apply_policy_numeric_guardrails(item, f"{path}[{idx}]", clamps) for idx, item in enumerate(node)]
+    return node
+
+
+def _build_effective_policies(
+    base_policies: Dict[str, Any],
+    policy_overrides: Optional[Dict[str, Dict[str, Any]]],
+    replace_policies: Optional[Iterable[str]],
+    report: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    effective = json.loads(json.dumps(base_policies or {}))
+    override_payload = policy_overrides or {}
+    payload_bytes = len(json.dumps(override_payload, default=_json_default).encode("utf-8"))
+    if payload_bytes > MAX_POLICY_OVERRIDE_BYTES:
+        raise HTTPException(status_code=422, detail="policy_overrides payload too large")
+    if len(override_payload) > MAX_POLICY_OVERRIDE_KEYS:
+        raise HTTPException(status_code=422, detail="Too many policy_overrides keys")
+
+    replace_set = set(replace_policies or [])
+    clamps: List[Dict[str, Any]] = []
+    received: Dict[str, Any] = {}
+
+    for policy_key, override in override_payload.items():
+        if not isinstance(override, dict):
+            raise HTTPException(status_code=422, detail=f"policy_overrides[{policy_key}] must be an object")
+        artifact_id, policy_name = _parse_policy_key(policy_key)
+        received[policy_key] = override
+
+        artifact_policies = dict(effective.get(artifact_id) or {})
+        existing_policy = artifact_policies.get(policy_name)
+        if not isinstance(existing_policy, dict):
+            existing_policy = {}
+
+        merged = dict(override) if policy_key in replace_set else _deep_merge_dict(existing_policy, override)
+        guarded = _apply_policy_numeric_guardrails(merged, policy_key, clamps)
+        artifact_policies[policy_name] = guarded
+        effective[artifact_id] = artifact_policies
+
+    if report is not None:
+        report["policy_overrides_received"] = received
+        report["policy_effective"] = effective
+        report["policy_clamps"] = clamps
+
+    return effective
+
+
 def _resolve_pruning_mode(mode: str) -> Dict[str, Any]:
     if mode not in PRUNING_MODE_LEDGER:
         raise HTTPException(status_code=422, detail=f"Unsupported mode: {mode}")
@@ -5626,7 +5831,6 @@ def _load_artifact_blob(run_id: str, artifact_id: str) -> Tuple[storage.Bucket, 
             break
     if not found:
         raise HTTPException(status_code=404, detail="artifact not found")
-
     data_blob = bucket.blob(found["object_path"])
     if not data_blob.exists(client):
         raise HTTPException(status_code=404, detail="artifact object missing")
@@ -6023,6 +6227,8 @@ def apply_llm_pruning(
     keep_keys: Optional[Iterable[str]],
     drop_keys: Optional[Iterable[str]],
     limits: Optional[Dict[str, int]],
+    policy_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
+    replace_policies: Optional[Iterable[str]] = None,
     value_filter: Optional[Any] = None,
     debug: bool = False,
 ) -> Tuple[Any, Dict[str, Any]]:
@@ -6042,8 +6248,9 @@ def apply_llm_pruning(
     effective_drops = {k for k in effective_drops if k not in keep_set and k not in guarded_rule_keys}
 
     default_limits: Dict[str, int] = dict(tier3_cfg.get("limits", {}))
+    policy_clamps: List[Dict[str, Any]] = []
     if limits:
-        default_limits.update(limits)
+        default_limits.update(_guard_limits_map(limits, "limits", policy_clamps) or {})
 
     report: Dict[str, Any] = {
         "mode": mode,
@@ -6053,7 +6260,16 @@ def apply_llm_pruning(
         "effective_limits": default_limits,
     }
 
-    if mode == "raw" and not drop_keys and not keep_keys and not limits and not value_filter:
+    effective_policies = _build_effective_policies(
+        base_policies=tier3_cfg.get("policies", {}),
+        policy_overrides=policy_overrides,
+        replace_policies=replace_policies,
+        report=report if debug else None,
+    )
+    if debug and policy_clamps:
+        report.setdefault("policy_clamps", []).extend(policy_clamps)
+
+    if mode == "raw" and not drop_keys and not keep_keys and not limits and not value_filter and not policy_overrides:
         return payload, report
 
     pruned = _recursive_prune_keys(
@@ -6070,7 +6286,7 @@ def apply_llm_pruning(
         path="",
         artifact_id=artifact_id,
         effective_limits=default_limits,
-        policies=tier3_cfg.get("policies", {}),
+        policies=effective_policies,
         value_filter=value_filter,
         report=report,
         root_node=pruned if isinstance(pruned, dict) else None,
@@ -6095,8 +6311,7 @@ def _run_pruning_smoke_checks() -> None:
         "columns": [
             {"column": "z_measure", "primary_role": "measure"},
             {"column": "id_a", "primary_role": "id_key"},
-            {"column": "id_b", "primary_role": "id_key"},
-            {"column": "time_1", "primary_role": "time_index"},
+            {"column": "id_b", "primary_role": "id_key"},            {"column": "time_1", "primary_role": "time_index"},
         ]
     }
     pruned_a9, _ = apply_llm_pruning(
@@ -6194,9 +6409,17 @@ def artifact_view_get(
         keep_keys=keep_keys,
         drop_keys=drop_keys,
         limits=limits_map,
+        policy_overrides=None,
+        replace_policies=None,
         value_filter=None,
         debug=debug,
     )
+
+    if debug and kind == "json" and isinstance(pruned, dict):
+        with_report = dict(pruned)
+        with_report["_prune_report"] = report
+        return JSONResponse(content=with_report)
+
     return _build_view_response(kind=kind, payload=pruned, report=report, debug=debug)
 
 
@@ -6217,6 +6440,8 @@ def artifact_view_post(
         keep_keys=req.keep,
         drop_keys=req.drop,
         limits=req.limits,
+        policy_overrides=req.policy_overrides,
+        replace_policies=req.replace_policies,
         value_filter=req.value_filter,
         debug=req.debug,
     )
@@ -6226,4 +6451,53 @@ def artifact_view_post(
         with_report["_prune_report"] = report
         return JSONResponse(content=with_report)
 
-    return _build_view_response(kind=kind, payload=pruned, report=report, debug=req.debug)
+    return _build_view_response(kind=kind, payload=pruned, report=report, debug=req.debug)
+
+
+@app.post("/artifact-bundles/view")
+def artifact_bundle_view_post(
+    req: ArtifactBundleRequest,
+    _=Depends(require_token),
+) -> Dict[str, Any]:
+    artifacts_out: Dict[str, Any] = {}
+    bundle_report: Dict[str, Any] = {}
+
+    global_scope = req.global_scope or ArtifactBundleScope(mode="raw")
+    per_artifact = req.per_artifact or {}
+
+    for artifact_id in req.artifact_ids:
+        artifact_scope = per_artifact.get(artifact_id) or ArtifactBundleScope()
+        effective_mode = artifact_scope.mode or global_scope.mode or "raw"
+        effective_keep = artifact_scope.keep if artifact_scope.keep is not None else global_scope.keep
+        effective_drop = artifact_scope.drop if artifact_scope.drop is not None else global_scope.drop
+        effective_limits = artifact_scope.limits if artifact_scope.limits is not None else global_scope.limits
+        effective_value_filter = artifact_scope.value_filter if artifact_scope.value_filter is not None else global_scope.value_filter
+
+        kind, payload, _ = _get_decoded_payload(run_id=req.run_id, artifact_id=artifact_id)
+        if kind == "other":
+            raise HTTPException(status_code=415, detail=f"Artifact {artifact_id} is not JSON/JSONL; use /download")
+
+        pruned, report = apply_llm_pruning(
+            payload=payload,
+            artifact_id=artifact_id,
+            mode=effective_mode,
+            keep_keys=effective_keep,
+            drop_keys=effective_drop,
+            limits=effective_limits,
+            policy_overrides=req.policy_overrides,
+            replace_policies=req.replace_policies,
+            value_filter=effective_value_filter,
+            debug=req.debug,
+        )
+        artifacts_out[artifact_id] = pruned
+        if req.debug:
+            bundle_report[artifact_id] = report
+
+    response: Dict[str, Any] = {
+        "run_id": req.run_id,
+        "mode": global_scope.mode or "raw",
+        "artifacts": artifacts_out,
+    }
+    if req.debug:
+        response["_bundle_prune_report"] = bundle_report
+    return response
