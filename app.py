@@ -7,6 +7,7 @@ import json
 import uuid
 import logging
 import re
+import copy
 from pathlib import Path
 from collections import defaultdict, deque, Counter
 from itertools import combinations
@@ -5638,9 +5639,7 @@ _DECODE_CACHE_MAX = int(os.getenv("ARTIFACT_VIEW_CACHE_MAX", "32"))
 MAX_POLICY_OVERRIDE_KEYS = int(os.getenv("MAX_POLICY_OVERRIDE_KEYS", "25"))
 MAX_POLICY_OVERRIDE_BYTES = int(os.getenv("MAX_POLICY_OVERRIDE_BYTES", "65536"))
 MAX_CAP = int(os.getenv("MAX_CAP", "500"))
-MAX_TOPK_PER_ROLE = int(os.getenv("MAX_TOPK_PER_ROLE", "200"))
-MAX_INCLUDE_ALL_CAP = int(os.getenv("MAX_INCLUDE_ALL_CAP", "500"))
-MAX_HARD_CAP_TOTAL = int(os.getenv("MAX_HARD_CAP_TOTAL", "1000"))
+MAX_POLICY_INT = int(os.getenv("MAX_POLICY_INT", "1000"))
 MAX_LIMITS_VALUE = int(os.getenv("MAX_LIMITS_VALUE", "5000"))
 
 
@@ -5719,29 +5718,16 @@ def _clamp_policy_number(
     field_name: str,
     clamps: List[Dict[str, Any]],
 ) -> int:
-    limit = None
-    reason = None
-    if field_name == "hard_cap_total":
-        limit = MAX_HARD_CAP_TOTAL
-        reason = "max_hard_cap_total"
-    elif "include_roles_topk" in path:
-        limit = MAX_TOPK_PER_ROLE
-        reason = "max_topk_per_role"
-    elif field_name == "include_review_required_topk":
-        limit = MAX_TOPK_PER_ROLE
-        reason = "max_include_review_required_topk"
-    elif field_name == "cap" and "include_roles_all" in path:
-        limit = MAX_INCLUDE_ALL_CAP
-        reason = "max_include_roles_all_cap"
-    elif field_name in {"k", "limit", "max_items"}:
-        limit = MAX_CAP
-        reason = "max_generic_policy_cap"
-    if limit is not None and number > limit:
-        clamps.append({"path": path, "from": number, "to": limit, "reason": reason})
-        return limit
     if number < 0:
         clamps.append({"path": path, "from": number, "to": 0, "reason": "negative_not_allowed"})
         return 0
+
+    key_like_fields = {"k", "cap", "limit", "max_items", "hard_cap_total", "include_review_required_topk"}
+    limit = MAX_CAP if field_name in key_like_fields else MAX_POLICY_INT
+    reason = "max_policy_k" if field_name in key_like_fields else "max_policy_int"
+    if number > limit:
+        clamps.append({"path": path, "from": number, "to": limit, "reason": reason})
+        return limit
     return number
 
 
@@ -5769,6 +5755,7 @@ def _build_effective_policies(
     policy_overrides: Optional[Dict[str, Dict[str, Any]]],
     replace_policies: Optional[Iterable[str]],
     report: Optional[Dict[str, Any]] = None,
+    scope_artifact_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     effective = json.loads(json.dumps(base_policies or {}))
     override_payload = policy_overrides or {}
@@ -5800,7 +5787,10 @@ def _build_effective_policies(
 
     if report is not None:
         report["policy_overrides_received"] = received
-        report["policy_effective"] = effective
+        scoped = effective
+        if scope_artifact_id is not None:
+            scoped = {scope_artifact_id: dict((effective.get(scope_artifact_id) or {}))}
+        report["policy_effective"] = scoped
         report["policy_clamps"] = clamps
 
     return effective
@@ -5946,6 +5936,7 @@ def _recursive_prune_keys(
     if isinstance(node, dict):
         out: Dict[str, Any] = {}
         for key, value in node.items():
+            report["seen_keys"][key] += 1
             current_path = f"{path}.{key}" if path else key
             should_drop = _should_drop_key(
                 key=key,
@@ -5957,6 +5948,8 @@ def _recursive_prune_keys(
             if should_drop and key not in keep_keys:
                 report["dropped_keys"][key] += 1
                 continue
+            if should_drop and key in keep_keys:
+                report["kept_key_hits"][key] += 1
             out[key] = _recursive_prune_keys(
                 value,
                 key_drops=key_drops,
@@ -6155,6 +6148,72 @@ def _apply_a9_columns_policy(
     return final_selected
 
 
+
+
+def _resolve_policy_target_path(policy_name: str, policy: Dict[str, Any]) -> str:
+    target = str(policy.get("target_array", "")).strip()
+    if target:
+        return target
+    if policy_name.endswith("_policy"):
+        return policy_name[:-7]
+    return policy_name
+
+
+def _resolve_policy_type(policy_name: str, policy: Dict[str, Any]) -> str:
+    policy_type = str(policy.get("type", "")).strip().lower()
+    if policy_type:
+        return policy_type
+    if policy_name == "columns_policy":
+        return "bucket_selector"
+    if policy_name == "tests_policy":
+        return "ranked_topk"
+    return ""
+
+
+def _apply_ranked_topk_policy(node: Dict[str, Any], items: List[Any], policy: Dict[str, Any], report: Dict[str, Any]) -> List[Any]:
+    return _apply_a6_tests_policy(node, items, policy, report)
+
+
+def _apply_bucket_selector_policy(items: List[Any], policy: Dict[str, Any], value_filter: Optional[Any], report: Dict[str, Any]) -> List[Any]:
+    return _apply_a9_columns_policy(items, policy, value_filter, report)
+
+
+def _apply_typed_array_policy(
+    node: Dict[str, Any],
+    items: List[Any],
+    policy_name: str,
+    policy: Dict[str, Any],
+    value_filter: Optional[Any],
+    report: Dict[str, Any],
+) -> List[Any]:
+    policy_type = _resolve_policy_type(policy_name, policy)
+    if policy_type in {"ranked_topk", "best_candidate_safe_ranked_topk"}:
+        return _apply_ranked_topk_policy(node=node, items=items, policy=policy, report=report)
+    if policy_type in {"bucket_selector", "role_bucket_selector"}:
+        return _apply_bucket_selector_policy(items=items, policy=policy, value_filter=value_filter, report=report)
+    return items
+
+
+def _apply_transform_stage(
+    node: Any,
+    artifact_id: str,
+    policies: Dict[str, Any],
+    report: Dict[str, Any],
+) -> Any:
+    if not isinstance(node, dict):
+        return node
+    artifact_policies = (policies.get(artifact_id) or {}) if isinstance(policies, dict) else {}
+    applied = []
+    for policy_name, policy in artifact_policies.items():
+        if not isinstance(policy, dict):
+            continue
+        policy_type = _resolve_policy_type(policy_name, policy)
+        if policy_type in {"augment_array_elements", "join_array_by_key", "sample_values"}:
+            applied.append({"policy": policy_name, "type": policy_type, "target": _resolve_policy_target_path(policy_name, policy)})
+    if applied:
+        report["transform_policies_seen"] = applied
+    return node
+
 def _apply_limits(
     node: Any,
     path: str,
@@ -6190,20 +6249,32 @@ def _apply_limits(
 
     if isinstance(node, dict):
         next_dict: Dict[str, Any] = {}
+        artifact_policies = (policies.get(artifact_id) or {}) if isinstance(policies, dict) else {}
         for key, value in node.items():
             child_path = f"{path}.{key}" if path else key
-            if artifact_id == "A9" and child_path == "columns" and isinstance(value, list):
-                a9_policy = (policies.get("A9") or {}).get("columns_policy", {})
-                next_dict[key] = _apply_a9_columns_policy(value, a9_policy, value_filter, report)
-                continue
-            if artifact_id == "A6" and child_path == "tests" and isinstance(value, list):
-                a6_policy = (policies.get("A6") or {}).get("tests_policy", {})
-                selected_tests = _apply_a6_tests_policy(root_node or node, value, a6_policy, report)
-                limit = _resolve_limit_for_path(effective_limits, artifact_id, child_path)
-                if limit is not None and len(selected_tests) > limit:
-                    report["truncated_arrays"].append({"path": child_path, "before": len(selected_tests), "after": limit})
-                    selected_tests = selected_tests[:limit]
-                next_dict[key] = selected_tests
+            applied_typed_policy = False
+            if isinstance(value, list) and isinstance(artifact_policies, dict):
+                for policy_name, policy in artifact_policies.items():
+                    if not isinstance(policy, dict):
+                        continue
+                    if _resolve_policy_target_path(policy_name, policy) != child_path:
+                        continue
+                    typed_selected = _apply_typed_array_policy(
+                        node=root_node or node,
+                        items=value,
+                        policy_name=policy_name,
+                        policy=policy,
+                        value_filter=value_filter,
+                        report=report,
+                    )
+                    limit = _resolve_limit_for_path(effective_limits, artifact_id, child_path)
+                    if limit is not None and len(typed_selected) > limit:
+                        report["truncated_arrays"].append({"path": child_path, "before": len(typed_selected), "after": limit})
+                        typed_selected = typed_selected[:limit]
+                    next_dict[key] = typed_selected
+                    applied_typed_policy = True
+                    break
+            if applied_typed_policy:
                 continue
             next_dict[key] = _apply_limits(
                 value,
@@ -6231,6 +6302,7 @@ def apply_llm_pruning(
     replace_policies: Optional[Iterable[str]] = None,
     value_filter: Optional[Any] = None,
     debug: bool = False,
+    effective_policies: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Any, Dict[str, Any]]:
     mode_config = _resolve_pruning_mode(mode)
 
@@ -6239,41 +6311,63 @@ def apply_llm_pruning(
     tier2_cfg = mode_config.get("tier2", {})
     tier3_cfg = mode_config.get("tier3", {})
 
-    drop_rules = [rule for rule in (tier1_cfg.get("global_drop_rules", []) or []) if rule.get("key") not in keep_set]
+    drop_rules = list(tier1_cfg.get("global_drop_rules", []) or [])
     guarded_rule_keys = {str(rule.get("key")) for rule in drop_rules if rule.get("key")}
 
     effective_drops = set(tier1_cfg.get("global_drop_keys", []))
     effective_drops.update(tier2_cfg.get("artifact_drop_keys", {}).get(artifact_id, []))
     effective_drops.update(drop_keys or [])
-    effective_drops = {k for k in effective_drops if k not in keep_set and k not in guarded_rule_keys}
+    effective_drops = {k for k in effective_drops if k not in guarded_rule_keys}
 
     default_limits: Dict[str, int] = dict(tier3_cfg.get("limits", {}))
     policy_clamps: List[Dict[str, Any]] = []
     if limits:
         default_limits.update(_guard_limits_map(limits, "limits", policy_clamps) or {})
 
+    requested_drop_keys = [str(k) for k in (drop_keys or [])]
     report: Dict[str, Any] = {
         "mode": mode,
         "artifact_id": artifact_id,
         "dropped_keys": Counter(),
         "truncated_arrays": [],
         "effective_limits": default_limits,
+        "seen_keys": Counter(),
+        "kept_key_hits": Counter(),
+        "keep_requested": sorted(list(keep_set)),
+        "drop_requested": requested_drop_keys,
     }
 
-    effective_policies = _build_effective_policies(
+    resolved_policies = effective_policies or _build_effective_policies(
         base_policies=tier3_cfg.get("policies", {}),
         policy_overrides=policy_overrides,
         replace_policies=replace_policies,
         report=report if debug else None,
+        scope_artifact_id=artifact_id,
     )
+    if debug and effective_policies is not None:
+        report["policy_effective"] = {artifact_id: dict((resolved_policies.get(artifact_id) or {}))}
+        report["policy_overrides_received"] = policy_overrides or {}
+        report["policy_clamps"] = []
     if debug and policy_clamps:
         report.setdefault("policy_clamps", []).extend(policy_clamps)
 
     if mode == "raw" and not drop_keys and not keep_keys and not limits and not value_filter and not policy_overrides:
+        report["drop_requested_not_found"] = [k for k in requested_drop_keys if report["seen_keys"].get(k, 0) == 0]
+        report["dropped_keys"] = dict(report["dropped_keys"])
+        report["kept_key_hits"] = dict(report["kept_key_hits"])
+        report.pop("seen_keys", None)
         return payload, report
 
+    working_payload = copy.deepcopy(payload)
+    transformed = _apply_transform_stage(
+        node=working_payload,
+        artifact_id=artifact_id,
+        policies=resolved_policies,
+        report=report,
+    )
+
     pruned = _recursive_prune_keys(
-        payload,
+        transformed,
         key_drops=effective_drops,
         keep_keys=keep_set,
         drop_rules=drop_rules,
@@ -6286,13 +6380,16 @@ def apply_llm_pruning(
         path="",
         artifact_id=artifact_id,
         effective_limits=default_limits,
-        policies=effective_policies,
+        policies=resolved_policies,
         value_filter=value_filter,
         report=report,
         root_node=pruned if isinstance(pruned, dict) else None,
     )
 
+    report["drop_requested_not_found"] = [k for k in requested_drop_keys if report["seen_keys"].get(k, 0) == 0]
     report["dropped_keys"] = dict(report["dropped_keys"])
+    report["kept_key_hits"] = dict(report["kept_key_hits"])
+    report.pop("seen_keys", None)
     if not debug:
         report = {
             "mode": report["mode"],
@@ -6311,7 +6408,9 @@ def _run_pruning_smoke_checks() -> None:
         "columns": [
             {"column": "z_measure", "primary_role": "measure"},
             {"column": "id_a", "primary_role": "id_key"},
-            {"column": "id_b", "primary_role": "id_key"},            {"column": "time_1", "primary_role": "time_index"},
+            {"column": "id_b", "primary_role": "id_key"},
+            {"column": "time_1", "primary_role": "time_index"},
+            {"column": "time_1", "primary_role": "time_index"},
         ]
     }
     pruned_a9, _ = apply_llm_pruning(
@@ -6439,6 +6538,16 @@ def artifact_view_post(
         mode=req.mode,
         keep_keys=req.keep,
         drop_keys=req.drop,
+    mode_config = _resolve_pruning_mode(global_scope.mode or "raw")
+    bundle_effective_policies = _build_effective_policies(
+        base_policies=mode_config.get("tier3", {}).get("policies", {}),
+        policy_overrides=req.policy_overrides,
+        replace_policies=req.replace_policies,
+        report=None,
+    )
+
+            effective_policies=bundle_effective_policies,
+        response["_bundle_policy_effective"] = bundle_effective_policies
         limits=req.limits,
         policy_overrides=req.policy_overrides,
         replace_policies=req.replace_policies,
