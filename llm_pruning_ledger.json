@@ -1,0 +1,248 @@
+{
+  "schema_version": "1.0",
+  "ledger_name": "llm_pruning_ledger",
+  "modes": {
+    "llm_baseline": {
+      "description": "LLM-safe pruning profile optimized for the Grain Worker. Tier 1 removes globally repeated non-decision payloads; Tier 2 drops artifact-local bloat keys; Tier 3 applies bounded K-limits and typed selectors where naive truncation is unsafe (A9).",
+      "global_drops": [
+        "inputs",
+        "uses",
+        "rows"
+      ],
+      "global_drop_rules": [
+        {
+          "key": "inputs",
+          "scope": "recursive_key_drop"
+        },
+        {
+          "key": "uses",
+          "scope": "recursive_key_drop"
+        },
+        {
+          "key": "rows",
+          "scope": "recursive_key_drop",
+          "guards": {
+            "value_kind_any_of": [
+              "list_of_objects"
+            ],
+            "path_hints_any_of": [
+              "row_samples.panels[].rows",
+              "example_conflicts[].rows",
+              "F_subset.rows"
+            ]
+          },
+          "note": "Mitigation for name-collision risk: only drop when the value looks like row payloads (list of objects) and/or appears under known row-sample containers."
+        }
+      ],
+      "artifact_drops": {
+        "A5": [
+          "candidate_key_stress_tests",
+          "handoff_to_A6",
+          "invariant_candidates_checked",
+          "not_final_key"
+        ],
+        "A6": [
+          "runner_ups",
+          "non_key_conflict_summary",
+          "base_key",
+          "added_qualifiers"
+        ],
+        "A7": [
+          "exact_duplicate_clusters",
+          "actions",
+          "grain_context_ref",
+          "grain_ref"
+        ],
+        "A8": [
+          "families",
+          "near_misses"
+        ],
+        "A9": [
+          "evidence_primitives",
+          "role_scores",
+          "role_candidates",
+          "audit",
+          "evidence_used",
+          "evidence_not_used",
+          "features"
+        ]
+      },
+      "artifact_limits": {
+        "A5": {
+          "single_column_key_seed_candidates": 12
+        },
+        "A6": {
+          "tests": 15
+        },
+        "A7": {},
+        "A8": {
+          "families_index": 30,
+          "rejected_candidates": 50
+        },
+        "A9": {}
+      },
+      "artifact_transforms": {
+        "A8": [
+          {
+            "type": "join_array_by_key",
+            "target_array_path": "families_index",
+            "source_array_path": "families",
+            "join_key": "family_id",
+            "write_field": "family_signature",
+            "field_map": {
+              "normalized_stem": {
+                "from": "source.stem_evidence.normalized_stem"
+              },
+              "raw_stem": {
+                "from": "source.stem_evidence.raw_stem"
+              },
+              "pattern_kind": {
+                "from": "source.patterns[0]",
+                "fallback_from": "target.patterns[0]"
+              },
+              "suffix_keyword": {
+                "from": "target.repeat_dim",
+                "fallback_from": "target.recommended_repeat_dimension_name"
+              },
+              "suffix_keyword_title": {
+                "from": "target.repeat_dim",
+                "fallback_from": "target.recommended_repeat_dimension_name",
+                "transform": "title"
+              },
+              "columns_preview": {
+                "from": "source.columns_preview",
+                "slice": 3,
+                "k_max": 8
+              },
+              "columns_count": {
+                "from": "source.columns_count"
+              },
+              "signature_label": {
+                "from": "source.stem_evidence.normalized_stem",
+                "template": "{source.family_id}:{value}"
+              }
+            }
+          }
+        ]
+      },
+      "artifact_policies": {
+        "A6": {
+          "tests_policy": {            "type": "best_candidate_safe_ranked_topk",
+            "k": 15,
+            "must_keep": {
+              "best_candidate_keys_path": "row_grain_assessment.best_candidate.keys",
+              "tests_key_field": "keys_tested",
+              "match_mode": "set_equal_or_order_insensitive_equal"
+            },
+            "rank_order": [
+              {
+                "field": "pivot_safety",
+                "order": "desc",
+                "note": "safe first"
+              },
+              {
+                "field": "collision_severity_score",
+                "order": "asc",
+                "note": "lower is better"
+              },
+              {
+                "field": "non_key_conflict_group_pct",
+                "order": "asc",
+                "note": "lower is better"
+              },
+              {
+                "field": "uniqueness_rate",
+                "order": "desc",
+                "note": "higher is better"
+              }
+            ],
+            "tie_breaker": {
+              "type": "stable",
+              "fields": [
+                "keys_tested"
+              ]
+            },
+            "note": "Deterministic truncation that always retains the best-candidate test if present, then keeps the top-ranked remaining tests."
+          }
+        },
+        "A9": {
+          "columns_policy": {
+            "type": "role_bucket_selector",
+            "target_array": "columns",
+            "role_field": "primary_role",
+            "name_field": "column",
+            "review_field": "review_required",
+            "include_roles_all": [
+              {
+                "role": "id_key",
+                "cap": 50,
+                "overflow_flag": "id_key_overflow"
+              }
+            ],
+            "include_roles_topk": {
+              "time_index": 10,
+              "repeat_index": 10,
+              "invariant_attr": 25,
+              "coded_categorical": 25
+            },
+            "include_review_required_topk": 25,
+            "exclude_roles": [
+              "measure",
+              "measure_numeric",
+              "measure_item"
+            ],
+            "hard_cap_total": 120,
+            "bucket_priority": [
+              "include_roles_all",
+              "include_roles_topk",
+              "include_review_required"
+            ],
+            "tie_breaker": {
+              "type": "name_asc",
+              "field": "column"
+            },
+            "note": "Value-aware selection is required because naive first-K truncation can drop the true id_key column in wide datasets."
+          }
+        },
+        "A8": {
+          "families_index_signature_policy": {
+            "type": "augment_families_index_with_signature",
+            "join_key": "family_id",
+            "source_families_path": "families",
+            "target_families_index_path": "families_index",
+            "signature_fields": {
+              "normalized_stem": "stem_evidence.normalized_stem",
+              "raw_stem": "stem_evidence.raw_stem",
+              "pattern_kind": {
+                "from": "families_index.patterns[0]",
+                "fallback_from": "families.patterns[0]"
+              },
+              "suffix_keyword": {
+                "from": "families_index.repeat_dim",
+                "fallback_from": "families_index.recommended_repeat_dimension_name"
+              },
+              "columns_preview": {
+                "from": "columns_preview",
+                "k_default": 3,
+                "k_max": 8
+              },
+              "columns_count": {
+                "from": "columns_count"
+              },
+              "member_regex": {
+                "derive": true,
+                "when_pattern_kind": {
+                  "suffix_keyword_numeric": {
+                    "template": "^{raw_stem}({suffix_keyword_title}|{suffix_keyword})[_-]?[0-9]+$"
+                  }
+                }
+              }
+            },
+            "output_field": "family_signature",
+            "note": "Adds a compact membership signature onto each families_index[] entry so workers can deterministically identify repeated-family members without shipping the full families[].columns list."
+          }
+        }
+      }
+    }
+  }
+}
