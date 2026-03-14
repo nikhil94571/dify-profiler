@@ -1,5 +1,6 @@
 import io
 import json
+import math
 from typing import Any, Dict, List, Tuple
 
 from openpyxl import Workbook
@@ -85,6 +86,27 @@ def _autosize_columns(ws) -> None:
         ws.column_dimensions[letter].width = min(max(12, max_len + 2), 60)
 
 
+def _estimate_line_count(text: str, width: float) -> int:
+    if not text:
+        return 1
+    usable_width = max(8, int(width) - 2)
+    total = 0
+    for line in text.splitlines() or [text]:
+        total += max(1, math.ceil(max(1, len(line)) / usable_width))
+    return total
+
+
+def _apply_row_heights(ws, min_height: float = 20.0, line_height: float = 15.0) -> None:
+    for row_idx in range(1, ws.max_row + 1):
+        max_lines = 1
+        for col_idx in range(1, ws.max_column + 1):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            text = "" if cell.value is None else str(cell.value)
+            width = float(ws.column_dimensions[get_column_letter(col_idx)].width or 12)
+            max_lines = max(max_lines, _estimate_line_count(text, width))
+        ws.row_dimensions[row_idx].height = max(min_height, min(240.0, max_lines * line_height))
+
+
 def _style_data_region(ws, recommended_cols: List[str], editable_cols: List[str]) -> None:
     header_map = {str(ws.cell(row=1, column=idx).value or ""): idx for idx in range(1, ws.max_column + 1)}
     for col_name in recommended_cols:
@@ -113,6 +135,7 @@ def _write_table_sheet(ws, headers: List[str], rows: List[List[Any]], freeze: st
     if headers:
         ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{max(1, ws.max_row)}"
     _autosize_columns(ws)
+    _apply_row_heights(ws)
 
 
 def _build_readme_rows() -> List[List[str]]:
@@ -127,6 +150,7 @@ def _build_readme_rows() -> List[List[str]]:
         ["Status: modify", "Leave the recommended columns untouched and fill the your_* columns with your corrected values."],
         ["Status: reject", "Reject the recommendation and explain why in comments. A later step will review the rejection."],
         ["Status: unsure", "Leave comments that explain what is unclear or what extra review is needed."],
+        ["Composite key guidance", "To create a composite key, fill your_key_1 and then add any additional key parts in your_key_2 and your_key_3. Leave unused trailing key cells blank. Example: a two-part key uses only your_key_1 and your_key_2."],
         ["3-step workflow", "1) Review the recommendation sheets. 2) Set status for each row. 3) Fill the your_* fields only when modifying or rejecting."],
     ]
 
@@ -163,6 +187,7 @@ def build_light_contract_xlsx_bytes(contract: Dict[str, Any]) -> bytes:
     for row in ws.iter_rows():
         for cell in row:
             cell.alignment = Alignment(wrap_text=True, vertical="top")
+    _apply_row_heights(ws)
 
     # Sheet 2: Column Guide
     ws_cols = wb.create_sheet(title="Column Guide")
@@ -296,7 +321,33 @@ def build_light_contract_xlsx_bytes(contract: Dict[str, Any]) -> bytes:
         editable_cols=["your_table_name", "your_repeat_index_name", "your_parent_key", "status", "comments"],
     )
 
-    # Sheet 7: Overrides
+    structural_gate_rows = contract.get("structural_gate_rows", [])
+    if structural_gate_rows:
+        ws_gates = wb.create_sheet(title="Structural Gates")
+        gate_headers = [
+            "trigger_column",
+            "trigger_value",
+            "affected_column_count",
+            "affected_family_ids",
+            "missing_explained_pct",
+            "directionality",
+            "interpretation",
+        ]
+        gate_rows = [
+            [
+                row.get("trigger_column", ""),
+                row.get("trigger_value", ""),
+                row.get("affected_column_count", ""),
+                ", ".join(row.get("affected_family_ids", []) or []),
+                row.get("missing_explained_pct", ""),
+                row.get("directionality", ""),
+                row.get("interpretation", ""),
+            ]
+            for row in structural_gate_rows
+        ]
+        _write_table_sheet(ws_gates, gate_headers, gate_rows)
+
+    # Sheet 7/8: Overrides
     ws_over = wb.create_sheet(title="Overrides")
     override_headers = ["field", "description", "user_input"]
     override_rows = [
@@ -328,6 +379,7 @@ def build_light_contract_xlsx_bytes(contract: Dict[str, Any]) -> bytes:
 
     for sheet in wb.worksheets:
         _autosize_columns(sheet)
+        _apply_row_heights(sheet)
 
     buf = io.BytesIO()
     wb.save(buf)

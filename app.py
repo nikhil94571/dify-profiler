@@ -2827,6 +2827,45 @@ def _family_column_map(run_id: str) -> Dict[str, str]:
     return mapping
 
 
+def _load_structural_gate_rows(run_id: str) -> List[Dict[str, Any]]:
+    try:
+        kind, a16_payload, _ = _get_decoded_payload(run_id=run_id, artifact_id="A16")
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            return []
+        raise
+    if kind != "json" or not isinstance(a16_payload, dict):
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    master_switches = _coerce_list_of_dicts(a16_payload.get("master_switch_candidates"))
+    for candidate in master_switches[:5]:
+        rows.append({
+            "trigger_column": str(candidate.get("trigger_column") or ""),
+            "trigger_value": ", ".join([str(v) for v in (candidate.get("top_trigger_values") or [])[:3]]),
+            "affected_column_count": int(candidate.get("explained_column_count") or 0),
+            "affected_family_ids": [str(v) for v in (candidate.get("affected_family_ids") or []) if str(v).strip()],
+            "missing_explained_pct": "",
+            "directionality": "master_switch_candidate",
+            "interpretation": str(candidate.get("interpretation") or "Likely structural gate controlling downstream question blocks."),
+        })
+
+    if rows:
+        return rows
+
+    for rule in _coerce_list_of_dicts(a16_payload.get("detected_skip_logic"))[:5]:
+        rows.append({
+            "trigger_column": str(rule.get("trigger_column") or ""),
+            "trigger_value": str(rule.get("trigger_value") or ""),
+            "affected_column_count": int(rule.get("affected_column_count") or 0),
+            "affected_family_ids": [str(v) for v in (rule.get("affected_family_ids") or []) if str(v).strip()],
+            "missing_explained_pct": rule.get("missing_explained_pct", ""),
+            "directionality": str(rule.get("directionality") or ""),
+            "interpretation": str(rule.get("interpretation") or ""),
+        })
+    return rows
+
+
 def _build_grain_summary_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     primary = grain_worker_output.get("recommended_primary_grain") or {}
@@ -2843,7 +2882,7 @@ def _build_grain_summary_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[
         rows.append({
             "topic": "Encoding pattern",
             "recommendation": str(diagnostics.get("encoding_hint") or "unknown"),
-            "why": str(diagnostics.get("recommended_next_action") or ""),
+            "why": str(diagnostics.get("encoding_justification") or diagnostics.get("recommended_next_action") or ""),
             "needs_review": "yes" if str(diagnostics.get("encoding_hint") or "") == "unknown" else "no",
         })
         rejected = _coerce_list_of_dicts(diagnostics.get("rejected_primary_candidates"))
@@ -2886,7 +2925,7 @@ def _build_grain_summary_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[
 def _build_primary_grain_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[str, Any]]:
     primary = grain_worker_output.get("recommended_primary_grain") or {}
     primary_keys = _as_key_triplet((primary.get("keys") or []) if isinstance(primary, dict) else [])
-    rows = [{
+    return [{
         "item": "primary_grain",
         "recommended_key_1": primary_keys[0],
         "recommended_key_2": primary_keys[1],
@@ -2897,26 +2936,6 @@ def _build_primary_grain_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[
         "status": "accept",
         "comments": str(primary.get("description") or ""),
     }]
-
-    diagnostics = grain_worker_output.get("diagnostics") or {}
-    rejected = _coerce_list_of_dicts((diagnostics or {}).get("rejected_primary_candidates"))
-    index_candidate = next(
-        (candidate for candidate in rejected if any("unnamed" in str(k).lower() for k in candidate.get("keys", []) or [])),
-        None,
-    )
-    if index_candidate:
-        rows.append({
-            "item": "export_index_policy",
-            "recommended_key_1": "",
-            "recommended_key_2": "",
-            "recommended_key_3": "",
-            "your_key_1": "",
-            "your_key_2": "",
-            "your_key_3": "",
-            "status": "accept",
-            "comments": str(index_candidate.get("reason") or "Review whether any export index should be dropped, kept, or renamed."),
-        })
-    return rows
 
 
 def _build_dimension_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -2938,13 +2957,24 @@ def _build_dimension_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[str,
     return rows
 
 
-def _build_repeat_family_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _build_repeat_family_rows(grain_worker_output: Dict[str, Any], structural_gate_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     primary = grain_worker_output.get("recommended_primary_grain") or {}
     primary_label = _keys_to_label((primary.get("keys") or []) if isinstance(primary, dict) else [])
+    gate_map: Dict[str, List[str]] = {}
+    for gate in structural_gate_rows:
+        trigger = _first_non_empty([gate.get("trigger_column"), gate.get("trigger_value")])
+        for family_id in gate.get("affected_family_ids", []) or []:
+            gate_map.setdefault(str(family_id), []).append(trigger)
     rows: List[Dict[str, Any]] = []
     for family in _coerce_list_of_dicts(grain_worker_output.get("family_review_candidates")):
+        family_id = str(family.get("family_id") or "")
+        gate_context = gate_map.get(family_id, [])
+        comment = str(family.get("why_review") or "")
+        if gate_context:
+            gate_text = ", ".join(gate_context[:3])
+            comment = f"{comment} Structural gate context: condition(s) involving {gate_text} may control whether this family appears.".strip()
         rows.append({
-            "family_id": str(family.get("family_id") or ""),
+            "family_id": family_id,
             "recommended_table_name": str(family.get("suggested_table_name") or ""),
             "your_table_name": "",
             "recommended_repeat_index_name": str(family.get("repeat_index_name") or ""),
@@ -2952,7 +2982,7 @@ def _build_repeat_family_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[
             "recommended_parent_key": primary_label,
             "your_parent_key": "",
             "status": "accept_as_child_table" if str(family.get("status") or "") == "confirm_detected" else "unsure",
-            "comments": str(family.get("why_review") or ""),
+            "comments": comment,
         })
     return rows
 
@@ -2964,6 +2994,7 @@ def _build_override_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[str, 
         {"field": "global_renaming_instructions", "description": "Describe global renaming decisions, including friendlier names for identifiers, dates, question blocks, or child tables."},
         {"field": "global_regex_rules", "description": "Provide any regex-style grouping or naming rules that should be applied consistently across the dataset."},
         {"field": "missed_family_information", "description": "List repeat or matrix families that were missed, plus any known business labels for their row indices."},
+        {"field": "known_skip_logic_or_screening_rules", "description": "Describe any known screening questions, skip logic, or conditionally shown question blocks that should inform downstream interpretation."},
         {"field": "free_text_override_instructions", "description": "Capture any downstream structural instructions, such as fields to keep wide, tables to build, or columns that should never be dropped."},
     ):
         descriptor = input_descriptors.get(default["field"]) if isinstance(input_descriptors, dict) else None
@@ -2982,6 +3013,7 @@ def _build_override_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[str, 
 def _normalize_light_contract_payload(run_id: str, grain_worker_output: Dict[str, Any]) -> Dict[str, Any]:
     column_order = _column_order_from_manifest_and_a2(run_id)
     family_map = _family_column_map(run_id)
+    structural_gate_rows = _load_structural_gate_rows(run_id)
     column_guide_rows = [
         {
             "column_index": idx + 1,
@@ -2997,7 +3029,8 @@ def _normalize_light_contract_payload(run_id: str, grain_worker_output: Dict[str
         "grain_summary_rows": _build_grain_summary_rows(grain_worker_output),
         "primary_grain_rows": _build_primary_grain_rows(grain_worker_output),
         "dimension_rows": _build_dimension_rows(grain_worker_output),
-        "repeat_family_rows": _build_repeat_family_rows(grain_worker_output),
+        "repeat_family_rows": _build_repeat_family_rows(grain_worker_output, structural_gate_rows),
+        "structural_gate_rows": structural_gate_rows,
         "override_rows": _build_override_rows(grain_worker_output),
     }
 

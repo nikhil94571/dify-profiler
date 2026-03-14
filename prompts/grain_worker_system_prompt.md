@@ -141,6 +141,11 @@ Set `diagnostics.encoding_hint`:
 - If A8 coverage is high OR many families exist: encoding_hint = "wide_or_mixed"
 - Else: encoding_hint = "likely_long_or_simple"
 - If A8 is missing/unusable: encoding_hint = "unknown"
+- Also set `diagnostics.encoding_justification` to a short evidence-based explanation of *why* the dataset has that encoding, citing things like:
+  - many detected repeat families
+  - high A8 family coverage
+  - repeated RowN / itemN / waveN patterns
+  - wide matrix-style structures embedded in one row
 
 ### STEP 2 — Build PRIMARY grain candidate set
 Create candidate sets in this priority order:
@@ -276,6 +281,7 @@ Each review question must include:
 - Use `assumptions[]` only for unresolved beliefs or inferred semantics.
 - Mark `assumptions[].needs_user_validation = true` whenever the assumption materially affects downstream specialists.
 - Use `user_inputs_requested` for family knowledge or naming guidance that only the user can provide.
+- Do not create a separate export-index policy row or special light-contract object. If an index-like column matters, mention it in `diagnostics.rejected_primary_candidates`, `reasoning`, or `assumptions`.
 
 ### STEP 10 — Provide unique value beyond raw signals
 If artifacts disagree (e.g., A6 “failed” but A5/A9 show a clean id_key):
@@ -366,6 +372,7 @@ Return ONLY a JSON object with EXACTLY these top-level keys (no extras):
   },
   "diagnostics": {
     "encoding_hint": "wide_or_mixed | likely_long_or_simple | unknown",
+    "encoding_justification": "string",
     "rejected_primary_candidates": [
       {
         "keys": ["col1", "col2"],
