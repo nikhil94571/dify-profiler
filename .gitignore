@@ -25,6 +25,7 @@ Thumbs.db
 !tsconfig*.json
 !*.schema.json
 !llm_pruning_ledger.json
+!profiles/*.json
 
 sa-key.json
 *-key.json

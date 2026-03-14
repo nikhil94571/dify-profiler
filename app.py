@@ -26,7 +26,7 @@ import google.auth
 from google.auth import impersonated_credentials
 
 
-from xlsx_export import build_xlsx_bytes
+from xlsx_export import build_light_contract_xlsx_bytes, build_xlsx_bytes
 
 
 try:
@@ -168,7 +168,7 @@ async def request_logging(request: Request, call_next):
 
 @app.middleware("http")
 async def limit_upload_size(request: Request, call_next):
-    if request.url.path in ("/profile", "/profile_summary", "/profile_column_detail", "/evidence_associations", "/export/light-contract-xlsx", "/full-bundle") and request.method.upper() == "POST":
+    if request.url.path in ("/profile", "/profile_summary", "/profile_column_detail", "/evidence_associations", "/export/light-contract-xlsx", "/light-contracts/xlsx", "/full-bundle") and request.method.upper() == "POST":
         cl = request.headers.get("content-length")
         if cl is not None:
             try:
@@ -181,7 +181,7 @@ async def limit_upload_size(request: Request, call_next):
 
 @app.middleware("http")
 async def basic_rate_limit(request: Request, call_next):
-    if request.url.path in ("/profile", "/profile_summary", "/profile_column_detail", "/evidence_associations", "/export/light-contract-xlsx", "/full-bundle") and request.method.upper() == "POST":
+    if request.url.path in ("/profile", "/profile_summary", "/profile_column_detail", "/evidence_associations", "/export/light-contract-xlsx", "/light-contracts/xlsx", "/full-bundle") and request.method.upper() == "POST":
         ip = _client_ip(request)
         now = time.time()
         q = _req_times[ip]
@@ -2673,36 +2673,26 @@ class XlsxExportRequest(BaseModel):
     filename: str | None = None
 
 
-@app.post("/export/light-contract-xlsx", include_in_schema=False, deprecated=True)
-def export_light_contract_xlsx(
-    req: XlsxExportRequest,
-    _: None = Depends(require_token),
-):
-    # (Decision) Use GCS + signed URL instead of returning bytes.
-    # Why it matters: Dify HTTP nodes handle JSON cleanly; a signed URL gives a reliable “download” UX.
+class LightContractXlsxRequest(BaseModel):
+    run_id: str
+    grain_worker_output: Dict[str, Any]
+    filename: str | None = None
 
-    try:
-        xlsx_bytes = build_xlsx_bytes(req.rows_table_json, sheet_name="Light Contract")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"XLSX build failed: {e}")
 
-    def _sanitize_filename(name: str) -> str:
-        name = (name or "").strip().replace("\n", "").replace("\r", "")
-        name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
-        if not name.lower().endswith(".xlsx"):
-            name += ".xlsx"
-        return name or "light_contract_template.xlsx"
+def _sanitize_export_filename(name: str, default_name: str) -> str:
+    name = (name or "").strip().replace("\n", "").replace("\r", "")
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+    if not name.lower().endswith(".xlsx"):
+        name += ".xlsx"
+    return name or default_name
 
-    filename = _sanitize_filename(req.filename or "light_contract_template.xlsx")
 
+def _upload_xlsx_and_sign(xlsx_bytes: bytes, filename: str) -> Dict[str, Any]:
     bucket_name = os.getenv("EXPORT_BUCKET")
     if not bucket_name:
         raise HTTPException(status_code=500, detail="Missing EXPORT_BUCKET env var")
 
     ttl_minutes = int(os.getenv("EXPORT_SIGNED_URL_TTL_MINUTES", "30"))
-
-    # (Decision) Unique object name per request.
-    # Why it matters: avoids collisions and makes requests idempotent-ish for debugging.
     object_name = f"exports/{uuid4().hex}_{filename}"
 
     try:
@@ -2715,14 +2705,11 @@ def export_light_contract_xlsx(
             content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-        # (Decision) Signed URL for temporary access using IAM SignBlob (Cloud Run-safe).
-        # Why it matters: Cloud Run default credentials are token-only and cannot sign V4 URLs directly.
         signing_sa = os.getenv("SIGNING_SA_EMAIL")
         if not signing_sa:
             raise HTTPException(status_code=500, detail="Missing SIGNING_SA_EMAIL env var")
 
         source_creds, _ = google.auth.default()
-
         signing_creds = impersonated_credentials.Credentials(
             source_credentials=source_creds,
             target_principal=signing_sa,
@@ -2738,20 +2725,330 @@ def export_light_contract_xlsx(
             response_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             credentials=signing_creds,
         )
-
-
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"GCS upload/sign failed: {e}")
+        raise HTTPException(status_code=500, detail=f"GCS upload/sign failed: {e}") from e
 
     return {
-        "status": "success",
+        "status": "ok",
         "filename": filename,
-        "object": object_name,
+        "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "bucket": bucket_name,
+        "object_path": object_name,
         "signed_url": signed_url,
-        "expires_minutes": ttl_minutes,
+        "expires_in_minutes": ttl_minutes,
     }
 
-from fastapi import HTTPException
+
+def _first_non_empty(items: List[Any]) -> str:
+    for item in items:
+        if item is None:
+            continue
+        text = str(item).strip()
+        if text:
+            return text
+    return ""
+
+
+def _coerce_list_of_dicts(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _as_key_triplet(keys: Any) -> List[str]:
+    if not isinstance(keys, list):
+        return ["", "", ""]
+    cleaned = [str(k).strip() for k in keys if str(k).strip()]
+    return (cleaned + ["", "", ""])[:3]
+
+
+def _keys_to_label(keys: Any) -> str:
+    parts = [str(k).strip() for k in (keys or []) if str(k).strip()]
+    return " + ".join(parts)
+
+
+def _load_run_manifest(run_id: str) -> Dict[str, Any]:
+    bucket_name = os.getenv("EXPORT_BUCKET")
+    if not bucket_name:
+        raise HTTPException(status_code=500, detail="Missing EXPORT_BUCKET env var")
+    try:
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(f"runs/{run_id}/manifest.json")
+        if not blob.exists(client):
+            raise HTTPException(status_code=404, detail="run_id not found")
+        return json.loads(blob.download_as_bytes().decode("utf-8"))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Unable to load run manifest: {exc}") from exc
+
+
+def _column_order_from_manifest_and_a2(run_id: str) -> List[str]:
+    manifest = _load_run_manifest(run_id)
+    evidence_fields = ((manifest.get("evidence_primitives") or {}).get("fields") or [])
+    try:
+        kind, a2_payload, _ = _get_decoded_payload(run_id=run_id, artifact_id="A2")
+    except HTTPException:
+        kind, a2_payload = "other", None
+    columns: List[str] = []
+    if kind == "jsonl" and isinstance(a2_payload, list):
+        for row in a2_payload:
+            if isinstance(row, dict):
+                col = str(row.get("column") or "").strip()
+                if col:
+                    columns.append(col)
+    if columns:
+        return columns
+    manifest_cols = (((manifest.get("profiling_limits") or {}).get("column_names")) or [])
+    if isinstance(manifest_cols, list):
+        return [str(col).strip() for col in manifest_cols if str(col).strip()]
+    return [str(col).strip() for col in evidence_fields if str(col).strip()]
+
+
+def _family_column_map(run_id: str) -> Dict[str, str]:
+    try:
+        kind, a8_payload, _ = _get_decoded_payload(run_id=run_id, artifact_id="A8")
+    except HTTPException:
+        return {}
+    if kind != "json" or not isinstance(a8_payload, dict):
+        return {}
+    mapping: Dict[str, str] = {}
+    for family in _coerce_list_of_dicts(a8_payload.get("families")):
+        family_id = str(family.get("family_id") or "").strip()
+        if not family_id:
+            continue
+        for col in family.get("columns", []) or []:
+            col_name = str(col).strip()
+            if col_name and col_name not in mapping:
+                mapping[col_name] = family_id
+    return mapping
+
+
+def _build_grain_summary_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    primary = grain_worker_output.get("recommended_primary_grain") or {}
+    if isinstance(primary, dict):
+        rows.append({
+            "topic": "Primary grain",
+            "recommendation": _keys_to_label(primary.get("keys")) or str(primary.get("description") or ""),
+            "why": str(primary.get("justification") or primary.get("description") or ""),
+            "needs_review": "yes",
+        })
+
+    diagnostics = grain_worker_output.get("diagnostics") or {}
+    if isinstance(diagnostics, dict):
+        rows.append({
+            "topic": "Encoding pattern",
+            "recommendation": str(diagnostics.get("encoding_hint") or "unknown"),
+            "why": str(diagnostics.get("recommended_next_action") or ""),
+            "needs_review": "yes" if str(diagnostics.get("encoding_hint") or "") == "unknown" else "no",
+        })
+        rejected = _coerce_list_of_dicts(diagnostics.get("rejected_primary_candidates"))
+        for candidate in rejected[:3]:
+            rows.append({
+                "topic": "Rejected primary candidate",
+                "recommendation": _keys_to_label(candidate.get("keys")),
+                "why": str(candidate.get("reason") or ""),
+                "needs_review": "no",
+            })
+
+    for dim in _coerce_list_of_dicts(grain_worker_output.get("candidate_dimension_tables"))[:3]:
+        rows.append({
+            "topic": "Candidate dimension",
+            "recommendation": _first_non_empty([dim.get("suggested_table_name"), _keys_to_label(dim.get("keys"))]),
+            "why": str(dim.get("justification") or dim.get("entity_description") or ""),
+            "needs_review": "yes",
+        })
+
+    family_candidates = _coerce_list_of_dicts(grain_worker_output.get("family_review_candidates"))
+    if family_candidates:
+        rows.append({
+            "topic": "Repeat family overview",
+            "recommendation": f"{len(family_candidates)} family candidates detected",
+            "why": "Review the Repeat Families sheet to confirm child-table handling, parent keys, and repeat index naming.",
+            "needs_review": "yes",
+        })
+
+    assumptions = _coerce_list_of_dicts(grain_worker_output.get("assumptions"))
+    for assumption in assumptions[:3]:
+        rows.append({
+            "topic": "Assumption requiring validation",
+            "recommendation": str(assumption.get("assumption") or ""),
+            "why": str(assumption.get("explanation") or ""),
+            "needs_review": "yes" if assumption.get("needs_user_validation") else "no",
+        })
+    return rows
+
+
+def _build_primary_grain_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[str, Any]]:
+    primary = grain_worker_output.get("recommended_primary_grain") or {}
+    primary_keys = _as_key_triplet((primary.get("keys") or []) if isinstance(primary, dict) else [])
+    rows = [{
+        "item": "primary_grain",
+        "recommended_key_1": primary_keys[0],
+        "recommended_key_2": primary_keys[1],
+        "recommended_key_3": primary_keys[2],
+        "your_key_1": "",
+        "your_key_2": "",
+        "your_key_3": "",
+        "status": "accept",
+        "comments": str(primary.get("description") or ""),
+    }]
+
+    diagnostics = grain_worker_output.get("diagnostics") or {}
+    rejected = _coerce_list_of_dicts((diagnostics or {}).get("rejected_primary_candidates"))
+    index_candidate = next(
+        (candidate for candidate in rejected if any("unnamed" in str(k).lower() for k in candidate.get("keys", []) or [])),
+        None,
+    )
+    if index_candidate:
+        rows.append({
+            "item": "export_index_policy",
+            "recommended_key_1": "",
+            "recommended_key_2": "",
+            "recommended_key_3": "",
+            "your_key_1": "",
+            "your_key_2": "",
+            "your_key_3": "",
+            "status": "accept",
+            "comments": str(index_candidate.get("reason") or "Review whether any export index should be dropped, kept, or renamed."),
+        })
+    return rows
+
+
+def _build_dimension_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for dim in _coerce_list_of_dicts(grain_worker_output.get("candidate_dimension_tables")):
+        keys = _as_key_triplet(dim.get("keys") or [])
+        rows.append({
+            "table_name": _first_non_empty([dim.get("suggested_table_name"), _keys_to_label(dim.get("keys"))]),
+            "recommended_key_1": keys[0],
+            "recommended_key_2": keys[1],
+            "recommended_key_3": keys[2],
+            "your_key_1": "",
+            "your_key_2": "",
+            "your_key_3": "",
+            "relationship_to_primary": str(dim.get("relationship_to_primary") or ""),
+            "status": "unsure" if "review" in str(dim.get("justification") or "").lower() else "accept",
+            "comments": str(dim.get("justification") or dim.get("entity_description") or ""),
+        })
+    return rows
+
+
+def _build_repeat_family_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[str, Any]]:
+    primary = grain_worker_output.get("recommended_primary_grain") or {}
+    primary_label = _keys_to_label((primary.get("keys") or []) if isinstance(primary, dict) else [])
+    rows: List[Dict[str, Any]] = []
+    for family in _coerce_list_of_dicts(grain_worker_output.get("family_review_candidates")):
+        rows.append({
+            "family_id": str(family.get("family_id") or ""),
+            "recommended_table_name": str(family.get("suggested_table_name") or ""),
+            "your_table_name": "",
+            "recommended_repeat_index_name": str(family.get("repeat_index_name") or ""),
+            "your_repeat_index_name": "",
+            "recommended_parent_key": primary_label,
+            "your_parent_key": "",
+            "status": "accept_as_child_table" if str(family.get("status") or "") == "confirm_detected" else "unsure",
+            "comments": str(family.get("why_review") or ""),
+        })
+    return rows
+
+
+def _build_override_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[str, Any]]:
+    input_descriptors = grain_worker_output.get("user_inputs_requested") or {}
+    rows: List[Dict[str, Any]] = []
+    for default in (
+        {"field": "global_renaming_instructions", "description": "Describe global renaming decisions, including friendlier names for identifiers, dates, question blocks, or child tables."},
+        {"field": "global_regex_rules", "description": "Provide any regex-style grouping or naming rules that should be applied consistently across the dataset."},
+        {"field": "missed_family_information", "description": "List repeat or matrix families that were missed, plus any known business labels for their row indices."},
+        {"field": "free_text_override_instructions", "description": "Capture any downstream structural instructions, such as fields to keep wide, tables to build, or columns that should never be dropped."},
+    ):
+        descriptor = input_descriptors.get(default["field"]) if isinstance(input_descriptors, dict) else None
+        purpose = ""
+        if isinstance(descriptor, dict):
+            purpose = str(descriptor.get("purpose") or "").strip()
+        desc = default["description"] + (f" Purpose: {purpose}." if purpose else "")
+        rows.append({
+            "field": default["field"],
+            "description": desc,
+            "user_input": "",
+        })
+    return rows
+
+
+def _normalize_light_contract_payload(run_id: str, grain_worker_output: Dict[str, Any]) -> Dict[str, Any]:
+    column_order = _column_order_from_manifest_and_a2(run_id)
+    family_map = _family_column_map(run_id)
+    column_guide_rows = [
+        {
+            "column_index": idx + 1,
+            "column_name": col,
+            "family_id": family_map.get(col, ""),
+            "notes": "",
+        }
+        for idx, col in enumerate(column_order)
+    ]
+    return {
+        "readme_rows": [],
+        "column_guide_rows": column_guide_rows,
+        "grain_summary_rows": _build_grain_summary_rows(grain_worker_output),
+        "primary_grain_rows": _build_primary_grain_rows(grain_worker_output),
+        "dimension_rows": _build_dimension_rows(grain_worker_output),
+        "repeat_family_rows": _build_repeat_family_rows(grain_worker_output),
+        "override_rows": _build_override_rows(grain_worker_output),
+    }
+
+
+@app.post("/export/light-contract-xlsx", include_in_schema=False, deprecated=True)
+def export_light_contract_xlsx(
+    req: XlsxExportRequest,
+    _: None = Depends(require_token),
+):
+    # (Decision) Use GCS + signed URL instead of returning bytes.
+    # Why it matters: Dify HTTP nodes handle JSON cleanly; a signed URL gives a reliable “download” UX.
+
+    try:
+        xlsx_bytes = build_xlsx_bytes(req.rows_table_json, sheet_name="Light Contract")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"XLSX build failed: {e}")
+
+    filename = _sanitize_export_filename(req.filename or "light_contract_template.xlsx", "light_contract_template.xlsx")
+    result = _upload_xlsx_and_sign(xlsx_bytes=xlsx_bytes, filename=filename)
+    return {
+        "status": "success",
+        "filename": result["filename"],
+        "object": result["object_path"],
+        "signed_url": result["signed_url"],
+        "expires_minutes": result["expires_in_minutes"],
+    }
+
+
+@app.post("/light-contracts/xlsx")
+def export_structured_light_contract_xlsx(
+    req: LightContractXlsxRequest,
+    _: None = Depends(require_token),
+):
+    if not isinstance(req.grain_worker_output, dict):
+        raise HTTPException(status_code=422, detail="grain_worker_output must be a JSON object")
+
+    try:
+        normalized_payload = _normalize_light_contract_payload(
+            run_id=req.run_id,
+            grain_worker_output=req.grain_worker_output,
+        )
+        xlsx_bytes = build_light_contract_xlsx_bytes(normalized_payload)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Light contract XLSX build failed: {exc}") from exc
+
+    filename = _sanitize_export_filename(req.filename or f"{req.run_id}_light_contract.xlsx", "light_contract.xlsx")
+    result = _upload_xlsx_and_sign(xlsx_bytes=xlsx_bytes, filename=filename)
+    result["run_id"] = req.run_id
+    return result
 
 @app.post("/export/manifest-txt", include_in_schema=False, deprecated=True)
 def export_manifest_txt(body: dict):
@@ -2803,6 +3100,7 @@ ARTIFACT_SPECS: Dict[str, Dict[str, str]] = {
     "A12": {"filename": "table_layout_candidates.json", "content_type": "application/json"},
     "A13": {"filename": "semantic_anchors.json", "content_type": "application/json"},
     "A14": {"filename": "quality_heatmap.json", "content_type": "application/json"},
+    "A16": {"filename": "conditional_missingness.json", "content_type": "application/json"},
     "B1": {"filename": "family_packets.jsonl", "content_type": "application/jsonl"},
 }
 
@@ -2869,6 +3167,14 @@ def _json_default(o: Any) -> Any:
 
 
 import math
+
+SKIP_LOGIC_TARGET_MISSINGNESS_PCT = float(os.getenv("SKIP_LOGIC_TARGET_MISSINGNESS_PCT", "20"))
+SKIP_LOGIC_TRIGGER_MAX_CARD = int(os.getenv("SKIP_LOGIC_TRIGGER_MAX_CARD", "12"))
+SKIP_LOGIC_MIN_SUPPORT_ROWS = int(os.getenv("SKIP_LOGIC_MIN_SUPPORT_ROWS", "5"))
+SKIP_LOGIC_NAME_HINT_RE = re.compile(
+    r"screen|screener|eligible|eligibility|consent|used|ever|skip|branch|gate|filter|routing|logic",
+    re.IGNORECASE,
+)
 
 def _json_sanitize(x: Any) -> Any:
     """
@@ -3175,6 +3481,181 @@ def _build_artifact_view_get_url(
     if limits:
         query["limits"] = ",".join(f"{k}:{v}" for k, v in limits.items())
     return f"{base_url}/artifacts/{artifact_id}?{urlencode(query)}"
+
+
+def _is_skip_logic_trigger_candidate(col: str, s: pd.Series, unique_count: int) -> bool:
+    if unique_count < 2:
+        return False
+    if unique_count <= SKIP_LOGIC_TRIGGER_MAX_CARD:
+        return True
+    return bool(SKIP_LOGIC_NAME_HINT_RE.search(col or ""))
+
+
+def _build_conditional_missingness_artifact(
+    df: pd.DataFrame,
+    cols_profile: Dict[str, Any],
+    column_signal_map: Dict[str, Dict[str, Any]],
+    artifact_inputs: Dict[str, Any],
+) -> Dict[str, Any]:
+    n_rows = int(len(df))
+    min_support_rows = max(SKIP_LOGIC_MIN_SUPPORT_ROWS, int(round(n_rows * 0.01))) if n_rows else SKIP_LOGIC_MIN_SUPPORT_ROWS
+    repeat_candidates = _build_families(list(df.columns))
+    family_by_col: Dict[str, str] = {}
+    for fam in repeat_candidates.get("families", []) or []:
+        fam_id = str(fam.get("family_id") or "")
+        for col in fam.get("columns", []) or []:
+            family_by_col[str(col)] = fam_id
+
+    target_columns: List[str] = []
+    trigger_columns: List[str] = []
+    for col in df.columns:
+        sig = column_signal_map.get(col, {})
+        missing_pct = float(sig.get("missing_pct", cols_profile.get(col, {}).get("missing_pct", 0.0)) or 0.0)
+        unique_count = int(sig.get("unique_count", cols_profile.get(col, {}).get("unique_count", int(df[col].nunique(dropna=True))) or 0))
+
+        if missing_pct > SKIP_LOGIC_TARGET_MISSINGNESS_PCT:
+            target_columns.append(col)
+        if col not in family_by_col and _is_skip_logic_trigger_candidate(col, df[col], unique_count):
+            trigger_columns.append(col)
+
+    grouped_rules: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    candidate_rule_count = 0
+
+    for target_col in target_columns:
+        target_missing = df[target_col].isna()
+        if not bool(target_missing.any()):
+            continue
+
+        for trigger_col in trigger_columns:
+            if trigger_col == target_col:
+                continue
+
+            trigger_series = df[trigger_col]
+            trigger_non_null = trigger_series.dropna()
+            if trigger_non_null.empty:
+                continue
+
+            trigger_missing_rate = float(trigger_series.isna().mean()) if len(trigger_series) else 0.0
+            if trigger_missing_rate >= 0.8:
+                continue
+
+            value_counts = trigger_non_null.astype("string").value_counts(dropna=True)
+            for trigger_value, support in value_counts.items():
+                support_n = int(support)
+                if support_n < min_support_rows:
+                    continue
+
+                candidate_rule_count += 1
+                match_mask = trigger_series.astype("string") == str(trigger_value)
+                if not bool(match_mask.any()):
+                    continue
+
+                if bool(target_missing.loc[match_mask].all()):
+                    rule_key = (trigger_col, str(trigger_value))
+                    if rule_key not in grouped_rules:
+                        grouped_rules[rule_key] = {
+                            "trigger_column": trigger_col,
+                            "trigger_value": str(trigger_value),
+                            "affected_columns": [],
+                            "rule_strength": 1.0,
+                            "interpretation": "Valid structural missingness (Skip Logic).",
+                        }
+                    grouped_rules[rule_key]["affected_columns"].append(target_col)
+
+    detected_skip_logic: List[Dict[str, Any]] = []
+    for rule in grouped_rules.values():
+        affected = sorted(set(rule["affected_columns"]))
+        if not affected:
+            continue
+        affected_family_ids = sorted({family_by_col[c] for c in affected if c in family_by_col})
+        explained_missing_pcts: List[float] = []
+        directionality = "bidirectional"
+        for col in affected:
+            target_missing = df[col].isna()
+            total_missing = int(target_missing.sum())
+            match_mask = df[rule["trigger_column"]].astype("string") == str(rule["trigger_value"])
+            explained_missing = int((target_missing & match_mask).sum())
+            explained_pct = float((explained_missing / total_missing) * 100.0) if total_missing else 0.0
+            explained_missing_pcts.append(explained_pct)
+            if explained_missing != total_missing:
+                directionality = "sufficient_only"
+        detected_skip_logic.append({
+            "trigger_column": rule["trigger_column"],
+            "trigger_value": rule["trigger_value"],
+            "affected_column_count": int(len(affected)),
+            "affected_family_ids": affected_family_ids,
+            "affected_family_count": int(len(affected_family_ids)),
+            "sample_affected_columns": affected[:5],
+            "rule_strength": float(rule["rule_strength"]),
+            "directionality": directionality,
+            "missing_explained_pct": round(min(explained_missing_pcts) if explained_missing_pcts else 0.0, 6),
+            "interpretation": rule["interpretation"],
+        })
+
+    detected_skip_logic.sort(
+        key=lambda item: (-int(item["affected_column_count"]), item["trigger_column"], item["trigger_value"])
+    )
+
+    master_switch_candidates: List[Dict[str, Any]] = []
+    trigger_aggregate: Dict[str, Dict[str, Any]] = {}
+    for rule in grouped_rules.values():
+        trigger_col = str(rule["trigger_column"])
+        agg = trigger_aggregate.setdefault(trigger_col, {
+            "values": [],
+            "columns": set(),
+            "family_ids": set(),
+        })
+        affected = sorted(set(rule["affected_columns"]))
+        agg["values"].append({
+            "trigger_value": str(rule["trigger_value"]),
+            "affected_column_count": len(affected),
+            "sample_affected_columns": affected[:5],
+        })
+        agg["columns"].update(affected)
+        agg["family_ids"].update({family_by_col[c] for c in affected if c in family_by_col})
+
+    for trigger_col, agg in trigger_aggregate.items():
+        explained_columns = sorted(agg["columns"])
+        explained_family_ids = sorted(agg["family_ids"])
+        score = 0.35 + min(0.5, 0.03 * len(explained_columns)) + (0.1 if SKIP_LOGIC_NAME_HINT_RE.search(trigger_col) else 0.0)
+        master_switch_candidates.append({
+            "trigger_column": trigger_col,
+            "explained_column_count": int(len(explained_columns)),
+            "explained_family_count": int(len(explained_family_ids)),
+            "affected_family_ids": explained_family_ids,
+            "top_trigger_values": [
+                item["trigger_value"]
+                for item in sorted(agg["values"], key=lambda x: (-int(x["affected_column_count"]), x["trigger_value"]))[:3]
+            ],
+            "sample_affected_columns": explained_columns[:5],
+            "confidence": round(float(min(0.99, score)), 6),
+            "interpretation": "Likely master screening/gating field for structural missingness.",
+        })
+
+    master_switch_candidates.sort(
+        key=lambda item: (-int(item["explained_column_count"]), -int(item["explained_family_count"]), item["trigger_column"])
+    )
+
+    return {
+        "artifact": "A16",
+        "purpose": "conditional_missingness_skip_logic",
+        "inputs": artifact_inputs["A16"],
+        "detected_skip_logic": detected_skip_logic,
+        "master_switch_candidates": master_switch_candidates,
+        "audit_assumptions": {
+            "family_member_triggers_excluded_from_master_switch_candidates": True,
+        },
+        "audit_trace": {
+            "target_missingness_threshold_pct": float(SKIP_LOGIC_TARGET_MISSINGNESS_PCT),
+            "trigger_max_cardinality": int(SKIP_LOGIC_TRIGGER_MAX_CARD),
+            "min_support_rows": int(min_support_rows),
+            "rows_evaluated": n_rows,
+            "target_columns_scanned": sorted(target_columns),
+            "trigger_columns_scanned": sorted(trigger_columns),
+            "candidate_rule_count_considered": int(candidate_rule_count),
+            "family_member_triggers_excluded": True,
+        },
+    }
 
 
 def _build_artifact_view_post_url(base_url: str, artifact_id: str) -> str:
@@ -3734,6 +4215,7 @@ async def full_bundle(
         "A12": {"uses": ["A5", "A6", "A8", "A9", "A10", "dataset"]},
         "A13": {"uses": ["A2", "dataset", "cols_profile"]},
         "A14": {"uses": ["dataset", "A2", "cols_profile"]},
+        "A16": {"uses": ["dataset", "A4", "cols_profile", "column_signal_map"]},
         "B1": {"uses": ["A8", "A2", "A6", "A11", "A13", "A14"]},
     }
 
@@ -4035,6 +4517,13 @@ async def full_bundle(
             "classification_rules_version": "v2",
         },
     }
+
+    conditional_missingness = _build_conditional_missingness_artifact(
+        df=df,
+        cols_profile=cols_profile,
+        column_signal_map=column_signal_map,
+        artifact_inputs=artifact_inputs,
+    )
 
     key_seed_candidates = []
     excluded_seed_columns = []
@@ -5325,6 +5814,7 @@ async def full_bundle(
         "A12": _json_bytes(table_layout_candidates),
         "A13": _json_bytes(semantic_anchors),
         "A14": _json_bytes(quality_heatmap),
+        "A16": _json_bytes(conditional_missingness),
         "B1": _jsonl_bytes(family_packets),
     }
 
@@ -5532,7 +6022,8 @@ class ArtifactBundleScope(BaseModel):
 
 class ArtifactBundleRequest(BaseModel):
     run_id: str
-    artifact_ids: List[str]
+    mode: str = "raw"
+    artifact_ids: Optional[List[str]] = None
     global_scope: ArtifactBundleScope = Field(default_factory=lambda: ArtifactBundleScope(mode="raw"), alias="global")
     per_artifact: Optional[Dict[str, ArtifactBundleScope]] = None
     policy_overrides: Optional[Dict[str, Dict[str, Any]]] = None
@@ -5549,6 +6040,10 @@ LLM_PRUNING_LEDGER_PATH = os.getenv(
     "LLM_PRUNING_LEDGER_PATH",
     str((Path(__file__).resolve().parent / "llm_pruning_ledger.json")),
 )
+PROFILE_PREFIX = os.getenv("PROFILE_PREFIX", "profiles/")
+PROFILE_SOURCE = os.getenv("PROFILE_SOURCE", "gcs").strip().lower()
+PROFILE_CACHE_TTL = int(os.getenv("PROFILE_CACHE_TTL", "300"))
+LOCAL_PROFILES_DIR = Path(os.getenv("LOCAL_PROFILES_DIR", str(Path(__file__).resolve().parent / "profiles")))
 
 
 def _normalize_path_hint(path_hint: str) -> str:
@@ -5573,8 +6068,7 @@ def _load_pruning_ledger(path: str) -> Dict[str, Any]:
     modes = ledger.get("modes")
     if not isinstance(modes, dict):
         raise RuntimeError("Invalid pruning ledger: modes must be an object")
-    if "llm_baseline" not in modes:
-        raise RuntimeError("Invalid pruning ledger: llm_baseline mode is required")
+    if "llm_baseline" not in modes:        raise RuntimeError("Invalid pruning ledger: llm_baseline mode is required")
     return ledger
 
 
@@ -5621,6 +6115,27 @@ def _adapt_pruning_modes_from_ledger(ledger: Dict[str, Any]) -> Dict[str, Dict[s
                     if as_int >= 0:
                         flattened_limits[f"{artifact_id}.{key}"] = as_int
 
+        normalized_transforms: Dict[str, Dict[str, Any]] = {}
+        if isinstance(artifact_transforms, dict):
+            for artifact_id, raw_ops in artifact_transforms.items():
+                if isinstance(raw_ops, dict):
+                    normalized_transforms[artifact_id] = {
+                        str(k): dict(v) for k, v in raw_ops.items() if isinstance(v, dict)
+                    }
+                    continue
+                ops: Dict[str, Dict[str, Any]] = {}
+                if isinstance(raw_ops, list):
+                    idx = 1
+                    for op in raw_ops:
+                        if not isinstance(op, dict):
+                            continue
+                        op_name = str(op.get("name") or f"op_{idx}")
+                        op_copy = dict(op)
+                        op_copy["name"] = op_name
+                        ops[op_name] = op_copy
+                        idx += 1
+                normalized_transforms[artifact_id] = ops
+
         adapted[mode_name] = {
             "tier1": {
                 "global_drop_keys": list(global_drops),
@@ -5632,7 +6147,7 @@ def _adapt_pruning_modes_from_ledger(ledger: Dict[str, Any]) -> Dict[str, Dict[s
             "tier3": {
                 "limits": flattened_limits,
                 "policies": dict(artifact_policies),
-                "transforms": dict(artifact_transforms),
+                "transforms": normalized_transforms,
             },
         }
     return adapted
@@ -5640,6 +6155,188 @@ def _adapt_pruning_modes_from_ledger(ledger: Dict[str, Any]) -> Dict[str, Dict[s
 
 PRUNING_LEDGER = _load_pruning_ledger(LLM_PRUNING_LEDGER_PATH)
 PRUNING_MODE_LEDGER: Dict[str, Dict[str, Any]] = _adapt_pruning_modes_from_ledger(PRUNING_LEDGER)
+_PROFILE_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _normalize_profile_prefix(prefix: str) -> str:
+    cleaned = (prefix or "profiles/").strip().lstrip("/")
+    if cleaned and not cleaned.endswith("/"):
+        cleaned += "/"
+    return cleaned
+
+
+def _profile_object_path(profile_name: str) -> str:
+    return f"{_normalize_profile_prefix(PROFILE_PREFIX)}{profile_name}.json"
+
+
+def _extract_drop_entries(drop_entries: Any) -> Tuple[List[str], List[Dict[str, Any]]]:
+    drop_keys: List[str] = []
+    drop_rules: List[Dict[str, Any]] = []
+    if not isinstance(drop_entries, list):
+        return drop_keys, drop_rules
+    for entry in drop_entries:
+        if isinstance(entry, str):
+            drop_keys.append(entry)
+        elif isinstance(entry, dict) and entry.get("key"):
+            drop_rules.append(dict(entry))
+    return drop_keys, drop_rules
+
+
+def _normalize_named_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(profile, dict):
+        raise HTTPException(status_code=422, detail="Profile must be a JSON object")
+
+    missing_required = [k for k in ("profile", "artifacts", "pruning") if k not in profile]
+    if missing_required:
+        raise HTTPException(status_code=422, detail=f"Profile missing required keys: {', '.join(missing_required)}")
+
+    profile_name = str(profile.get("profile") or "").strip()
+    artifacts = profile.get("artifacts")
+    pruning = profile.get("pruning")
+    if not profile_name:
+        raise HTTPException(status_code=422, detail="Profile key 'profile' must be a non-empty string")
+    if not isinstance(artifacts, list) or not all(isinstance(a, str) and a for a in artifacts):
+        raise HTTPException(status_code=422, detail="Profile key 'artifacts' must be a list of artifact IDs")
+    if not isinstance(pruning, dict):
+        raise HTTPException(status_code=422, detail="Profile key 'pruning' must be an object")
+
+    artifact_drop_keys: Dict[str, List[str]] = {}
+    artifact_drop_rules: Dict[str, List[Dict[str, Any]]] = {}
+    flattened_limits: Dict[str, int] = {}
+    policies: Dict[str, Dict[str, Any]] = {}
+    transforms: Dict[str, Dict[str, Any]] = {}
+
+    for artifact_id, artifact_cfg in pruning.items():
+        if not isinstance(artifact_cfg, dict):
+            raise HTTPException(status_code=422, detail=f"Profile pruning.{artifact_id} must be an object")
+
+        drop_keys, drop_rules = _extract_drop_entries(artifact_cfg.get("drop") or [])
+        artifact_drop_keys[artifact_id] = drop_keys
+        artifact_drop_rules[artifact_id] = drop_rules
+
+        for key, value in (artifact_cfg.get("limits") or {}).items():
+            try:
+                as_int = int(value)
+            except (ValueError, TypeError):
+                continue
+            if as_int >= 0:
+                flattened_limits[f"{artifact_id}.{key}"] = as_int
+
+        artifact_policies = artifact_cfg.get("policies") or {}
+        if artifact_policies and isinstance(artifact_policies, dict):
+            policies[artifact_id] = dict(artifact_policies)
+
+        artifact_transforms = artifact_cfg.get("transforms") or {}
+        transforms[artifact_id] = _normalize_transform_ops(artifact_transforms)
+
+    return {
+        "profile": profile_name,
+        "description": profile.get("description", ""),
+        "artifacts": artifacts,
+        "mode_config": {
+            "tier1": {
+                "global_drop_keys": [],
+                "global_drop_rules": [],
+            },
+            "tier2": {
+                "artifact_drop_keys": artifact_drop_keys,
+                "artifact_drop_rules": artifact_drop_rules,
+            },
+            "tier3": {
+                "limits": flattened_limits,
+                "policies": policies,
+                "transforms": transforms,
+            },
+        },
+    }
+
+
+def _load_profile_local(profile_name: str) -> Tuple[Dict[str, Any], str]:
+    local_path = LOCAL_PROFILES_DIR / f"{profile_name}.json"
+    if not local_path.exists():
+        raise HTTPException(status_code=404, detail=f"Profile '{profile_name}' not found at {local_path}")
+    try:
+        profile_raw = json.loads(local_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=422, detail=f"Malformed profile JSON at {local_path}: {exc}") from exc
+    return _normalize_named_profile(profile_raw), "local"
+
+
+def _load_profile_gcs(profile_name: str) -> Tuple[Dict[str, Any], str]:
+    bucket_name = os.getenv("EXPORT_BUCKET")
+    object_path = _profile_object_path(profile_name)
+    if not bucket_name:
+        raise HTTPException(status_code=503, detail="EXPORT_BUCKET is not configured for GCS profile loading")
+
+    now = time.time()
+    cached = _PROFILE_CACHE.get(profile_name)
+    if cached and now < cached.get("expires_at", 0):
+        return cached["profile"], "cache_hit"
+
+    try:
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(object_path)
+        if not blob.exists(client):
+            raise HTTPException(
+                status_code=404,
+                detail=f"Profile '{profile_name}' not found at gs://{bucket_name}/{object_path}. Have you uploaded it?",
+            )
+        profile_raw = json.loads(blob.download_as_bytes().decode("utf-8"))
+    except HTTPException:
+        raise
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=422, detail=f"Malformed profile JSON at gs://{bucket_name}/{object_path}: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"GCS unavailable while loading profile '{profile_name}': {exc}") from exc
+
+    normalized = _normalize_named_profile(profile_raw)
+    _PROFILE_CACHE[profile_name] = {
+        "profile": normalized,
+        "expires_at": now + max(1, PROFILE_CACHE_TTL),
+    }
+    return normalized, "cache_miss"
+
+
+def _resolve_mode_config(mode: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    normalized_mode = str(mode or "raw").strip() or "raw"
+    if normalized_mode == "raw":
+        return _resolve_pruning_mode("raw"), {
+            "mode": "raw",
+            "header": "raw; no_pruning",
+            "profile_artifacts": None,
+            "cache": "none",
+            "source": "none",
+        }
+    if normalized_mode == "llm_baseline":
+        return _resolve_pruning_mode("llm_baseline"), {
+            "mode": "llm_baseline",
+            "header": "llm_baseline; source=local_ledger",
+            "profile_artifacts": None,
+            "cache": "none",
+            "source": "local_ledger",
+        }
+
+    use_local = PROFILE_SOURCE == "local" or not os.getenv("EXPORT_BUCKET")
+    if use_local:
+        profile, source = _load_profile_local(normalized_mode)
+        return profile["mode_config"], {
+            "mode": profile["profile"],
+            "header": f"{profile['profile']}; source={source}",
+            "profile_artifacts": profile.get("artifacts") or [],
+            "cache": "n/a",
+            "source": source,
+        }
+
+    profile, cache_state = _load_profile_gcs(normalized_mode)
+    cache_value = "hit" if cache_state == "cache_hit" else "miss"
+    return profile["mode_config"], {
+        "mode": profile["profile"],
+        "header": f"{profile['profile']}; cache={cache_value}",
+        "profile_artifacts": profile.get("artifacts") or [],
+        "cache": cache_value,
+        "source": "gcs",
+    }
 
 _DECODE_CACHE: Dict[Tuple[str, str, str], Tuple[str, Any]] = {}
 _DECODE_CACHE_MAX = int(os.getenv("ARTIFACT_VIEW_CACHE_MAX", "32"))
@@ -6662,8 +7359,9 @@ def apply_llm_pruning(
     debug: bool = False,
     effective_policies: Optional[Dict[str, Any]] = None,
     effective_transforms: Optional[Dict[str, Any]] = None,
+    mode_config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Any, Dict[str, Any]]:
-    mode_config = _resolve_pruning_mode(mode)
+    mode_config = mode_config or _resolve_pruning_mode(mode)
 
     keep_set = set(keep_keys or [])
     tier1_cfg = mode_config.get("tier1", {})
@@ -6671,6 +7369,7 @@ def apply_llm_pruning(
     tier3_cfg = mode_config.get("tier3", {})
 
     drop_rules = list(tier1_cfg.get("global_drop_rules", []) or [])
+    drop_rules.extend(tier2_cfg.get("artifact_drop_rules", {}).get(artifact_id, []) or [])
     guarded_rule_keys = {str(rule.get("key")) for rule in drop_rules if rule.get("key")}
 
     effective_drops = set(tier1_cfg.get("global_drop_keys", []))
@@ -6695,7 +7394,6 @@ def apply_llm_pruning(
         "keep_requested": sorted(list(keep_set)),
         "drop_requested": requested_drop_keys,
     }
-
     resolved_policies = effective_policies or _build_effective_policies(
         base_policies=tier3_cfg.get("policies", {}),
         policy_overrides=policy_overrides,
@@ -6847,6 +7545,115 @@ def _run_pruning_smoke_checks() -> None:
     assert isinstance(first_family.get("family_signature"), dict)
     assert "families" not in pruned_a8
 
+    grain_profile, profile_source = _load_profile_local("grain_worker")
+    assert profile_source == "local"
+    assert grain_profile["profile"] == "grain_worker"
+    assert grain_profile["artifacts"] == ["A5", "A6", "A7", "A8", "A9", "A10"]
+
+    profile_cfg = grain_profile["mode_config"]
+    assert "inputs" in profile_cfg["tier2"]["artifact_drop_keys"]["A5"]
+
+    pruned_a9_profile, _ = apply_llm_pruning(
+        payload=sample_a9,
+        artifact_id="A9",
+        mode="grain_worker",
+        keep_keys=[],
+        drop_keys=[],
+        limits=None,
+        value_filter=None,
+        debug=True,
+        mode_config=profile_cfg,
+    )
+    selected_names_profile = [c.get("column") for c in pruned_a9_profile.get("columns", []) if isinstance(c, dict)]
+    assert "id_a" in selected_names_profile and "id_b" in selected_names_profile
+
+    pruned_a8_profile, _ = apply_llm_pruning(
+        payload=sample_a8,
+        artifact_id="A8",
+        mode="grain_worker",
+        keep_keys=[],
+        drop_keys=[],
+        limits=None,
+        value_filter=None,
+        debug=True,
+        mode_config=profile_cfg,
+    )
+    profile_first_family = (pruned_a8_profile.get("families_index") or [{}])[0]
+    assert isinstance(profile_first_family.get("family_signature"), dict)
+
+    pruned_a6_override, _ = apply_llm_pruning(
+        payload=sample_a6,
+        artifact_id="A6",
+        mode="grain_worker",
+        keep_keys=[],
+        drop_keys=[],
+        limits=None,
+        policy_overrides={"A6.tests_policy": {"k": 1}},
+        value_filter=None,
+        debug=True,
+        mode_config=profile_cfg,
+    )
+    assert len(pruned_a6_override.get("tests", [])) == 1
+
+    try:
+        _load_profile_local("missing_profile")
+        raise AssertionError("Expected missing profile to raise HTTPException")
+    except HTTPException as exc:
+        assert exc.status_code == 404
+
+    mode_cfg_bundle, mode_meta_bundle = _resolve_mode_config("grain_worker")
+    assert mode_meta_bundle["profile_artifacts"] == ["A5", "A6", "A7", "A8", "A9", "A10"]
+    assert mode_cfg_bundle == profile_cfg
+    assert parse_csv_list("A5,A8") == ["A5", "A8"]
+
+    skip_df = pd.DataFrame({
+        "Q1_Screening": ["No", "No", "No", "No", "No", "Yes", "Yes", "Yes", "Yes", "Yes"],
+        "Q2_Freq": [None, None, None, None, None, "Weekly", "Monthly", "Daily", "Rarely", "Weekly"],
+        "Q3_Type": [None, None, None, None, None, "A", "B", "C", "A", "B"],
+        "Noise": [None, "x", None, "y", None, "m", None, "n", None, "p"],
+    })
+    skip_cols_profile = {
+        "Q1_Screening": {"missing_pct": 0.0, "unique_count": 2},
+        "Q2_Freq": {"missing_pct": 50.0, "unique_count": 5},
+        "Q3_Type": {"missing_pct": 50.0, "unique_count": 3},
+        "Noise": {"missing_pct": 50.0, "unique_count": 4},
+    }
+    skip_signal_map = {
+        "Q1_Screening": {"missing_pct": 0.0, "unique_count": 2},
+        "Q2_Freq": {"missing_pct": 50.0, "unique_count": 5},
+        "Q3_Type": {"missing_pct": 50.0, "unique_count": 3},
+        "Noise": {"missing_pct": 50.0, "unique_count": 4},
+    }
+    skip_artifact = _build_conditional_missingness_artifact(
+        df=skip_df,
+        cols_profile=skip_cols_profile,
+        column_signal_map=skip_signal_map,
+        artifact_inputs={"A16": {"uses": ["dataset", "A4", "cols_profile", "column_signal_map"]}},
+    )
+    rules = skip_artifact.get("detected_skip_logic", [])
+    matched = next(
+        (
+            rule for rule in rules
+            if rule.get("trigger_column") == "Q1_Screening" and rule.get("trigger_value") == "No"
+        ),
+        None,
+    )
+    assert matched is not None
+    assert matched.get("affected_column_count") == 2
+    assert sorted(matched.get("sample_affected_columns", [])) == ["Q2_Freq", "Q3_Type"]
+    assert matched.get("rule_strength") == 1.0
+    assert matched.get("directionality") == "bidirectional"
+    assert matched.get("missing_explained_pct") == 100.0
+    master_switches = skip_artifact.get("master_switch_candidates", [])
+    assert master_switches
+    assert master_switches[0].get("trigger_column") == "Q1_Screening"
+    assert master_switches[0].get("explained_column_count") == 2
+    assert skip_artifact.get("audit_assumptions", {}).get("family_member_triggers_excluded_from_master_switch_candidates") is True
+
+    type_transform_profile, type_transform_source = _load_profile_local("type_transform_worker")
+    assert type_transform_source == "local"
+    assert "A16" in type_transform_profile["artifacts"]
+
 
 if os.getenv("RUN_PRUNING_SMOKE_TESTS", "").strip().lower() in {"1", "true", "yes"}:
     _run_pruning_smoke_checks()
@@ -6866,15 +7673,15 @@ def _get_decoded_payload(run_id: str, artifact_id: str) -> Tuple[str, Any, Dict[
     return kind, payload, artifact_meta
 
 
-def _build_view_response(kind: str, payload: Any, report: Dict[str, Any], debug: bool) -> Response:
+def _build_view_response(kind: str, payload: Any, report: Dict[str, Any], debug: bool, profile_header: str) -> Response:
     if kind == "json":
-        headers: Dict[str, str] = {}
+        headers: Dict[str, str] = {"X-Pruning-Profile": profile_header}
         if debug:
             headers["X-Prune-Report"] = json.dumps(report, separators=(",", ":"), default=_json_default)[:4096]
         return JSONResponse(content=payload, headers=headers)
 
     if kind == "jsonl":
-        headers = {}
+        headers = {"X-Pruning-Profile": profile_header}
         if debug:
             headers["X-Prune-Report"] = json.dumps(report, separators=(",", ":"), default=_json_default)[:4096]
         return StreamingResponse(_iter_jsonl_bytes(payload), media_type="application/jsonl", headers=headers)
@@ -6900,6 +7707,9 @@ def artifact_view_get(
     keep_keys = parse_csv_list(keep)
     drop_keys = parse_csv_list(drop)
     limits_map = parse_limits_csv(limits)
+    resolved_mode_cfg, mode_meta = _resolve_mode_config(mode)
+    has_overrides = any([keep_keys, drop_keys, limits_map])
+    profile_header = mode_meta["header"] if not has_overrides else f"{mode_meta['header']}; overrides=keep,drop,limits"
 
     pruned, report = apply_llm_pruning(
         payload=payload,
@@ -6914,14 +7724,15 @@ def artifact_view_get(
         replace_transforms=None,
         value_filter=None,
         debug=debug,
+        mode_config=resolved_mode_cfg,
     )
 
     if debug and kind == "json" and isinstance(pruned, dict):
         with_report = dict(pruned)
         with_report["_prune_report"] = report
-        return JSONResponse(content=with_report)
+        return JSONResponse(content=with_report, headers={"X-Pruning-Profile": profile_header})
 
-    return _build_view_response(kind=kind, payload=pruned, report=report, debug=debug)
+    return _build_view_response(kind=kind, payload=pruned, report=report, debug=debug, profile_header=profile_header)
 
 
 @app.post("/artifacts/{artifact_id}/view")
@@ -6934,7 +7745,19 @@ def artifact_view_post(
     if kind == "other":
         raise HTTPException(status_code=415, detail="Artifact view supports only JSON/JSONL. Use /download for raw bytes.")
 
-    mode_config = _resolve_pruning_mode(req.mode)
+    mode_config, mode_meta = _resolve_mode_config(req.mode)
+    override_parts: List[str] = []
+    if req.policy_overrides:
+        override_parts.append("policy_overrides")
+    if req.transform_overrides:
+        override_parts.append("transform_overrides")
+    if req.keep:
+        override_parts.append("keep")
+    if req.drop:
+        override_parts.append("drop")
+    if req.limits:
+        override_parts.append("limits")
+    profile_header = f"{mode_meta['header']}; overrides={','.join(override_parts) if override_parts else 'none'}"
     bundle_effective_policies = _build_effective_policies(
         base_policies=mode_config.get("tier3", {}).get("policies", {}),
         policy_overrides=req.policy_overrides,
@@ -6963,30 +7786,58 @@ def artifact_view_post(
         value_filter=req.value_filter,
         debug=req.debug,
         effective_transforms=bundle_effective_transforms,
+        mode_config=mode_config,
     )
 
     if req.debug and kind == "json" and isinstance(pruned, dict):
         with_report = dict(pruned)
         with_report["_prune_report"] = report
-        return JSONResponse(content=with_report)
+        return JSONResponse(content=with_report, headers={"X-Pruning-Profile": profile_header})
 
-    return _build_view_response(kind=kind, payload=pruned, report=report, debug=req.debug)
+    return _build_view_response(kind=kind, payload=pruned, report=report, debug=req.debug, profile_header=profile_header)
 
 
-@app.post("/artifact-bundles/view")
-def artifact_bundle_view_post(
+def _artifact_bundle_view(
     req: ArtifactBundleRequest,
-    _=Depends(require_token),
+    response: Response,
 ) -> Dict[str, Any]:
     artifacts_out: Dict[str, Any] = {}
     bundle_report: Dict[str, Any] = {}
 
-    global_scope = req.global_scope or ArtifactBundleScope(mode="raw")
+    global_scope = req.global_scope or ArtifactBundleScope(mode=req.mode or "raw")
+    if req.mode and req.mode != "raw" and (global_scope.mode is None or global_scope.mode == "raw"):
+        global_scope.mode = req.mode
+    if not global_scope.mode:
+        global_scope.mode = req.mode or "raw"
     per_artifact = req.per_artifact or {}
+    profile_mode_cfg: Optional[Dict[str, Any]] = None
+    mode_meta: Optional[Dict[str, Any]] = None
 
-    for artifact_id in req.artifact_ids:
+    if global_scope.mode not in {"raw", "llm_baseline"}:
+        profile_mode_cfg, mode_meta = _resolve_mode_config(global_scope.mode)
+
+    effective_artifact_ids = list(req.artifact_ids or [])
+    if not effective_artifact_ids:
+        if mode_meta and mode_meta.get("profile_artifacts"):
+            effective_artifact_ids = list(mode_meta.get("profile_artifacts") or [])
+        else:
+            raise HTTPException(status_code=422, detail="artifact_ids are required for mode raw or llm_baseline")
+
+    override_parts: List[str] = []
+    if req.policy_overrides:
+        override_parts.append("policy_overrides")
+    if req.transform_overrides:
+        override_parts.append("transform_overrides")
+    if req.artifact_ids:
+        override_parts.append("artifact_ids")
+    profile_header = (mode_meta or {"header": f"{global_scope.mode}; source=request"})["header"]
+    profile_header = f"{profile_header}; overrides={','.join(override_parts) if override_parts else 'none'}"
+    response.headers["X-Pruning-Profile"] = profile_header
+
+    for artifact_id in effective_artifact_ids:
         artifact_scope = per_artifact.get(artifact_id) or ArtifactBundleScope()
         effective_mode = artifact_scope.mode or global_scope.mode or "raw"
+        resolved_mode_cfg, _effective_mode_meta = (profile_mode_cfg, mode_meta) if (profile_mode_cfg is not None and effective_mode == global_scope.mode) else _resolve_mode_config(effective_mode)
         effective_keep = artifact_scope.keep if artifact_scope.keep is not None else global_scope.keep
         effective_drop = artifact_scope.drop if artifact_scope.drop is not None else global_scope.drop
         effective_limits = artifact_scope.limits if artifact_scope.limits is not None else global_scope.limits
@@ -7009,16 +7860,45 @@ def artifact_bundle_view_post(
             replace_transforms=req.replace_transforms,
             value_filter=effective_value_filter,
             debug=req.debug,
+            mode_config=resolved_mode_cfg,
         )
         artifacts_out[artifact_id] = pruned
         if req.debug:
             bundle_report[artifact_id] = report
 
-    response: Dict[str, Any] = {
+    body: Dict[str, Any] = {
         "run_id": req.run_id,
         "mode": global_scope.mode or "raw",
+        "artifact_ids": effective_artifact_ids,
         "artifacts": artifacts_out,
     }
     if req.debug:
-        response["_bundle_prune_report"] = bundle_report
-    return response
+        body["_bundle_prune_report"] = bundle_report
+    return body
+
+
+@app.get("/artifact-bundles")
+def artifact_bundle_view_get(
+    run_id: str,
+    response: Response,
+    mode: str = "raw",
+    artifact_ids: str = "",
+    debug: bool = False,
+    _=Depends(require_token),
+) -> Dict[str, Any]:
+    req = ArtifactBundleRequest(
+        run_id=run_id,
+        mode=mode,
+        artifact_ids=parse_csv_list(artifact_ids) or None,
+        debug=debug,
+    )
+    return _artifact_bundle_view(req=req, response=response)
+
+
+@app.post("/artifact-bundles/view")
+def artifact_bundle_view_post(
+    req: ArtifactBundleRequest,
+    response: Response,
+    _=Depends(require_token),
+) -> Dict[str, Any]:
+    return _artifact_bundle_view(req=req, response=response)

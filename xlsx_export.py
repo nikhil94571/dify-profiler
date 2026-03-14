@@ -1,12 +1,35 @@
 import io
 import json
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Tuple
 
 from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
-from openpyxl.styles import Alignment, Font
 from openpyxl.worksheet.datavalidation import DataValidation
 
+
+HEADER_FILL = PatternFill(fill_type="solid", fgColor="D9EAF7")
+RECOMMENDED_FILL = PatternFill(fill_type="solid", fgColor="F3F6FA")
+EDITABLE_FILL = PatternFill(fill_type="solid", fgColor="FFF4CC")
+
+DEFAULT_OVERRIDE_FIELDS: List[Dict[str, str]] = [
+    {
+        "field": "global_renaming_instructions",
+        "description": "Describe global renaming decisions, including friendlier names for identifiers, dates, question blocks, or child tables.",
+    },
+    {
+        "field": "global_regex_rules",
+        "description": "Provide any regex-style grouping or naming rules that should be applied consistently across the dataset.",
+    },
+    {
+        "field": "missed_family_information",
+        "description": "List repeat or matrix families that were missed, plus any known business labels for their row indices.",
+    },
+    {
+        "field": "free_text_override_instructions",
+        "description": "Capture any downstream structural instructions, such as fields to keep wide, tables to build, or columns that should never be dropped.",
+    },
+]
 
 
 def _normalize_rows(obj: Any) -> Tuple[List[str], List[List[Any]]]:
@@ -25,7 +48,6 @@ def _normalize_rows(obj: Any) -> Tuple[List[str], List[List[Any]]]:
         return cols, [list(r) if isinstance(r, (list, tuple)) else [r] for r in rows]
 
     if isinstance(obj, list) and obj and isinstance(obj[0], dict):
-        # deterministic header order: keys in first row, then any new keys in later rows sorted
         first_keys = list(obj[0].keys())
         extra_keys = sorted({k for r in obj[1:] for k in (r.keys() if isinstance(r, dict) else [])} - set(first_keys))
         headers = [str(k) for k in (first_keys + extra_keys)]
@@ -33,7 +55,6 @@ def _normalize_rows(obj: Any) -> Tuple[List[str], List[List[Any]]]:
         return headers, rows
 
     if isinstance(obj, list) and obj and isinstance(obj[0], list):
-        # header detection
         first = obj[0]
         if all(isinstance(x, str) for x in first):
             headers = [str(x) for x in first]
@@ -43,40 +64,71 @@ def _normalize_rows(obj: Any) -> Tuple[List[str], List[List[Any]]]:
             rows = obj
         return headers, rows
 
-    # empty or unknown
     return [], []
 
-HEADER_FIELDS: Dict[str, str] = {
-    "dataset_notes": (
-        "FREE TEXT (recommended): Describe the dataset and intended structure.\n"
-        "Examples:\n"
-        "- 'Columns 1–12 represent Questions 1–12 of the OCQ scale.'\n"
-        "- 'Each participant has multiple visits; visit columns are labelled Visit1/Visit2.'\n"
-        "- 'These are survey waves; long format should use (participant_id, wave) as keys.'\n"
-    ),
-    "global_override_instructions": (
-        "OPTIONAL FREE TEXT: Any global rename/reshape instruction.\n"
-        "Examples:\n"
-        "- 'Treat baseline/week4/week8 as timepoints.'\n"
-        "- 'Do NOT pivot demographic columns.'\n"
-    ),
-    "group_definitions": (
-        "OPTIONAL: Define families of variables (blocks/scales) in free text.\n"
-        "Examples:\n"
-        "- 'OCQ: Q1–Q12; total in ocq_total'\n"
-        "- 'PHQ9: phq_1..phq_9; total in phq_total'\n"
-    ),
-    "group_regex_rules": (
-        "OPTIONAL (advanced): Provide regex rules for repeated patterns.\n"
-        "Examples:\n"
-        "- 'OCQ_Q(\\d+)' or 'ocq_(\\d+)' or 'Q(\\d+)'\n"
-        "Keep small; the next step will validate/interpret.\n"
-    ),
-}
+
+def _style_header_row(ws, row_idx: int = 1) -> None:
+    for cell in ws[row_idx]:
+        cell.font = Font(bold=True)
+        cell.fill = HEADER_FILL
+        cell.alignment = Alignment(wrap_text=True, vertical="top")
 
 
+def _autosize_columns(ws) -> None:
+    for col_idx in range(1, ws.max_column + 1):
+        letter = get_column_letter(col_idx)
+        max_len = 0
+        for cell in ws[letter]:
+            value = "" if cell.value is None else str(cell.value)
+            if len(value) > max_len:
+                max_len = len(value)
+        ws.column_dimensions[letter].width = min(max(12, max_len + 2), 60)
 
 
+def _style_data_region(ws, recommended_cols: List[str], editable_cols: List[str]) -> None:
+    header_map = {str(ws.cell(row=1, column=idx).value or ""): idx for idx in range(1, ws.max_column + 1)}
+    for col_name in recommended_cols:
+        idx = header_map.get(col_name)
+        if not idx:
+            continue
+        for row in range(2, ws.max_row + 1):
+            ws.cell(row=row, column=idx).fill = RECOMMENDED_FILL
+    for col_name in editable_cols:
+        idx = header_map.get(col_name)
+        if not idx:
+            continue
+        for row in range(2, ws.max_row + 1):
+            ws.cell(row=row, column=idx).fill = EDITABLE_FILL
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+
+def _write_table_sheet(ws, headers: List[str], rows: List[List[Any]], freeze: str = "A2") -> None:
+    ws.append(headers)
+    _style_header_row(ws)
+    for row in rows:
+        ws.append(row)
+    ws.freeze_panes = freeze
+    if headers:
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{max(1, ws.max_row)}"
+    _autosize_columns(ws)
+
+
+def _build_readme_rows() -> List[List[str]]:
+    return [
+        ["section", "details"],
+        ["Workbook purpose", "Use this workbook to review the grain worker's structural recommendations before later specialists continue. The goal is to confirm the base row grain, validate repeat families, and capture any naming or structural overrides."],
+        ["Primary Grain", "The minimal key or key combination that should identify one row in the base table."],
+        ["Candidate Dimension", "A stable grouping or entity that may deserve its own dimension-style table, but is not the primary row grain."],
+        ["Repeat Family", "A group of repeated or matrix-style columns that may need to become a child table instead of staying wide."],
+        ["How to edit", "Do not overwrite recommended columns. Only edit status, your_* columns, and comments on the editable sheets."],
+        ["Status: accept", "Keep the recommendation exactly as shown. You do not need to fill the your_* columns."],
+        ["Status: modify", "Leave the recommended columns untouched and fill the your_* columns with your corrected values."],
+        ["Status: reject", "Reject the recommendation and explain why in comments. A later step will review the rejection."],
+        ["Status: unsure", "Leave comments that explain what is unclear or what extra review is needed."],
+        ["3-step workflow", "1) Review the recommendation sheets. 2) Set status for each row. 3) Fill the your_* fields only when modifying or rejecting."],
+    ]
 
 
 def build_xlsx_bytes(rows_table_json: str, sheet_name: str = "Template") -> bytes:
@@ -84,113 +136,199 @@ def build_xlsx_bytes(rows_table_json: str, sheet_name: str = "Template") -> byte
     headers, rows = _normalize_rows(parsed)
 
     wb = Workbook()
-
-    # -----------------------
-    # Sheet 1: Overrides
-    # -----------------------
-    ws_over = wb.active
-    ws_over.title = "Overrides"
-
-    ws_over.append(["key", "instructions", "your_input"])
-    for c in ws_over[1]:
-        c.font = Font(bold=True)
-
-    start_row = 2
-    for i, (k, help_text) in enumerate(HEADER_FIELDS.items()):
-        r = start_row + i
-        ws_over.cell(row=r, column=1, value=k)
-        ws_over.cell(row=r, column=2, value=help_text).alignment = Alignment(wrap_text=True, vertical="top")
-        ws_over.cell(row=r, column=3, value="").alignment = Alignment(wrap_text=True, vertical="top")
-        ws_over.row_dimensions[r].height = 120  # big free-text space
-
-    ws_over.freeze_panes = "A2"
-    ws_over.column_dimensions["A"].width = 28
-    ws_over.column_dimensions["B"].width = 80
-    ws_over.column_dimensions["C"].width = 60
-
-    # -----------------------
-    # Sheet 2: Contract table
-    # -----------------------
-    ws = wb.create_sheet(title=(sheet_name[:31] if sheet_name else "Template"))
-
+    ws = wb.active
+    ws.title = (sheet_name[:31] if sheet_name else "Template")
     if headers:
-        # Header row (Row 1)
-        ws.append(headers)
-        for cell in ws[1]:
-            cell.font = Font(bold=True)  # (E) header styling
-            cell.alignment = Alignment(wrap_text=True, vertical="top")
-
-        # Field guide row:
-        # Only add our generic guide if the incoming data does NOT already include a FIELD GUIDE row.
-        incoming_has_guide = False
-        if rows:
-            first_row = list(rows[0]) if isinstance(rows[0], (list, tuple)) else [rows[0]]
-            if first_row and isinstance(first_row[0], str) and first_row[0].strip().upper().startswith("FIELD GUIDE"):
-                incoming_has_guide = True
-
-        if not incoming_has_guide:
-            guide = ["FIELD GUIDE (row 2): fill rows 3+; use dropdowns where present; keep values consistent."]
-            if len(headers) > 1:
-                guide += [""] * (len(headers) - 1)
-            ws.append(guide)
-            ws[2][0].alignment = Alignment(wrap_text=True, vertical="top")
-
-        # Freeze header + the (real) guide row
-        ws.freeze_panes = "A3"
-
-        # (C) Autofilter on header row
-        ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}1"
-    else:
-        # No headers -> just dump rows; no formatting/filters
-        ws.freeze_panes = None
-
-    # (A) Remove pandas index artifact rows if we can detect them
-    if headers and "original_column" in headers:
-        oc_idx = headers.index("original_column")
-        filtered_rows = []
-        for r in rows:
-            rr = list(r) if isinstance(r, (list, tuple)) else [r]
-            oc_val = "" if oc_idx >= len(rr) else str(rr[oc_idx]).strip()
-            if oc_val == "Unnamed: 0" or oc_val.startswith("Unnamed:"):
-                continue
-            filtered_rows.append(rr)
-        rows = filtered_rows
-
-    # Write data starting row 3 (after header + guide)
-    for r in rows:
-        ws.append(list(r) if isinstance(r, (list, tuple)) else [r])
-
-    # (D) Dropdown validation for boolean-ish fields + include
-    if headers:
-        col_letter = {h: get_column_letter(i + 1) for i, h in enumerate(headers)}
-        last_row = max(ws.max_row, 3)
-
-        bool_fields = ["is_primary_id", "is_time", "reshape_exclude", "is_multi_select"]
-        if any(f in col_letter for f in bool_fields):
-            dv_bool = DataValidation(type="list", formula1='"TRUE,FALSE"', allow_blank=True)
-            ws.add_data_validation(dv_bool)
-            for f in bool_fields:
-                if f in col_letter:
-                    L = col_letter[f]
-                    dv_bool.add(f"{L}3:{L}{last_row}")
-
-        if "include" in col_letter:
-            dv_yesno = DataValidation(type="list", formula1='"yes,no"', allow_blank=True)
-            ws.add_data_validation(dv_yesno)
-            L = col_letter["include"]
-            dv_yesno.add(f"{L}3:{L}{last_row}")
-
-    # light autosize (cap width to avoid silly columns)
-    for col_idx in range(1, ws.max_column + 1):
-        letter = get_column_letter(col_idx)
-        max_len = 0
-        for cell in ws[letter]:
-            v = "" if cell.value is None else str(cell.value)
-            if len(v) > max_len:
-                max_len = len(v)
-        ws.column_dimensions[letter].width = min(max(10, max_len + 2), 60)
+        _write_table_sheet(ws, headers, rows)
 
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
 
+
+def build_light_contract_xlsx_bytes(contract: Dict[str, Any]) -> bytes:
+    wb = Workbook()
+
+    # Sheet 1: Read Me
+    ws = wb.active
+    ws.title = "Read Me"
+    readme_rows = _build_readme_rows()
+    ws.append(readme_rows[0])
+    _style_header_row(ws)
+    for row in readme_rows[1:]:
+        ws.append(row)
+    ws.freeze_panes = "A2"
+    ws.column_dimensions["A"].width = 24
+    ws.column_dimensions["B"].width = 120
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+    # Sheet 2: Column Guide
+    ws_cols = wb.create_sheet(title="Column Guide")
+    column_headers = ["column_index", "column_name", "family_id", "notes"]
+    column_rows = [
+        [
+            row.get("column_index", ""),
+            row.get("column_name", ""),
+            row.get("family_id", ""),
+            row.get("notes", ""),
+        ]
+        for row in contract.get("column_guide_rows", [])
+    ]
+    _write_table_sheet(ws_cols, column_headers, column_rows)
+
+    # Sheet 3: Grain Summary
+    ws_summary = wb.create_sheet(title="Grain Summary")
+    summary_headers = ["topic", "recommendation", "why", "needs_review"]
+    summary_rows = [
+        [
+            row.get("topic", ""),
+            row.get("recommendation", ""),
+            row.get("why", ""),
+            row.get("needs_review", ""),
+        ]
+        for row in contract.get("grain_summary_rows", [])
+    ]
+    _write_table_sheet(ws_summary, summary_headers, summary_rows)
+
+    # Sheet 4: Primary Grain
+    ws_grain = wb.create_sheet(title="Primary Grain")
+    grain_headers = [
+        "item",
+        "recommended_key_1",
+        "recommended_key_2",
+        "recommended_key_3",
+        "your_key_1",
+        "your_key_2",
+        "your_key_3",
+        "status",
+        "comments",
+    ]
+    grain_rows = [
+        [
+            row.get("item", ""),
+            row.get("recommended_key_1", ""),
+            row.get("recommended_key_2", ""),
+            row.get("recommended_key_3", ""),
+            row.get("your_key_1", ""),
+            row.get("your_key_2", ""),
+            row.get("your_key_3", ""),
+            row.get("status", ""),
+            row.get("comments", ""),
+        ]
+        for row in contract.get("primary_grain_rows", [])
+    ]
+    _write_table_sheet(ws_grain, grain_headers, grain_rows)
+    _style_data_region(
+        ws_grain,
+        recommended_cols=["recommended_key_1", "recommended_key_2", "recommended_key_3"],
+        editable_cols=["your_key_1", "your_key_2", "your_key_3", "status", "comments"],
+    )
+
+    # Sheet 5: Dimension Tables
+    ws_dim = wb.create_sheet(title="Dimension Tables")
+    dim_headers = [
+        "table_name",
+        "recommended_key_1",
+        "recommended_key_2",
+        "recommended_key_3",
+        "your_key_1",
+        "your_key_2",
+        "your_key_3",
+        "relationship_to_primary",
+        "status",
+        "comments",
+    ]
+    dim_rows = [
+        [
+            row.get("table_name", ""),
+            row.get("recommended_key_1", ""),
+            row.get("recommended_key_2", ""),
+            row.get("recommended_key_3", ""),
+            row.get("your_key_1", ""),
+            row.get("your_key_2", ""),
+            row.get("your_key_3", ""),
+            row.get("relationship_to_primary", ""),
+            row.get("status", ""),
+            row.get("comments", ""),
+        ]
+        for row in contract.get("dimension_rows", [])
+    ]
+    _write_table_sheet(ws_dim, dim_headers, dim_rows)
+    _style_data_region(
+        ws_dim,
+        recommended_cols=["recommended_key_1", "recommended_key_2", "recommended_key_3", "relationship_to_primary"],
+        editable_cols=["your_key_1", "your_key_2", "your_key_3", "status", "comments"],
+    )
+
+    # Sheet 6: Repeat Families
+    ws_fam = wb.create_sheet(title="Repeat Families")
+    fam_headers = [
+        "family_id",
+        "recommended_table_name",
+        "your_table_name",
+        "recommended_repeat_index_name",
+        "your_repeat_index_name",
+        "recommended_parent_key",
+        "your_parent_key",
+        "status",
+        "comments",
+    ]
+    fam_rows = [
+        [
+            row.get("family_id", ""),
+            row.get("recommended_table_name", ""),
+            row.get("your_table_name", ""),
+            row.get("recommended_repeat_index_name", ""),
+            row.get("your_repeat_index_name", ""),
+            row.get("recommended_parent_key", ""),
+            row.get("your_parent_key", ""),
+            row.get("status", ""),
+            row.get("comments", ""),
+        ]
+        for row in contract.get("repeat_family_rows", [])
+    ]
+    _write_table_sheet(ws_fam, fam_headers, fam_rows)
+    _style_data_region(
+        ws_fam,
+        recommended_cols=["recommended_table_name", "recommended_repeat_index_name", "recommended_parent_key"],
+        editable_cols=["your_table_name", "your_repeat_index_name", "your_parent_key", "status", "comments"],
+    )
+
+    # Sheet 7: Overrides
+    ws_over = wb.create_sheet(title="Overrides")
+    override_headers = ["field", "description", "user_input"]
+    override_rows = [
+        [
+            row.get("field", ""),
+            row.get("description", ""),
+            row.get("user_input", ""),
+        ]
+        for row in contract.get("override_rows", [])
+    ]
+    _write_table_sheet(ws_over, override_headers, override_rows)
+    _style_data_region(ws_over, recommended_cols=["field", "description"], editable_cols=["user_input"])
+
+    grain_status = DataValidation(type="list", formula1='"accept,modify,reject,unsure"', allow_blank=True)
+    ws_grain.add_data_validation(grain_status)
+    grain_status.add(f"H2:H{max(2, ws_grain.max_row)}")
+
+    dim_status = DataValidation(type="list", formula1='"accept,modify,reject,unsure"', allow_blank=True)
+    ws_dim.add_data_validation(dim_status)
+    dim_status.add(f"I2:I{max(2, ws_dim.max_row)}")
+
+    fam_status = DataValidation(
+        type="list",
+        formula1='"accept_as_child_table,modify,keep_wide,merge_with_other_family,unsure"',
+        allow_blank=True,
+    )
+    ws_fam.add_data_validation(fam_status)
+    fam_status.add(f"H2:H{max(2, ws_fam.max_row)}")
+
+    for sheet in wb.worksheets:
+        _autosize_columns(sheet)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()

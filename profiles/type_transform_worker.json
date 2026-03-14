@@ -1,0 +1,56 @@
+{
+  "profile": "type_transform_worker",
+  "description": "Pruning profile optimized for the post-grain type and transform specialist. Includes typing queues, missingness evidence, semantic anchors, drift evidence, and conditional missingness proofs.",
+  "artifacts": ["A2", "A3-T", "A3-V", "A4", "A13", "A14", "A16"],
+  "pruning": {
+    "A2": {
+      "drop": [
+        "artifact_inputs",
+        "profiler_samples",
+        "a2_samples",
+        "numeric_profile",
+        "datetime_profile"
+      ]
+    },
+    "A3-T": {
+      "drop": [
+        "inputs",
+        "evidence_snippets"
+      ],
+      "limits": {
+        "items": 60
+      }
+    },
+    "A3-V": {
+      "drop": [
+        "inputs"
+      ],
+      "limits": {
+        "items": 60
+      }
+    },
+    "A4": {
+      "drop": [
+        "inputs"
+      ]
+    },
+    "A13": {
+      "drop": [
+        "inputs"
+      ]
+    },
+    "A14": {
+      "drop": [
+        "inputs"
+      ],
+      "limits": {
+        "columns": 120
+      }
+    },
+    "A16": {
+      "drop": [
+        "inputs"
+      ]
+    }
+  }
+}
