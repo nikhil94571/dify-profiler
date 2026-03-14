@@ -1,0 +1,20 @@
+# Keep Cloud Run source deploys focused on production runtime files.
+.git
+.gitignore
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+Outputs/
+Patch/
+profiles/
+sa-key.json
+*-key.json
+*_key.json
+*.pem
+*.p12
+*.pfx
+*.log
+.DS_Store
+Thumbs.db

@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 import io
 import os
 import hashlib
@@ -7,23 +7,26 @@ import json
 import uuid
 import logging
 import re
+import copy
+from pathlib import Path
 from collections import defaultdict, deque, Counter
 from itertools import combinations
 from datetime import timedelta
 from uuid import uuid4
+from urllib.parse import urlencode
 from manifest_export import upload_and_sign_text
 
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from google.cloud import storage
 import google.auth
 from google.auth import impersonated_credentials
 
 
-from xlsx_export import build_xlsx_bytes
+from xlsx_export import build_light_contract_xlsx_bytes, build_xlsx_bytes
 
 
 try:
@@ -165,7 +168,7 @@ async def request_logging(request: Request, call_next):
 
 @app.middleware("http")
 async def limit_upload_size(request: Request, call_next):
-    if request.url.path in ("/profile", "/profile_summary", "/profile_column_detail", "/evidence_associations", "/export/light-contract-xlsx", "/full-bundle") and request.method.upper() == "POST":
+    if request.url.path in ("/profile", "/profile_summary", "/profile_column_detail", "/evidence_associations", "/export/light-contract-xlsx", "/light-contracts/xlsx", "/full-bundle") and request.method.upper() == "POST":
         cl = request.headers.get("content-length")
         if cl is not None:
             try:
@@ -178,7 +181,7 @@ async def limit_upload_size(request: Request, call_next):
 
 @app.middleware("http")
 async def basic_rate_limit(request: Request, call_next):
-    if request.url.path in ("/profile", "/profile_summary", "/profile_column_detail", "/evidence_associations", "/export/light-contract-xlsx", "/full-bundle") and request.method.upper() == "POST":
+    if request.url.path in ("/profile", "/profile_summary", "/profile_column_detail", "/evidence_associations", "/export/light-contract-xlsx", "/light-contracts/xlsx", "/full-bundle") and request.method.upper() == "POST":
         ip = _client_ip(request)
         now = time.time()
         q = _req_times[ip]
@@ -1708,7 +1711,7 @@ async def _run_full_profile(
 # -----------------------------
 # Main endpoint (unchanged external behavior)
 # -----------------------------
-@app.post("/profile")
+@app.post("/profile", include_in_schema=False, deprecated=True)
 async def profile(
     request: Request,
     file: UploadFile = File(...),
@@ -1727,7 +1730,7 @@ async def profile(
 # -----------------------------
 # Dify-safe: shallow summary
 # -----------------------------
-@app.post("/profile_summary")
+@app.post("/profile_summary", include_in_schema=False, deprecated=True)
 async def profile_summary(
     request: Request,
     file: UploadFile = File(...),
@@ -1807,7 +1810,7 @@ async def profile_summary(
 # -----------------------------
 # Dify-safe: one column detail (returned as JSON string)
 # -----------------------------
-@app.post("/profile_column_detail")
+@app.post("/profile_column_detail", include_in_schema=False, deprecated=True)
 async def profile_column_detail(
     request: Request,
     file: UploadFile = File(...),
@@ -1953,7 +1956,7 @@ def _add_signal(out: List[Dict[str, Any]], *, kind: str, columns: List[str], sco
         "evidence_json": _safe_json(evidence),
     })
 
-@app.post("/evidence_associations")
+@app.post("/evidence_associations", include_in_schema=False, deprecated=True)
 async def evidence_associations(
     request: Request,
     file: UploadFile = File(...),
@@ -2670,36 +2673,26 @@ class XlsxExportRequest(BaseModel):
     filename: str | None = None
 
 
-@app.post("/export/light-contract-xlsx")
-def export_light_contract_xlsx(
-    req: XlsxExportRequest,
-    _: None = Depends(require_token),
-):
-    # (Decision) Use GCS + signed URL instead of returning bytes.
-    # Why it matters: Dify HTTP nodes handle JSON cleanly; a signed URL gives a reliable “download” UX.
+class LightContractXlsxRequest(BaseModel):
+    run_id: str
+    grain_worker_output: Dict[str, Any]
+    filename: str | None = None
 
-    try:
-        xlsx_bytes = build_xlsx_bytes(req.rows_table_json, sheet_name="Light Contract")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"XLSX build failed: {e}")
 
-    def _sanitize_filename(name: str) -> str:
-        name = (name or "").strip().replace("\n", "").replace("\r", "")
-        name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
-        if not name.lower().endswith(".xlsx"):
-            name += ".xlsx"
-        return name or "light_contract_template.xlsx"
+def _sanitize_export_filename(name: str, default_name: str) -> str:
+    name = (name or "").strip().replace("\n", "").replace("\r", "")
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+    if not name.lower().endswith(".xlsx"):
+        name += ".xlsx"
+    return name or default_name
 
-    filename = _sanitize_filename(req.filename or "light_contract_template.xlsx")
 
+def _upload_xlsx_and_sign(xlsx_bytes: bytes, filename: str) -> Dict[str, Any]:
     bucket_name = os.getenv("EXPORT_BUCKET")
     if not bucket_name:
         raise HTTPException(status_code=500, detail="Missing EXPORT_BUCKET env var")
 
     ttl_minutes = int(os.getenv("EXPORT_SIGNED_URL_TTL_MINUTES", "30"))
-
-    # (Decision) Unique object name per request.
-    # Why it matters: avoids collisions and makes requests idempotent-ish for debugging.
     object_name = f"exports/{uuid4().hex}_{filename}"
 
     try:
@@ -2712,14 +2705,11 @@ def export_light_contract_xlsx(
             content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-        # (Decision) Signed URL for temporary access using IAM SignBlob (Cloud Run-safe).
-        # Why it matters: Cloud Run default credentials are token-only and cannot sign V4 URLs directly.
         signing_sa = os.getenv("SIGNING_SA_EMAIL")
         if not signing_sa:
             raise HTTPException(status_code=500, detail="Missing SIGNING_SA_EMAIL env var")
 
         source_creds, _ = google.auth.default()
-
         signing_creds = impersonated_credentials.Credentials(
             source_credentials=source_creds,
             target_principal=signing_sa,
@@ -2735,22 +2725,332 @@ def export_light_contract_xlsx(
             response_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             credentials=signing_creds,
         )
-
-
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"GCS upload/sign failed: {e}")
+        raise HTTPException(status_code=500, detail=f"GCS upload/sign failed: {e}") from e
 
     return {
-        "status": "success",
+        "status": "ok",
         "filename": filename,
-        "object": object_name,
+        "content_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "bucket": bucket_name,
+        "object_path": object_name,
         "signed_url": signed_url,
-        "expires_minutes": ttl_minutes,
+        "expires_in_minutes": ttl_minutes,
     }
 
-from fastapi import HTTPException
 
-@app.post("/export/manifest-txt")
+def _first_non_empty(items: List[Any]) -> str:
+    for item in items:
+        if item is None:
+            continue
+        text = str(item).strip()
+        if text:
+            return text
+    return ""
+
+
+def _coerce_list_of_dicts(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _as_key_triplet(keys: Any) -> List[str]:
+    if not isinstance(keys, list):
+        return ["", "", ""]
+    cleaned = [str(k).strip() for k in keys if str(k).strip()]
+    return (cleaned + ["", "", ""])[:3]
+
+
+def _keys_to_label(keys: Any) -> str:
+    parts = [str(k).strip() for k in (keys or []) if str(k).strip()]
+    return " + ".join(parts)
+
+
+def _load_run_manifest(run_id: str) -> Dict[str, Any]:
+    bucket_name = os.getenv("EXPORT_BUCKET")
+    if not bucket_name:
+        raise HTTPException(status_code=500, detail="Missing EXPORT_BUCKET env var")
+    try:
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(f"runs/{run_id}/manifest.json")
+        if not blob.exists(client):
+            raise HTTPException(status_code=404, detail="run_id not found")
+        return json.loads(blob.download_as_bytes().decode("utf-8"))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Unable to load run manifest: {exc}") from exc
+
+
+def _column_order_from_manifest_and_a2(run_id: str) -> List[str]:
+    manifest = _load_run_manifest(run_id)
+    evidence_fields = ((manifest.get("evidence_primitives") or {}).get("fields") or [])
+    try:
+        kind, a2_payload, _ = _get_decoded_payload(run_id=run_id, artifact_id="A2")
+    except HTTPException:
+        kind, a2_payload = "other", None
+    columns: List[str] = []
+    if kind == "jsonl" and isinstance(a2_payload, list):
+        for row in a2_payload:
+            if isinstance(row, dict):
+                col = str(row.get("column") or "").strip()
+                if col:
+                    columns.append(col)
+    if columns:
+        return columns
+    manifest_cols = (((manifest.get("profiling_limits") or {}).get("column_names")) or [])
+    if isinstance(manifest_cols, list):
+        return [str(col).strip() for col in manifest_cols if str(col).strip()]
+    return [str(col).strip() for col in evidence_fields if str(col).strip()]
+
+
+def _family_column_map(run_id: str) -> Dict[str, str]:
+    try:
+        kind, a8_payload, _ = _get_decoded_payload(run_id=run_id, artifact_id="A8")
+    except HTTPException:
+        return {}
+    if kind != "json" or not isinstance(a8_payload, dict):
+        return {}
+    mapping: Dict[str, str] = {}
+    for family in _coerce_list_of_dicts(a8_payload.get("families")):
+        family_id = str(family.get("family_id") or "").strip()
+        if not family_id:
+            continue
+        for col in family.get("columns", []) or []:
+            col_name = str(col).strip()
+            if col_name and col_name not in mapping:
+                mapping[col_name] = family_id
+    return mapping
+
+
+def _build_grain_summary_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    primary = grain_worker_output.get("recommended_primary_grain") or {}
+    if isinstance(primary, dict):
+        rows.append({
+            "topic": "Primary grain",
+            "recommendation": _keys_to_label(primary.get("keys")) or str(primary.get("description") or ""),
+            "why": str(primary.get("justification") or primary.get("description") or ""),
+            "needs_review": "yes",
+        })
+
+    diagnostics = grain_worker_output.get("diagnostics") or {}
+    if isinstance(diagnostics, dict):
+        rows.append({
+            "topic": "Encoding pattern",
+            "recommendation": str(diagnostics.get("encoding_hint") or "unknown"),
+            "why": str(diagnostics.get("recommended_next_action") or ""),
+            "needs_review": "yes" if str(diagnostics.get("encoding_hint") or "") == "unknown" else "no",
+        })
+        rejected = _coerce_list_of_dicts(diagnostics.get("rejected_primary_candidates"))
+        for candidate in rejected[:3]:
+            rows.append({
+                "topic": "Rejected primary candidate",
+                "recommendation": _keys_to_label(candidate.get("keys")),
+                "why": str(candidate.get("reason") or ""),
+                "needs_review": "no",
+            })
+
+    for dim in _coerce_list_of_dicts(grain_worker_output.get("candidate_dimension_tables"))[:3]:
+        rows.append({
+            "topic": "Candidate dimension",
+            "recommendation": _first_non_empty([dim.get("suggested_table_name"), _keys_to_label(dim.get("keys"))]),
+            "why": str(dim.get("justification") or dim.get("entity_description") or ""),
+            "needs_review": "yes",
+        })
+
+    family_candidates = _coerce_list_of_dicts(grain_worker_output.get("family_review_candidates"))
+    if family_candidates:
+        rows.append({
+            "topic": "Repeat family overview",
+            "recommendation": f"{len(family_candidates)} family candidates detected",
+            "why": "Review the Repeat Families sheet to confirm child-table handling, parent keys, and repeat index naming.",
+            "needs_review": "yes",
+        })
+
+    assumptions = _coerce_list_of_dicts(grain_worker_output.get("assumptions"))
+    for assumption in assumptions[:3]:
+        rows.append({
+            "topic": "Assumption requiring validation",
+            "recommendation": str(assumption.get("assumption") or ""),
+            "why": str(assumption.get("explanation") or ""),
+            "needs_review": "yes" if assumption.get("needs_user_validation") else "no",
+        })
+    return rows
+
+
+def _build_primary_grain_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[str, Any]]:
+    primary = grain_worker_output.get("recommended_primary_grain") or {}
+    primary_keys = _as_key_triplet((primary.get("keys") or []) if isinstance(primary, dict) else [])
+    rows = [{
+        "item": "primary_grain",
+        "recommended_key_1": primary_keys[0],
+        "recommended_key_2": primary_keys[1],
+        "recommended_key_3": primary_keys[2],
+        "your_key_1": "",
+        "your_key_2": "",
+        "your_key_3": "",
+        "status": "accept",
+        "comments": str(primary.get("description") or ""),
+    }]
+
+    diagnostics = grain_worker_output.get("diagnostics") or {}
+    rejected = _coerce_list_of_dicts((diagnostics or {}).get("rejected_primary_candidates"))
+    index_candidate = next(
+        (candidate for candidate in rejected if any("unnamed" in str(k).lower() for k in candidate.get("keys", []) or [])),
+        None,
+    )
+    if index_candidate:
+        rows.append({
+            "item": "export_index_policy",
+            "recommended_key_1": "",
+            "recommended_key_2": "",
+            "recommended_key_3": "",
+            "your_key_1": "",
+            "your_key_2": "",
+            "your_key_3": "",
+            "status": "accept",
+            "comments": str(index_candidate.get("reason") or "Review whether any export index should be dropped, kept, or renamed."),
+        })
+    return rows
+
+
+def _build_dimension_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for dim in _coerce_list_of_dicts(grain_worker_output.get("candidate_dimension_tables")):
+        keys = _as_key_triplet(dim.get("keys") or [])
+        rows.append({
+            "table_name": _first_non_empty([dim.get("suggested_table_name"), _keys_to_label(dim.get("keys"))]),
+            "recommended_key_1": keys[0],
+            "recommended_key_2": keys[1],
+            "recommended_key_3": keys[2],
+            "your_key_1": "",
+            "your_key_2": "",
+            "your_key_3": "",
+            "relationship_to_primary": str(dim.get("relationship_to_primary") or ""),
+            "status": "unsure" if "review" in str(dim.get("justification") or "").lower() else "accept",
+            "comments": str(dim.get("justification") or dim.get("entity_description") or ""),
+        })
+    return rows
+
+
+def _build_repeat_family_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[str, Any]]:
+    primary = grain_worker_output.get("recommended_primary_grain") or {}
+    primary_label = _keys_to_label((primary.get("keys") or []) if isinstance(primary, dict) else [])
+    rows: List[Dict[str, Any]] = []
+    for family in _coerce_list_of_dicts(grain_worker_output.get("family_review_candidates")):
+        rows.append({
+            "family_id": str(family.get("family_id") or ""),
+            "recommended_table_name": str(family.get("suggested_table_name") or ""),
+            "your_table_name": "",
+            "recommended_repeat_index_name": str(family.get("repeat_index_name") or ""),
+            "your_repeat_index_name": "",
+            "recommended_parent_key": primary_label,
+            "your_parent_key": "",
+            "status": "accept_as_child_table" if str(family.get("status") or "") == "confirm_detected" else "unsure",
+            "comments": str(family.get("why_review") or ""),
+        })
+    return rows
+
+
+def _build_override_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[str, Any]]:
+    input_descriptors = grain_worker_output.get("user_inputs_requested") or {}
+    rows: List[Dict[str, Any]] = []
+    for default in (
+        {"field": "global_renaming_instructions", "description": "Describe global renaming decisions, including friendlier names for identifiers, dates, question blocks, or child tables."},
+        {"field": "global_regex_rules", "description": "Provide any regex-style grouping or naming rules that should be applied consistently across the dataset."},
+        {"field": "missed_family_information", "description": "List repeat or matrix families that were missed, plus any known business labels for their row indices."},
+        {"field": "free_text_override_instructions", "description": "Capture any downstream structural instructions, such as fields to keep wide, tables to build, or columns that should never be dropped."},
+    ):
+        descriptor = input_descriptors.get(default["field"]) if isinstance(input_descriptors, dict) else None
+        purpose = ""
+        if isinstance(descriptor, dict):
+            purpose = str(descriptor.get("purpose") or "").strip()
+        desc = default["description"] + (f" Purpose: {purpose}." if purpose else "")
+        rows.append({
+            "field": default["field"],
+            "description": desc,
+            "user_input": "",
+        })
+    return rows
+
+
+def _normalize_light_contract_payload(run_id: str, grain_worker_output: Dict[str, Any]) -> Dict[str, Any]:
+    column_order = _column_order_from_manifest_and_a2(run_id)
+    family_map = _family_column_map(run_id)
+    column_guide_rows = [
+        {
+            "column_index": idx + 1,
+            "column_name": col,
+            "family_id": family_map.get(col, ""),
+            "notes": "",
+        }
+        for idx, col in enumerate(column_order)
+    ]
+    return {
+        "readme_rows": [],
+        "column_guide_rows": column_guide_rows,
+        "grain_summary_rows": _build_grain_summary_rows(grain_worker_output),
+        "primary_grain_rows": _build_primary_grain_rows(grain_worker_output),
+        "dimension_rows": _build_dimension_rows(grain_worker_output),
+        "repeat_family_rows": _build_repeat_family_rows(grain_worker_output),
+        "override_rows": _build_override_rows(grain_worker_output),
+    }
+
+
+@app.post("/export/light-contract-xlsx", include_in_schema=False, deprecated=True)
+def export_light_contract_xlsx(
+    req: XlsxExportRequest,
+    _: None = Depends(require_token),
+):
+    # (Decision) Use GCS + signed URL instead of returning bytes.
+    # Why it matters: Dify HTTP nodes handle JSON cleanly; a signed URL gives a reliable “download” UX.
+
+    try:
+        xlsx_bytes = build_xlsx_bytes(req.rows_table_json, sheet_name="Light Contract")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"XLSX build failed: {e}")
+
+    filename = _sanitize_export_filename(req.filename or "light_contract_template.xlsx", "light_contract_template.xlsx")
+    result = _upload_xlsx_and_sign(xlsx_bytes=xlsx_bytes, filename=filename)
+    return {
+        "status": "success",
+        "filename": result["filename"],
+        "object": result["object_path"],
+        "signed_url": result["signed_url"],
+        "expires_minutes": result["expires_in_minutes"],
+    }
+
+
+@app.post("/light-contracts/xlsx")
+def export_structured_light_contract_xlsx(
+    req: LightContractXlsxRequest,
+    _: None = Depends(require_token),
+):
+    if not isinstance(req.grain_worker_output, dict):
+        raise HTTPException(status_code=422, detail="grain_worker_output must be a JSON object")
+
+    try:
+        normalized_payload = _normalize_light_contract_payload(
+            run_id=req.run_id,
+            grain_worker_output=req.grain_worker_output,
+        )
+        xlsx_bytes = build_light_contract_xlsx_bytes(normalized_payload)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Light contract XLSX build failed: {exc}") from exc
+
+    filename = _sanitize_export_filename(req.filename or f"{req.run_id}_light_contract.xlsx", "light_contract.xlsx")
+    result = _upload_xlsx_and_sign(xlsx_bytes=xlsx_bytes, filename=filename)
+    result["run_id"] = req.run_id
+    return result
+
+@app.post("/export/manifest-txt", include_in_schema=False, deprecated=True)
 def export_manifest_txt(body: dict):
     run_id = body.get("run_id")
     manifest_text = body.get("manifest_text")
@@ -2800,6 +3100,7 @@ ARTIFACT_SPECS: Dict[str, Dict[str, str]] = {
     "A12": {"filename": "table_layout_candidates.json", "content_type": "application/json"},
     "A13": {"filename": "semantic_anchors.json", "content_type": "application/json"},
     "A14": {"filename": "quality_heatmap.json", "content_type": "application/json"},
+    "A16": {"filename": "conditional_missingness.json", "content_type": "application/json"},
     "B1": {"filename": "family_packets.jsonl", "content_type": "application/jsonl"},
 }
 
@@ -2866,6 +3167,14 @@ def _json_default(o: Any) -> Any:
 
 
 import math
+
+SKIP_LOGIC_TARGET_MISSINGNESS_PCT = float(os.getenv("SKIP_LOGIC_TARGET_MISSINGNESS_PCT", "20"))
+SKIP_LOGIC_TRIGGER_MAX_CARD = int(os.getenv("SKIP_LOGIC_TRIGGER_MAX_CARD", "12"))
+SKIP_LOGIC_MIN_SUPPORT_ROWS = int(os.getenv("SKIP_LOGIC_MIN_SUPPORT_ROWS", "5"))
+SKIP_LOGIC_NAME_HINT_RE = re.compile(
+    r"screen|screener|eligible|eligibility|consent|used|ever|skip|branch|gate|filter|routing|logic",
+    re.IGNORECASE,
+)
 
 def _json_sanitize(x: Any) -> Any:
     """
@@ -3151,6 +3460,217 @@ def _upload_artifact(bucket: storage.Bucket, object_path: str, payload: bytes, c
 
 def _build_artifact_url(base_url: str, artifact_id: str, run_id: str, mode: str) -> str:
     return f"{base_url}/artifacts/{artifact_id}/{mode}?run_id={run_id}"
+
+
+def _build_artifact_view_get_url(
+    base_url: str,
+    artifact_id: str,
+    run_id: str,
+    mode: Optional[str] = None,
+    keep: Optional[Iterable[str]] = None,
+    drop: Optional[Iterable[str]] = None,
+    limits: Optional[Dict[str, int]] = None,
+) -> str:
+    query: Dict[str, Any] = {"run_id": run_id}
+    if mode:
+        query["mode"] = mode
+    if keep:
+        query["keep"] = ",".join(str(k) for k in keep)
+    if drop:
+        query["drop"] = ",".join(str(k) for k in drop)
+    if limits:
+        query["limits"] = ",".join(f"{k}:{v}" for k, v in limits.items())
+    return f"{base_url}/artifacts/{artifact_id}?{urlencode(query)}"
+
+
+def _is_skip_logic_trigger_candidate(col: str, s: pd.Series, unique_count: int) -> bool:
+    if unique_count < 2:
+        return False
+    if unique_count <= SKIP_LOGIC_TRIGGER_MAX_CARD:
+        return True
+    return bool(SKIP_LOGIC_NAME_HINT_RE.search(col or ""))
+
+
+def _build_conditional_missingness_artifact(
+    df: pd.DataFrame,
+    cols_profile: Dict[str, Any],
+    column_signal_map: Dict[str, Dict[str, Any]],
+    artifact_inputs: Dict[str, Any],
+) -> Dict[str, Any]:
+    n_rows = int(len(df))
+    min_support_rows = max(SKIP_LOGIC_MIN_SUPPORT_ROWS, int(round(n_rows * 0.01))) if n_rows else SKIP_LOGIC_MIN_SUPPORT_ROWS
+    repeat_candidates = _build_families(list(df.columns))
+    family_by_col: Dict[str, str] = {}
+    for fam in repeat_candidates.get("families", []) or []:
+        fam_id = str(fam.get("family_id") or "")
+        for col in fam.get("columns", []) or []:
+            family_by_col[str(col)] = fam_id
+
+    target_columns: List[str] = []
+    trigger_columns: List[str] = []
+    for col in df.columns:
+        sig = column_signal_map.get(col, {})
+        missing_pct = float(sig.get("missing_pct", cols_profile.get(col, {}).get("missing_pct", 0.0)) or 0.0)
+        unique_count = int(sig.get("unique_count", cols_profile.get(col, {}).get("unique_count", int(df[col].nunique(dropna=True))) or 0))
+
+        if missing_pct > SKIP_LOGIC_TARGET_MISSINGNESS_PCT:
+            target_columns.append(col)
+        if col not in family_by_col and _is_skip_logic_trigger_candidate(col, df[col], unique_count):
+            trigger_columns.append(col)
+
+    grouped_rules: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    candidate_rule_count = 0
+
+    for target_col in target_columns:
+        target_missing = df[target_col].isna()
+        if not bool(target_missing.any()):
+            continue
+
+        for trigger_col in trigger_columns:
+            if trigger_col == target_col:
+                continue
+
+            trigger_series = df[trigger_col]
+            trigger_non_null = trigger_series.dropna()
+            if trigger_non_null.empty:
+                continue
+
+            trigger_missing_rate = float(trigger_series.isna().mean()) if len(trigger_series) else 0.0
+            if trigger_missing_rate >= 0.8:
+                continue
+
+            value_counts = trigger_non_null.astype("string").value_counts(dropna=True)
+            for trigger_value, support in value_counts.items():
+                support_n = int(support)
+                if support_n < min_support_rows:
+                    continue
+
+                candidate_rule_count += 1
+                match_mask = trigger_series.astype("string") == str(trigger_value)
+                if not bool(match_mask.any()):
+                    continue
+
+                if bool(target_missing.loc[match_mask].all()):
+                    rule_key = (trigger_col, str(trigger_value))
+                    if rule_key not in grouped_rules:
+                        grouped_rules[rule_key] = {
+                            "trigger_column": trigger_col,
+                            "trigger_value": str(trigger_value),
+                            "affected_columns": [],
+                            "rule_strength": 1.0,
+                            "interpretation": "Valid structural missingness (Skip Logic).",
+                        }
+                    grouped_rules[rule_key]["affected_columns"].append(target_col)
+
+    detected_skip_logic: List[Dict[str, Any]] = []
+    for rule in grouped_rules.values():
+        affected = sorted(set(rule["affected_columns"]))
+        if not affected:
+            continue
+        affected_family_ids = sorted({family_by_col[c] for c in affected if c in family_by_col})
+        explained_missing_pcts: List[float] = []
+        directionality = "bidirectional"
+        for col in affected:
+            target_missing = df[col].isna()
+            total_missing = int(target_missing.sum())
+            match_mask = df[rule["trigger_column"]].astype("string") == str(rule["trigger_value"])
+            explained_missing = int((target_missing & match_mask).sum())
+            explained_pct = float((explained_missing / total_missing) * 100.0) if total_missing else 0.0
+            explained_missing_pcts.append(explained_pct)
+            if explained_missing != total_missing:
+                directionality = "sufficient_only"
+        detected_skip_logic.append({
+            "trigger_column": rule["trigger_column"],
+            "trigger_value": rule["trigger_value"],
+            "affected_column_count": int(len(affected)),
+            "affected_family_ids": affected_family_ids,
+            "affected_family_count": int(len(affected_family_ids)),
+            "sample_affected_columns": affected[:5],
+            "rule_strength": float(rule["rule_strength"]),
+            "directionality": directionality,
+            "missing_explained_pct": round(min(explained_missing_pcts) if explained_missing_pcts else 0.0, 6),
+            "interpretation": rule["interpretation"],
+        })
+
+    detected_skip_logic.sort(
+        key=lambda item: (-int(item["affected_column_count"]), item["trigger_column"], item["trigger_value"])
+    )
+
+    master_switch_candidates: List[Dict[str, Any]] = []
+    trigger_aggregate: Dict[str, Dict[str, Any]] = {}
+    for rule in grouped_rules.values():
+        trigger_col = str(rule["trigger_column"])
+        agg = trigger_aggregate.setdefault(trigger_col, {
+            "values": [],
+            "columns": set(),
+            "family_ids": set(),
+        })
+        affected = sorted(set(rule["affected_columns"]))
+        agg["values"].append({
+            "trigger_value": str(rule["trigger_value"]),
+            "affected_column_count": len(affected),
+            "sample_affected_columns": affected[:5],
+        })
+        agg["columns"].update(affected)
+        agg["family_ids"].update({family_by_col[c] for c in affected if c in family_by_col})
+
+    for trigger_col, agg in trigger_aggregate.items():
+        explained_columns = sorted(agg["columns"])
+        explained_family_ids = sorted(agg["family_ids"])
+        score = 0.35 + min(0.5, 0.03 * len(explained_columns)) + (0.1 if SKIP_LOGIC_NAME_HINT_RE.search(trigger_col) else 0.0)
+        master_switch_candidates.append({
+            "trigger_column": trigger_col,
+            "explained_column_count": int(len(explained_columns)),
+            "explained_family_count": int(len(explained_family_ids)),
+            "affected_family_ids": explained_family_ids,
+            "top_trigger_values": [
+                item["trigger_value"]
+                for item in sorted(agg["values"], key=lambda x: (-int(x["affected_column_count"]), x["trigger_value"]))[:3]
+            ],
+            "sample_affected_columns": explained_columns[:5],
+            "confidence": round(float(min(0.99, score)), 6),
+            "interpretation": "Likely master screening/gating field for structural missingness.",
+        })
+
+    master_switch_candidates.sort(
+        key=lambda item: (-int(item["explained_column_count"]), -int(item["explained_family_count"]), item["trigger_column"])
+    )
+
+    return {
+        "artifact": "A16",
+        "purpose": "conditional_missingness_skip_logic",
+        "inputs": artifact_inputs["A16"],
+        "detected_skip_logic": detected_skip_logic,
+        "master_switch_candidates": master_switch_candidates,
+        "audit_assumptions": {
+            "family_member_triggers_excluded_from_master_switch_candidates": True,
+        },
+        "audit_trace": {
+            "target_missingness_threshold_pct": float(SKIP_LOGIC_TARGET_MISSINGNESS_PCT),
+            "trigger_max_cardinality": int(SKIP_LOGIC_TRIGGER_MAX_CARD),
+            "min_support_rows": int(min_support_rows),
+            "rows_evaluated": n_rows,
+            "target_columns_scanned": sorted(target_columns),
+            "trigger_columns_scanned": sorted(trigger_columns),
+            "candidate_rule_count_considered": int(candidate_rule_count),
+            "family_member_triggers_excluded": True,
+        },
+    }
+
+
+def _build_artifact_view_post_url(base_url: str, artifact_id: str) -> str:
+    return f"{base_url}/artifacts/{artifact_id}/view"
+
+
+def _enrich_artifact_entry_with_urls(base_url: str, run_id: str, item: Dict[str, Any]) -> Dict[str, Any]:
+    aid = item["artifact_id"]
+    return {
+        **item,
+        "download_url": _build_artifact_url(base_url, aid, run_id, "download"),
+        "meta_url": _build_artifact_url(base_url, aid, run_id, "meta"),
+        "view_get_url": _build_artifact_view_get_url(base_url, aid, run_id, mode="llm_baseline"),
+        "view_post_url": _build_artifact_view_post_url(base_url, aid),
+    }
 
 
 def _candidate_evidence_summary(candidate: Dict[str, Any]) -> Dict[str, Any]:
@@ -3695,6 +4215,7 @@ async def full_bundle(
         "A12": {"uses": ["A5", "A6", "A8", "A9", "A10", "dataset"]},
         "A13": {"uses": ["A2", "dataset", "cols_profile"]},
         "A14": {"uses": ["dataset", "A2", "cols_profile"]},
+        "A16": {"uses": ["dataset", "A4", "cols_profile", "column_signal_map"]},
         "B1": {"uses": ["A8", "A2", "A6", "A11", "A13", "A14"]},
     }
 
@@ -3996,6 +4517,13 @@ async def full_bundle(
             "classification_rules_version": "v2",
         },
     }
+
+    conditional_missingness = _build_conditional_missingness_artifact(
+        df=df,
+        cols_profile=cols_profile,
+        column_signal_map=column_signal_map,
+        artifact_inputs=artifact_inputs,
+    )
 
     key_seed_candidates = []
     excluded_seed_columns = []
@@ -5286,6 +5814,7 @@ async def full_bundle(
         "A12": _json_bytes(table_layout_candidates),
         "A13": _json_bytes(semantic_anchors),
         "A14": _json_bytes(quality_heatmap),
+        "A16": _json_bytes(conditional_missingness),
         "B1": _jsonl_bytes(family_packets),
     }
 
@@ -5307,6 +5836,8 @@ async def full_bundle(
             "size_bytes": meta["size_bytes"],
             "download_url": _build_artifact_url(base_url, aid, run_id, "download"),
             "meta_url": _build_artifact_url(base_url, aid, run_id, "meta"),
+            "view_get_url": _build_artifact_view_get_url(base_url, aid, run_id, mode="llm_baseline"),
+            "view_post_url": _build_artifact_view_post_url(base_url, aid),
         })
 
     run_manifest = {
@@ -5359,6 +5890,8 @@ async def full_bundle(
         "size_bytes": manifest_meta["size_bytes"],
         "download_url": _build_artifact_url(base_url, "A1", run_id, "download"),
         "meta_url": _build_artifact_url(base_url, "A1", run_id, "meta"),
+        "view_get_url": _build_artifact_view_get_url(base_url, "A1", run_id, mode="llm_baseline"),
+        "view_post_url": _build_artifact_view_post_url(base_url, "A1"),
     }
     run_manifest["artifact_registry"] = [a1_entry] + manifest_artifacts
     _upload_artifact(bucket, manifest_object_path, _json_bytes(run_manifest), "application/json")
@@ -5393,12 +5926,7 @@ def list_artifacts(
     base_url = str(request.base_url).rstrip("/")
     entries = []
     for item in manifest.get("artifact_registry", []):
-        aid = item["artifact_id"]
-        entries.append({
-            **item,
-            "download_url": _build_artifact_url(base_url, aid, run_id, "download"),
-            "meta_url": _build_artifact_url(base_url, aid, run_id, "meta"),
-        })
+        entries.append(_enrich_artifact_entry_with_urls(base_url=base_url, run_id=run_id, item=item))
 
     return {
         "run_id": run_id,
@@ -5410,6 +5938,7 @@ def list_artifacts(
 
 @app.get("/artifacts/{artifact_id}/meta")
 def artifact_meta(
+    request: Request,
     artifact_id: str,
     run_id: str,
     _=Depends(require_token),
@@ -5425,9 +5954,10 @@ def artifact_meta(
         raise HTTPException(status_code=404, detail="run_id not found")
 
     manifest = json.loads(blob.download_as_bytes().decode("utf-8"))
+    base_url = str(request.base_url).rstrip("/")
     for item in manifest.get("artifact_registry", []):
         if item.get("artifact_id") == artifact_id:
-            return item
+            return _enrich_artifact_entry_with_urls(base_url=base_url, run_id=run_id, item=item)
     raise HTTPException(status_code=404, detail="artifact not found")
 
 
@@ -5466,3 +5996,1909 @@ def artifact_download(
     stream = io.BytesIO(data_blob.download_as_bytes())
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     return StreamingResponse(stream, media_type=found.get("content_type", "application/octet-stream"), headers=headers)
+
+
+class ArtifactViewRequest(BaseModel):
+    run_id: str
+    mode: str = "raw"
+    keep: Optional[List[str]] = None
+    drop: Optional[List[str]] = None
+    limits: Optional[Dict[str, int]] = None
+    policy_overrides: Optional[Dict[str, Dict[str, Any]]] = None
+    replace_policies: Optional[List[str]] = None
+    transform_overrides: Optional[Dict[str, Any]] = None
+    replace_transforms: Optional[List[str]] = None
+    value_filter: Optional[Any] = None
+    debug: bool = False
+
+
+class ArtifactBundleScope(BaseModel):
+    mode: Optional[str] = None
+    keep: Optional[List[str]] = None
+    drop: Optional[List[str]] = None
+    limits: Optional[Dict[str, int]] = None
+    value_filter: Optional[Any] = None
+
+
+class ArtifactBundleRequest(BaseModel):
+    run_id: str
+    mode: str = "raw"
+    artifact_ids: Optional[List[str]] = None
+    global_scope: ArtifactBundleScope = Field(default_factory=lambda: ArtifactBundleScope(mode="raw"), alias="global")
+    per_artifact: Optional[Dict[str, ArtifactBundleScope]] = None
+    policy_overrides: Optional[Dict[str, Dict[str, Any]]] = None
+    replace_policies: Optional[List[str]] = None
+    transform_overrides: Optional[Dict[str, Any]] = None
+    replace_transforms: Optional[List[str]] = None
+    debug: bool = False
+
+    class Config:
+        allow_population_by_field_name = True
+
+
+LLM_PRUNING_LEDGER_PATH = os.getenv(
+    "LLM_PRUNING_LEDGER_PATH",
+    str((Path(__file__).resolve().parent / "llm_pruning_ledger.json")),
+)
+PROFILE_PREFIX = os.getenv("PROFILE_PREFIX", "profiles/")
+PROFILE_SOURCE = os.getenv("PROFILE_SOURCE", "gcs").strip().lower()
+PROFILE_CACHE_TTL = int(os.getenv("PROFILE_CACHE_TTL", "300"))
+LOCAL_PROFILES_DIR = Path(os.getenv("LOCAL_PROFILES_DIR", str(Path(__file__).resolve().parent / "profiles")))
+
+
+def _normalize_path_hint(path_hint: str) -> str:
+    normalized = path_hint.replace("panels[]", "panels").replace("[]", "")
+    return normalized.strip(".")
+
+
+def _load_pruning_ledger(path: str) -> Dict[str, Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            ledger = json.load(f)
+    except FileNotFoundError:
+        logger.warning("Pruning ledger not found at %s; using empty llm_baseline fallback", path)
+        ledger = {"schema_version": "fallback", "modes": {"llm_baseline": {}}}
+    except Exception as exc:
+        raise RuntimeError(f"Failed to load pruning ledger from {path}: {exc}") from exc
+
+    if not isinstance(ledger, dict):
+        raise RuntimeError("Invalid pruning ledger: expected top-level object")
+    if "schema_version" not in ledger or "modes" not in ledger:
+        raise RuntimeError("Invalid pruning ledger: required keys schema_version and modes")
+    modes = ledger.get("modes")
+    if not isinstance(modes, dict):
+        raise RuntimeError("Invalid pruning ledger: modes must be an object")
+    if "llm_baseline" not in modes:        raise RuntimeError("Invalid pruning ledger: llm_baseline mode is required")
+    return ledger
+
+
+def _adapt_pruning_modes_from_ledger(ledger: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    raw_mode = {
+        "tier1": {
+            "global_drop_keys": [],
+            "global_drop_rules": [],
+        },
+        "tier2": {
+            "artifact_drop_keys": {},
+        },
+        "tier3": {
+            "limits": {},
+            "policies": {},
+            "transforms": {},
+        },
+    }
+    adapted: Dict[str, Dict[str, Any]] = {"raw": raw_mode}
+
+    for mode_name, mode_cfg in (ledger.get("modes") or {}).items():
+        if not isinstance(mode_cfg, dict):
+            continue
+        global_drops = mode_cfg.get("global_drops") or []
+        global_drop_rules = mode_cfg.get("global_drop_rules") or []
+        artifact_drops = mode_cfg.get("artifact_drops") or {}
+        artifact_limits = mode_cfg.get("artifact_limits") or {}
+        artifact_policies = mode_cfg.get("artifact_policies") or {}
+        artifact_transforms = mode_cfg.get("artifact_transforms") or {}
+
+        flattened_limits: Dict[str, int] = {}
+
+        if isinstance(artifact_limits, dict):
+            for artifact_id, key_limits in artifact_limits.items():
+                if not isinstance(key_limits, dict):
+                    continue
+
+                for key, value in key_limits.items():
+                    try:
+                        as_int = int(value)
+                    except (ValueError, TypeError):
+                        continue
+
+                    if as_int >= 0:
+                        flattened_limits[f"{artifact_id}.{key}"] = as_int
+
+        normalized_transforms: Dict[str, Dict[str, Any]] = {}
+        if isinstance(artifact_transforms, dict):
+            for artifact_id, raw_ops in artifact_transforms.items():
+                if isinstance(raw_ops, dict):
+                    normalized_transforms[artifact_id] = {
+                        str(k): dict(v) for k, v in raw_ops.items() if isinstance(v, dict)
+                    }
+                    continue
+                ops: Dict[str, Dict[str, Any]] = {}
+                if isinstance(raw_ops, list):
+                    idx = 1
+                    for op in raw_ops:
+                        if not isinstance(op, dict):
+                            continue
+                        op_name = str(op.get("name") or f"op_{idx}")
+                        op_copy = dict(op)
+                        op_copy["name"] = op_name
+                        ops[op_name] = op_copy
+                        idx += 1
+                normalized_transforms[artifact_id] = ops
+
+        adapted[mode_name] = {
+            "tier1": {
+                "global_drop_keys": list(global_drops),
+                "global_drop_rules": list(global_drop_rules),
+            },
+            "tier2": {
+                "artifact_drop_keys": dict(artifact_drops),
+            },
+            "tier3": {
+                "limits": flattened_limits,
+                "policies": dict(artifact_policies),
+                "transforms": normalized_transforms,
+            },
+        }
+    return adapted
+
+
+PRUNING_LEDGER = _load_pruning_ledger(LLM_PRUNING_LEDGER_PATH)
+PRUNING_MODE_LEDGER: Dict[str, Dict[str, Any]] = _adapt_pruning_modes_from_ledger(PRUNING_LEDGER)
+_PROFILE_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _normalize_profile_prefix(prefix: str) -> str:
+    cleaned = (prefix or "profiles/").strip().lstrip("/")
+    if cleaned and not cleaned.endswith("/"):
+        cleaned += "/"
+    return cleaned
+
+
+def _profile_object_path(profile_name: str) -> str:
+    return f"{_normalize_profile_prefix(PROFILE_PREFIX)}{profile_name}.json"
+
+
+def _extract_drop_entries(drop_entries: Any) -> Tuple[List[str], List[Dict[str, Any]]]:
+    drop_keys: List[str] = []
+    drop_rules: List[Dict[str, Any]] = []
+    if not isinstance(drop_entries, list):
+        return drop_keys, drop_rules
+    for entry in drop_entries:
+        if isinstance(entry, str):
+            drop_keys.append(entry)
+        elif isinstance(entry, dict) and entry.get("key"):
+            drop_rules.append(dict(entry))
+    return drop_keys, drop_rules
+
+
+def _normalize_named_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(profile, dict):
+        raise HTTPException(status_code=422, detail="Profile must be a JSON object")
+
+    missing_required = [k for k in ("profile", "artifacts", "pruning") if k not in profile]
+    if missing_required:
+        raise HTTPException(status_code=422, detail=f"Profile missing required keys: {', '.join(missing_required)}")
+
+    profile_name = str(profile.get("profile") or "").strip()
+    artifacts = profile.get("artifacts")
+    pruning = profile.get("pruning")
+    if not profile_name:
+        raise HTTPException(status_code=422, detail="Profile key 'profile' must be a non-empty string")
+    if not isinstance(artifacts, list) or not all(isinstance(a, str) and a for a in artifacts):
+        raise HTTPException(status_code=422, detail="Profile key 'artifacts' must be a list of artifact IDs")
+    if not isinstance(pruning, dict):
+        raise HTTPException(status_code=422, detail="Profile key 'pruning' must be an object")
+
+    artifact_drop_keys: Dict[str, List[str]] = {}
+    artifact_drop_rules: Dict[str, List[Dict[str, Any]]] = {}
+    flattened_limits: Dict[str, int] = {}
+    policies: Dict[str, Dict[str, Any]] = {}
+    transforms: Dict[str, Dict[str, Any]] = {}
+
+    for artifact_id, artifact_cfg in pruning.items():
+        if not isinstance(artifact_cfg, dict):
+            raise HTTPException(status_code=422, detail=f"Profile pruning.{artifact_id} must be an object")
+
+        drop_keys, drop_rules = _extract_drop_entries(artifact_cfg.get("drop") or [])
+        artifact_drop_keys[artifact_id] = drop_keys
+        artifact_drop_rules[artifact_id] = drop_rules
+
+        for key, value in (artifact_cfg.get("limits") or {}).items():
+            try:
+                as_int = int(value)
+            except (ValueError, TypeError):
+                continue
+            if as_int >= 0:
+                flattened_limits[f"{artifact_id}.{key}"] = as_int
+
+        artifact_policies = artifact_cfg.get("policies") or {}
+        if artifact_policies and isinstance(artifact_policies, dict):
+            policies[artifact_id] = dict(artifact_policies)
+
+        artifact_transforms = artifact_cfg.get("transforms") or {}
+        transforms[artifact_id] = _normalize_transform_ops(artifact_transforms)
+
+    return {
+        "profile": profile_name,
+        "description": profile.get("description", ""),
+        "artifacts": artifacts,
+        "mode_config": {
+            "tier1": {
+                "global_drop_keys": [],
+                "global_drop_rules": [],
+            },
+            "tier2": {
+                "artifact_drop_keys": artifact_drop_keys,
+                "artifact_drop_rules": artifact_drop_rules,
+            },
+            "tier3": {
+                "limits": flattened_limits,
+                "policies": policies,
+                "transforms": transforms,
+            },
+        },
+    }
+
+
+def _load_profile_local(profile_name: str) -> Tuple[Dict[str, Any], str]:
+    local_path = LOCAL_PROFILES_DIR / f"{profile_name}.json"
+    if not local_path.exists():
+        raise HTTPException(status_code=404, detail=f"Profile '{profile_name}' not found at {local_path}")
+    try:
+        profile_raw = json.loads(local_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=422, detail=f"Malformed profile JSON at {local_path}: {exc}") from exc
+    return _normalize_named_profile(profile_raw), "local"
+
+
+def _load_profile_gcs(profile_name: str) -> Tuple[Dict[str, Any], str]:
+    bucket_name = os.getenv("EXPORT_BUCKET")
+    object_path = _profile_object_path(profile_name)
+    if not bucket_name:
+        raise HTTPException(status_code=503, detail="EXPORT_BUCKET is not configured for GCS profile loading")
+
+    now = time.time()
+    cached = _PROFILE_CACHE.get(profile_name)
+    if cached and now < cached.get("expires_at", 0):
+        return cached["profile"], "cache_hit"
+
+    try:
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(object_path)
+        if not blob.exists(client):
+            raise HTTPException(
+                status_code=404,
+                detail=f"Profile '{profile_name}' not found at gs://{bucket_name}/{object_path}. Have you uploaded it?",
+            )
+        profile_raw = json.loads(blob.download_as_bytes().decode("utf-8"))
+    except HTTPException:
+        raise
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=422, detail=f"Malformed profile JSON at gs://{bucket_name}/{object_path}: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"GCS unavailable while loading profile '{profile_name}': {exc}") from exc
+
+    normalized = _normalize_named_profile(profile_raw)
+    _PROFILE_CACHE[profile_name] = {
+        "profile": normalized,
+        "expires_at": now + max(1, PROFILE_CACHE_TTL),
+    }
+    return normalized, "cache_miss"
+
+
+def _resolve_mode_config(mode: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    normalized_mode = str(mode or "raw").strip() or "raw"
+    if normalized_mode == "raw":
+        return _resolve_pruning_mode("raw"), {
+            "mode": "raw",
+            "header": "raw; no_pruning",
+            "profile_artifacts": None,
+            "cache": "none",
+            "source": "none",
+        }
+    if normalized_mode == "llm_baseline":
+        return _resolve_pruning_mode("llm_baseline"), {
+            "mode": "llm_baseline",
+            "header": "llm_baseline; source=local_ledger",
+            "profile_artifacts": None,
+            "cache": "none",
+            "source": "local_ledger",
+        }
+
+    use_local = PROFILE_SOURCE == "local" or not os.getenv("EXPORT_BUCKET")
+    if use_local:
+        profile, source = _load_profile_local(normalized_mode)
+        return profile["mode_config"], {
+            "mode": profile["profile"],
+            "header": f"{profile['profile']}; source={source}",
+            "profile_artifacts": profile.get("artifacts") or [],
+            "cache": "n/a",
+            "source": source,
+        }
+
+    profile, cache_state = _load_profile_gcs(normalized_mode)
+    cache_value = "hit" if cache_state == "cache_hit" else "miss"
+    return profile["mode_config"], {
+        "mode": profile["profile"],
+        "header": f"{profile['profile']}; cache={cache_value}",
+        "profile_artifacts": profile.get("artifacts") or [],
+        "cache": cache_value,
+        "source": "gcs",
+    }
+
+_DECODE_CACHE: Dict[Tuple[str, str, str], Tuple[str, Any]] = {}
+_DECODE_CACHE_MAX = int(os.getenv("ARTIFACT_VIEW_CACHE_MAX", "32"))
+
+MAX_POLICY_OVERRIDE_KEYS = int(os.getenv("MAX_POLICY_OVERRIDE_KEYS", "25"))
+MAX_POLICY_OVERRIDE_BYTES = int(os.getenv("MAX_POLICY_OVERRIDE_BYTES", "65536"))
+MAX_TRANSFORM_OVERRIDE_KEYS = int(os.getenv("MAX_TRANSFORM_OVERRIDE_KEYS", "25"))
+MAX_TRANSFORM_OVERRIDE_BYTES = int(os.getenv("MAX_TRANSFORM_OVERRIDE_BYTES", "65536"))
+MAX_CAP = int(os.getenv("MAX_CAP", "500"))
+MAX_POLICY_INT = int(os.getenv("MAX_POLICY_INT", "1000"))
+MAX_POLICY_LIST_LEN = int(os.getenv("MAX_POLICY_LIST_LEN", "200"))
+MAX_POLICY_STR_LEN = int(os.getenv("MAX_POLICY_STR_LEN", "2048"))
+MAX_LIMITS_VALUE = int(os.getenv("MAX_LIMITS_VALUE", "5000"))
+
+def parse_csv_list(s: str) -> List[str]:
+    if not s:
+        return []
+    return [part.strip() for part in s.split(",") if part and part.strip()]
+
+
+def parse_limits_csv(s: str) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for token in parse_csv_list(s):
+        if ":" not in token:
+            raise HTTPException(status_code=422, detail=f"Invalid limits token: {token}")
+        key, raw_value = token.split(":", 1)
+        key = key.strip()
+        raw_value = raw_value.strip()
+        if not key:
+            raise HTTPException(status_code=422, detail=f"Invalid limits key in token: {token}")
+        try:
+            value = int(raw_value)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid limit value in token: {token}") from exc
+        if value < 0:
+            raise HTTPException(status_code=422, detail=f"Limit must be non-negative: {token}")
+        out[key] = value
+    return out
+
+
+def _clamp_limit_value(path: str, value: int, report: List[Dict[str, Any]]) -> int:
+    if value < 0:
+        report.append({"path": path, "from": value, "to": 0, "reason": "negative_not_allowed"})
+        return 0
+    if value > MAX_LIMITS_VALUE:
+        report.append({"path": path, "from": value, "to": MAX_LIMITS_VALUE, "reason": "max_limits_value"})
+        return MAX_LIMITS_VALUE
+    return value
+
+
+def _guard_limits_map(limits: Optional[Dict[str, int]], path_prefix: str, clamps: List[Dict[str, Any]]) -> Optional[Dict[str, int]]:
+    if not limits:
+        return limits
+    guarded: Dict[str, int] = {}
+    for k, v in limits.items():
+        try:
+            as_int = int(v)
+        except (ValueError, TypeError):
+            continue
+        guarded[str(k)] = _clamp_limit_value(f"{path_prefix}.{k}", as_int, clamps)
+    return guarded
+
+
+def _parse_policy_key(policy_key: str) -> Tuple[str, str]:
+    key = str(policy_key or "").strip()
+    if key.startswith("artifact_policies."):
+        key = key[len("artifact_policies."):]
+    parts = key.split(".")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise HTTPException(status_code=422, detail=f"Invalid policy key: {policy_key}")
+    return parts[0], parts[1]
+
+
+def _parse_transform_key(transform_key: str) -> Tuple[str, str]:
+    key = str(transform_key or "").strip()
+    if key.startswith("artifact_transforms."):
+        key = key[len("artifact_transforms."):]
+    parts = key.split(".")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise HTTPException(status_code=422, detail=f"Invalid transform key: {transform_key}")
+    return parts[0], parts[1]
+
+
+def _normalize_transform_ops(raw_ops: Any) -> Dict[str, Dict[str, Any]]:
+    normalized: Dict[str, Dict[str, Any]] = {}
+    if isinstance(raw_ops, dict):
+        iterable = raw_ops.items()
+    elif isinstance(raw_ops, list):
+        iterable = ((None, op) for op in raw_ops)
+    else:
+        return normalized
+
+    next_idx = 1
+    for key, op in iterable:
+        if not isinstance(op, dict):
+            continue
+        op_name = str(key or op.get("name") or f"op_{next_idx}").strip()
+        if not op_name:
+            op_name = f"op_{next_idx}"
+        if op_name in normalized:
+            suffix = 2
+            while f"{op_name}_{suffix}" in normalized:
+                suffix += 1
+            op_name = f"{op_name}_{suffix}"
+        op_copy = dict(op)
+        op_copy["name"] = op_name
+        normalized[op_name] = op_copy
+        next_idx += 1
+    return normalized
+
+
+def _deep_merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge_dict(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def _clamp_policy_number(
+    path: str,
+    number: int,
+    field_name: str,
+    clamps: List[Dict[str, Any]],
+) -> int:
+    if number < 0:
+        clamps.append({"path": path, "from": number, "to": 0, "reason": "negative_not_allowed"})
+        return 0
+
+    key_like_fields = {"k", "cap", "limit", "max_items", "hard_cap_total", "include_review_required_topk"}
+    limit = MAX_CAP if field_name in key_like_fields else MAX_POLICY_INT
+    reason = "max_policy_k" if field_name in key_like_fields else "max_policy_int"
+    if number > limit:
+        clamps.append({"path": path, "from": number, "to": limit, "reason": reason})
+        return limit
+    return number
+
+
+def _clamp_structure_sizes(node: Any, path: str, clamps: List[Dict[str, Any]]) -> Any:
+    if isinstance(node, dict):
+        guarded: Dict[str, Any] = {}
+        for key, value in node.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            guarded[key] = _clamp_structure_sizes(value, child_path, clamps)
+        return guarded
+    if isinstance(node, list):
+        if len(node) > MAX_POLICY_LIST_LEN:
+            clamps.append({
+                "path": path,
+                "from": len(node),
+                "to": MAX_POLICY_LIST_LEN,
+                "reason": "max_policy_list_len",
+            })
+            node = node[:MAX_POLICY_LIST_LEN]
+        return [_clamp_structure_sizes(item, f"{path}[{idx}]", clamps) for idx, item in enumerate(node)]
+    if isinstance(node, str) and len(node) > MAX_POLICY_STR_LEN:
+        clamps.append({
+            "path": path,
+            "from": len(node),
+            "to": MAX_POLICY_STR_LEN,
+            "reason": "max_policy_str_len",
+        })
+        return node[:MAX_POLICY_STR_LEN]
+    return node
+
+
+def _apply_policy_numeric_guardrails(node: Any, path: str, clamps: List[Dict[str, Any]]) -> Any:
+    sized = _clamp_structure_sizes(node, path, clamps)
+
+    if isinstance(sized, dict):
+        guarded: Dict[str, Any] = {}
+
+        for key, value in sized.items():
+            child_path = f"{path}.{key}" if path else str(key)
+
+            if isinstance(value, bool):
+                guarded[key] = value
+            elif isinstance(value, int):
+                guarded[key] = _clamp_policy_number(child_path, value, str(key), clamps)
+            elif isinstance(value, float) and value.is_integer():
+                guarded[key] = _clamp_policy_number(child_path, int(value), str(key), clamps)
+            else:
+                guarded[key] = _apply_policy_numeric_guardrails(value, child_path, clamps)
+
+        return guarded
+
+    if isinstance(sized, list):
+        return [
+            _apply_policy_numeric_guardrails(item, f"{path}[{idx}]", clamps)
+            for idx, item in enumerate(sized)
+        ]
+
+    return sized
+
+
+def _build_effective_policies(    base_policies: Dict[str, Any],
+    policy_overrides: Optional[Dict[str, Dict[str, Any]]],
+    replace_policies: Optional[Iterable[str]],
+    report: Optional[Dict[str, Any]] = None,
+    scope_artifact_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    effective = json.loads(json.dumps(base_policies or {}))
+    override_payload = policy_overrides or {}
+    payload_bytes = len(json.dumps(override_payload, default=_json_default).encode("utf-8"))
+    if payload_bytes > MAX_POLICY_OVERRIDE_BYTES:
+        raise HTTPException(status_code=422, detail="policy_overrides payload too large")
+    if len(override_payload) > MAX_POLICY_OVERRIDE_KEYS:
+        raise HTTPException(status_code=422, detail="Too many policy_overrides keys")
+
+    replace_set = set(replace_policies or [])
+    clamps: List[Dict[str, Any]] = []
+    received: Dict[str, Any] = {}
+
+    for policy_key, override in override_payload.items():
+        if not isinstance(override, dict):
+            raise HTTPException(status_code=422, detail=f"policy_overrides[{policy_key}] must be an object")
+        artifact_id, policy_name = _parse_policy_key(policy_key)
+        received[policy_key] = override
+
+        artifact_policies = dict(effective.get(artifact_id) or {})
+        existing_policy = artifact_policies.get(policy_name)
+        if not isinstance(existing_policy, dict):
+            existing_policy = {}
+
+        merged = dict(override) if policy_key in replace_set else _deep_merge_dict(existing_policy, override)
+        guarded = _apply_policy_numeric_guardrails(merged, policy_key, clamps)
+        artifact_policies[policy_name] = guarded
+        effective[artifact_id] = artifact_policies
+
+    if report is not None:
+        report["policy_overrides_received"] = received
+        scoped = effective
+        if scope_artifact_id is not None:
+            scoped = {scope_artifact_id: dict((effective.get(scope_artifact_id) or {}))}
+        report["policy_effective"] = scoped
+        report["policy_clamps"] = clamps
+
+    return effective
+
+
+def _build_effective_transforms(
+    base_transforms: Dict[str, Any],
+    transform_overrides: Optional[Dict[str, Any]],
+    replace_transforms: Optional[Iterable[str]],
+    report: Optional[Dict[str, Any]] = None,
+    scope_artifact_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    effective: Dict[str, Dict[str, Dict[str, Any]]] = {
+        str(artifact_id): _normalize_transform_ops(raw_ops)
+        for artifact_id, raw_ops in dict(base_transforms or {}).items()
+    }
+    override_payload = transform_overrides or {}
+    payload_bytes = len(json.dumps(override_payload, default=_json_default).encode("utf-8"))
+    if payload_bytes > MAX_TRANSFORM_OVERRIDE_BYTES:
+        raise HTTPException(status_code=422, detail="transform_overrides payload too large")
+    if len(override_payload) > MAX_TRANSFORM_OVERRIDE_KEYS:
+        raise HTTPException(status_code=422, detail="Too many transform_overrides keys")
+
+    replace_set = set(replace_transforms or [])
+    received: Dict[str, Any] = {}
+    replace_applied: Set[str] = set()
+
+    for transform_key, override in override_payload.items():
+        if not isinstance(override, dict):
+            raise HTTPException(status_code=422, detail=f"transform_overrides[{transform_key}] must be an object")
+        artifact_id, transform_name = _parse_transform_key(transform_key)
+        received[transform_key] = override
+
+        artifact_transforms = dict(effective.get(artifact_id) or {})
+        existing_transform = artifact_transforms.get(transform_name)
+        if not isinstance(existing_transform, dict):
+            existing_transform = {}
+
+        should_replace = transform_key in replace_set
+        merged = dict(override) if should_replace else _deep_merge_dict(existing_transform, override)
+        merged["name"] = transform_name
+        artifact_transforms[transform_name] = merged
+        effective[artifact_id] = artifact_transforms
+        if should_replace:
+            replace_applied.add(transform_key)
+
+    if report is not None:
+        report["transform_overrides_received"] = received
+        scoped: Dict[str, Any] = effective
+        if scope_artifact_id is not None:
+            scoped = {scope_artifact_id: dict((effective.get(scope_artifact_id) or {}))}
+        report["transform_effective"] = scoped
+        report["replace_transforms_applied"] = sorted(replace_applied)
+
+    return effective
+
+
+def _resolve_pruning_mode(mode: str) -> Dict[str, Any]:
+    if mode not in PRUNING_MODE_LEDGER:
+        raise HTTPException(status_code=422, detail=f"Unsupported mode: {mode}")
+    return PRUNING_MODE_LEDGER[mode]
+
+
+def _load_artifact_blob(run_id: str, artifact_id: str) -> Tuple[storage.Bucket, Dict[str, Any], storage.Blob]:
+    bucket_name = os.getenv("EXPORT_BUCKET")
+    if not bucket_name:
+        raise HTTPException(status_code=500, detail="Missing EXPORT_BUCKET env var")
+
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    manifest_blob = bucket.blob(f"runs/{run_id}/manifest.json")
+    if not manifest_blob.exists(client):
+        raise HTTPException(status_code=404, detail="run_id not found")
+
+    manifest = json.loads(manifest_blob.download_as_bytes().decode("utf-8"))
+    found = None
+    for item in manifest.get("artifact_registry", []):
+        if item.get("artifact_id") == artifact_id:
+            found = item
+            break
+    if not found:
+        raise HTTPException(status_code=404, detail="artifact not found")
+    data_blob = bucket.blob(found["object_path"])
+    if not data_blob.exists(client):
+        raise HTTPException(status_code=404, detail="artifact object missing")
+    return bucket, found, data_blob
+
+
+def load_artifact_bytes(run_id: str, artifact_id: str) -> Tuple[str, bytes, Dict[str, Any]]:
+    _, found, data_blob = _load_artifact_blob(run_id=run_id, artifact_id=artifact_id)
+    payload = data_blob.download_as_bytes()
+    return found.get("content_type", "application/octet-stream"), payload, found
+
+
+def decode_payload(content_type: str, payload: bytes) -> Tuple[str, Any]:
+    normalized = (content_type or "").split(";")[0].strip().lower()
+    if normalized in {"application/json", "text/json"}:
+        try:
+            return "json", json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=422, detail="Invalid JSON payload") from exc
+
+    if normalized in {"application/jsonl", "application/x-ndjson", "application/jsonlines", "text/plain"}:
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(status_code=422, detail="Invalid JSONL payload") from exc
+        rows: List[Any] = []
+        for idx, line in enumerate(text.splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                raise HTTPException(status_code=422, detail=f"Invalid JSONL payload at line {idx}") from exc
+        return "jsonl", rows
+
+    return "other", None
+
+
+def _iter_jsonl_bytes(rows: Iterable[Any]) -> Iterator[bytes]:
+    for row in rows:
+        yield (json.dumps(row, separators=(",", ":"), default=_json_default) + "\n").encode("utf-8")
+
+
+def _is_list_of_objects(value: Any) -> bool:
+    return isinstance(value, list) and (len(value) == 0 or all(isinstance(item, dict) for item in value))
+
+
+def _matches_path_hint(current_path: str, path_hints_any_of: List[str]) -> bool:
+    if not current_path:
+        return False
+    for path_hint in path_hints_any_of:
+        normalized_hint = _normalize_path_hint(str(path_hint))
+        if not normalized_hint:
+            continue
+        if current_path == normalized_hint or current_path.endswith(f".{normalized_hint}"):
+            return True
+    return False
+
+
+def _should_drop_via_rule(key: str, value: Any, current_path: str, rule: Dict[str, Any]) -> bool:
+    if key != rule.get("key"):
+        return False
+
+    guards = rule.get("guards") or {}
+    value_kinds = set(guards.get("value_kind_any_of") or [])
+    path_hints = list(guards.get("path_hints_any_of") or [])
+
+    if not value_kinds and not path_hints:
+        return True
+
+    type_match = False
+    if "list_of_objects" in value_kinds and _is_list_of_objects(value):
+        type_match = True
+
+    path_match = _matches_path_hint(current_path, path_hints)
+
+    if value_kinds and path_hints:
+        return type_match or path_match
+    if value_kinds:
+        return type_match
+    return path_match
+
+
+def _should_drop_key(key: str, value: Any, current_path: str, key_drops: Set[str], drop_rules: List[Dict[str, Any]]) -> bool:
+    if key in key_drops:
+        return True
+    for rule in drop_rules:
+        if _should_drop_via_rule(key=key, value=value, current_path=current_path, rule=rule):
+            return True
+    return False
+
+
+def _recursive_prune_keys(
+    node: Any,
+    key_drops: Set[str],
+    keep_keys: Set[str],
+    drop_rules: List[Dict[str, Any]],
+    report: Dict[str, Any],
+    path: str = "",
+) -> Any:
+    if isinstance(node, list):
+        return [
+            _recursive_prune_keys(
+                item,
+                key_drops=key_drops,
+                keep_keys=keep_keys,
+                drop_rules=drop_rules,
+                report=report,
+                path=path,
+            )
+            for item in node
+        ]
+    if isinstance(node, dict):
+        out: Dict[str, Any] = {}
+        for key, value in node.items():
+            report["seen_keys"][key] += 1
+            current_path = f"{path}.{key}" if path else key
+            should_drop = _should_drop_key(
+                key=key,
+                value=value,
+                current_path=current_path,
+                key_drops=key_drops,
+                drop_rules=drop_rules,
+            )
+            if should_drop and key not in keep_keys:
+                report["dropped_keys"][key] += 1
+                continue
+            if should_drop and key in keep_keys:
+                report["kept_key_hits"][key] += 1
+            out[key] = _recursive_prune_keys(
+                value,
+                key_drops=key_drops,
+                keep_keys=keep_keys,
+                drop_rules=drop_rules,
+                report=report,
+                path=current_path,
+            )
+        return out
+    return node
+
+
+def _resolve_limit_for_path(effective_limits: Dict[str, int], artifact_id: str, path: str) -> Optional[int]:
+    full_path = f"{artifact_id}.{path}" if artifact_id and path else path
+    if full_path in effective_limits:
+        return effective_limits[full_path]
+    if path in effective_limits:
+        return effective_limits[path]
+    return None
+
+
+def _normalize_keys_tested(value: Any) -> Tuple[str, ...]:
+    if isinstance(value, list):
+        return tuple(sorted(str(v) for v in value))
+    if isinstance(value, tuple):
+        return tuple(sorted(str(v) for v in value))
+    if value is None:
+        return tuple()
+    return (str(value),)
+
+
+def _to_sort_value(value: Any, order: str) -> Any:
+    if value is None:
+        return float("-inf") if order == "desc" else float("inf")
+    if isinstance(value, bool):
+        value = int(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    return str(value)
+
+
+def _score_test_row(row: Dict[str, Any], rank_order: List[Dict[str, Any]]) -> Tuple[Any, ...]:
+    score: List[Any] = []
+    for rank in rank_order:
+        field = rank.get("field")
+        order = str(rank.get("order", "asc")).lower()
+        raw = row.get(field)
+        sortable = _to_sort_value(raw, order)
+        if isinstance(sortable, float):
+            score.append(-sortable if order == "desc" else sortable)
+        else:
+            score.append(sortable if order == "asc" else "".join(chr(255 - ord(c)) for c in sortable))
+    score.append(str(_normalize_keys_tested(row.get("keys_tested"))))
+    return tuple(score)
+
+
+def _apply_a6_tests_policy(node: Dict[str, Any], tests: List[Any], policy: Dict[str, Any], report: Dict[str, Any]) -> List[Any]:
+    if not isinstance(tests, list):
+        return tests
+
+    k = int(policy.get("k", len(tests)))
+    must_keep_cfg = policy.get("must_keep") or {}
+    best_candidate_path = str(must_keep_cfg.get("best_candidate_keys_path", ""))
+    best_keys: Any = node
+    for part in [p for p in best_candidate_path.split(".") if p]:
+        if isinstance(best_keys, dict):
+            best_keys = best_keys.get(part)
+        else:
+            best_keys = None
+            break
+    best_key_norm = _normalize_keys_tested(best_keys)
+
+    kept: List[Dict[str, Any]] = []
+    remainder: List[Dict[str, Any]] = []
+    for item in tests:
+        if not isinstance(item, dict):
+            continue
+        keys_norm = _normalize_keys_tested(item.get("keys_tested"))
+        if best_key_norm and keys_norm == best_key_norm:
+            kept.append(item)
+        else:
+            remainder.append(item)
+
+    rank_order = policy.get("rank_order") or []
+    remainder_sorted = sorted(remainder, key=lambda row: _score_test_row(row, rank_order))
+
+    selected = kept + remainder_sorted
+    if k >= 0:
+        selected = selected[:k]
+
+    report["a6_tests_policy"] = {
+        "input": len(tests),
+        "best_candidate_kept": bool(kept),
+        "output": len(selected),
+    }
+    return selected
+
+
+def _extract_forced_a9_columns(value_filter: Optional[Any]) -> Set[str]:
+    forced_names: Set[str] = set()
+    if isinstance(value_filter, dict):
+        forced_names.update(str(v) for v in (value_filter.get("a9_force_include_columns") or []))
+    elif isinstance(value_filter, list):
+        for item in value_filter:
+            if isinstance(item, dict):
+                forced_names.update(str(v) for v in (item.get("a9_force_include_columns") or []))
+    return {name for name in forced_names if name}
+
+
+def _sorted_columns_for_bucket(columns: List[Tuple[int, Dict[str, Any]]], name_field: str) -> List[Tuple[int, Dict[str, Any]]]:
+    return sorted(columns, key=lambda pair: str(pair[1].get(name_field, "")))
+
+
+def _apply_a9_columns_policy(
+    columns: List[Any],
+    policy: Dict[str, Any],
+    value_filter: Optional[Any],
+    report: Dict[str, Any],
+) -> List[Any]:
+    if not isinstance(columns, list):
+        return columns
+
+    name_field = str(policy.get("name_field", "column"))
+    role_field = str(policy.get("role_field", "primary_role"))
+    review_field = str(policy.get("review_field", "review_required"))
+    hard_cap = int(policy.get("hard_cap_total", len(columns)))
+    exclude_roles = set(policy.get("exclude_roles") or [])
+
+    valid_columns: List[Tuple[int, Dict[str, Any]]] = [
+        (idx, col) for idx, col in enumerate(columns) if isinstance(col, dict)
+    ]
+    forced_names = _extract_forced_a9_columns(value_filter)
+
+    selected: List[Tuple[int, Dict[str, Any]]] = []
+    selected_idx: Set[int] = set()
+
+    def _take(pair: Tuple[int, Dict[str, Any]]) -> None:
+        idx, col = pair
+        if idx not in selected_idx and len(selected) < hard_cap:
+            selected_idx.add(idx)
+            selected.append((idx, col))
+
+    for pair in _sorted_columns_for_bucket(valid_columns, name_field):
+        _, col = pair
+        if str(col.get(name_field, "")) in forced_names:
+            _take(pair)
+
+    include_roles_all = policy.get("include_roles_all") or []
+    overflow_flags: Dict[str, bool] = {}
+    for rule in include_roles_all:
+        role = rule.get("role")
+        cap = int(rule.get("cap", len(valid_columns)))
+        overflow_flag = rule.get("overflow_flag")
+        bucket = [pair for pair in valid_columns if str(pair[1].get(role_field, "")) == str(role)]
+        bucket = _sorted_columns_for_bucket(bucket, name_field)
+        if overflow_flag:
+            overflow_flags[str(overflow_flag)] = len(bucket) > cap
+        for pair in bucket[:cap]:
+            _take(pair)
+
+    include_roles_topk = policy.get("include_roles_topk") or {}
+    for role, cap_val in include_roles_topk.items():
+        cap = int(cap_val)
+        bucket = [
+            pair for pair in valid_columns
+            if str(pair[1].get(role_field, "")) == str(role)
+        ]
+        for pair in _sorted_columns_for_bucket(bucket, name_field)[:cap]:
+            _take(pair)
+
+    include_review_required_topk = int(policy.get("include_review_required_topk", 0))
+    if include_review_required_topk > 0:
+        bucket = [
+            pair for pair in valid_columns
+            if bool(pair[1].get(review_field, False))
+        ]
+        for pair in _sorted_columns_for_bucket(bucket, name_field)[:include_review_required_topk]:
+            _take(pair)
+
+    final_selected: List[Dict[str, Any]] = []
+    for _, col in selected:
+        role = str(col.get(role_field, ""))
+        if role in exclude_roles and str(col.get(name_field, "")) not in forced_names:
+            continue
+        final_selected.append(col)
+
+    if len(final_selected) > hard_cap:
+        final_selected = final_selected[:hard_cap]
+
+    report["a9_columns_policy"] = {
+        "input": len(columns),
+        "output": len(final_selected),
+        "forced_includes": sorted(forced_names),
+        "overflow_flags": overflow_flags,
+    }
+    return final_selected
+
+
+
+
+def _resolve_policy_target_path(policy_name: str, policy: Dict[str, Any]) -> str:
+    target = str(policy.get("target_array", "")).strip()
+    if target:
+        return target
+    if policy_name.endswith("_policy"):
+        return policy_name[:-7]
+    return policy_name
+
+
+def _resolve_policy_type(policy_name: str, policy: Dict[str, Any]) -> str:
+    policy_type = str(policy.get("type", "")).strip().lower()
+    if policy_type:
+        return policy_type
+    if policy_name == "columns_policy":
+        return "bucket_selector"
+    if policy_name == "tests_policy":
+        return "ranked_topk"
+    return ""
+
+
+def _apply_ranked_topk_policy(node: Dict[str, Any], items: List[Any], policy: Dict[str, Any], report: Dict[str, Any]) -> List[Any]:
+    return _apply_a6_tests_policy(node, items, policy, report)
+
+
+def _apply_bucket_selector_policy(items: List[Any], policy: Dict[str, Any], value_filter: Optional[Any], report: Dict[str, Any]) -> List[Any]:
+    return _apply_a9_columns_policy(items, policy, value_filter, report)
+
+
+def _apply_typed_array_policy(
+    node: Dict[str, Any],
+    items: List[Any],
+    policy_name: str,
+    policy: Dict[str, Any],
+    value_filter: Optional[Any],
+    report: Dict[str, Any],
+) -> List[Any]:
+    policy_type = _resolve_policy_type(policy_name, policy)
+    if policy_type in {"ranked_topk", "best_candidate_safe_ranked_topk"}:
+        return _apply_ranked_topk_policy(node=node, items=items, policy=policy, report=report)
+    if policy_type in {"bucket_selector", "role_bucket_selector"}:
+        return _apply_bucket_selector_policy(items=items, policy=policy, value_filter=value_filter, report=report)
+    return items
+
+
+def _path_parts(path: str) -> List[str]:
+    parts: List[str] = []
+    for token in [p for p in str(path or "").split(".") if p]:
+        if token.endswith("]") and "[" in token:
+            base, _, index = token[:-1].partition("[")
+            if base:
+                parts.append(base)
+            parts.append(index)
+        else:
+            parts.append(token)
+    return parts
+
+
+def _path_get(node: Any, path: str, default: Any = None) -> Any:
+    cur = node
+    for part in _path_parts(path):
+        if isinstance(cur, list):
+            if not part.isdigit():
+                return default
+            idx = int(part)
+            if idx < 0 or idx >= len(cur):
+                return default
+            cur = cur[idx]
+            continue
+        if isinstance(cur, dict):
+            if part not in cur:
+                return default
+            cur = cur[part]
+            continue
+        return default
+    return cur
+
+
+def _path_set(node: Any, path: str, value: Any) -> bool:
+    parts = _path_parts(path)
+    if not parts:
+        return False
+    cur = node
+    for part in parts[:-1]:
+        if isinstance(cur, dict):
+            if part not in cur or not isinstance(cur[part], (dict, list)):
+                cur[part] = {}
+            cur = cur[part]
+        elif isinstance(cur, list) and part.isdigit():
+            idx = int(part)
+            if idx < 0 or idx >= len(cur):
+                return False
+            cur = cur[idx]
+        else:
+            return False
+
+    last = parts[-1]
+    if isinstance(cur, dict):
+        cur[last] = value
+        return True
+    if isinstance(cur, list) and last.isdigit():
+        idx = int(last)
+        if idx < 0 or idx >= len(cur):
+            return False
+        cur[idx] = value
+        return True
+    return False
+
+
+def _render_template(template: str, context: Dict[str, Any]) -> str:
+    out = str(template)
+    for key, val in context.items():
+        out = out.replace("{" + key + "}", "" if val is None else str(val))
+    return out
+
+
+def _derive_value(spec: Any, root: Dict[str, Any], source: Optional[Dict[str, Any]], target: Optional[Dict[str, Any]]) -> Any:
+    if not isinstance(spec, dict):
+        return spec
+
+    if "const" in spec:
+        return spec.get("const")
+
+    if "from" in spec:
+        raw_path = str(spec.get("from") or "")
+        if raw_path.startswith("source."):
+            value = _path_get(source or {}, raw_path[len("source."):])
+        elif raw_path.startswith("target."):
+            value = _path_get(target or {}, raw_path[len("target."):])
+        else:
+            value = _path_get(source or {}, raw_path)
+            if value is None:
+                value = _path_get(target or {}, raw_path)
+            if value is None:
+                value = _path_get(root, raw_path)
+        if value is None and spec.get("fallback_from"):
+            value = _derive_value({"from": spec.get("fallback_from")}, root, source, target)
+    else:
+        value = None
+
+    if "slice" in spec and isinstance(value, list):
+        try:
+            k = int(spec.get("slice", len(value)))
+        except (TypeError, ValueError):
+            k = len(value)
+        try:
+            k_max = int(spec.get("k_max", k))
+        except (TypeError, ValueError):
+            k_max = k
+        value = value[:max(0, min(k, k_max))]
+
+    transform = str(spec.get("transform", "")).strip().lower()
+    if isinstance(value, str):
+        if transform == "lower":
+            value = value.lower()
+        elif transform == "upper":
+            value = value.upper()
+        elif transform == "title":
+            value = value.title()
+
+    if "template" in spec:
+        ctx = {
+            "value": value,
+            "source": source,
+            "target": target,
+        }
+        if isinstance(source, dict):
+            for k, v in source.items():
+                ctx[f"source.{k}"] = v
+        if isinstance(target, dict):
+            for k, v in target.items():
+                ctx[f"target.{k}"] = v
+        value = _render_template(str(spec.get("template")), ctx)
+
+    return value
+
+
+def _op_join_array_by_key(root: Dict[str, Any], op: Dict[str, Any], report: Dict[str, Any]) -> None:
+    target_path = str(op.get("target_array_path") or "")
+    source_path = str(op.get("source_array_path") or "")
+    join_key = str(op.get("join_key") or "")
+    write_field = str(op.get("write_field") or "")
+    field_map = op.get("field_map") or {}
+    if not target_path or not source_path or not join_key or not write_field or not isinstance(field_map, dict):
+        return
+
+    target = _path_get(root, target_path)
+    source = _path_get(root, source_path)
+    if not isinstance(target, list) or not isinstance(source, list):
+        return
+
+    source_index: Dict[Any, Dict[str, Any]] = {}
+    for row in source:
+        if isinstance(row, dict) and join_key in row and row.get(join_key) is not None:
+            source_index[row.get(join_key)] = row
+
+    touched = 0
+    for row in target:
+        if not isinstance(row, dict):
+            continue
+        join_val = row.get(join_key)
+        if join_val is None:
+            continue
+        src = source_index.get(join_val)
+        if not isinstance(src, dict):
+            continue
+        derived: Dict[str, Any] = {}
+        for out_key, spec in field_map.items():
+            derived[str(out_key)] = _derive_value(spec, root=root, source=src, target=row)
+        row[write_field] = derived
+        touched += 1
+    report.setdefault("transform_ops_applied", []).append({
+        "name": str(op.get("name") or ""),
+        "type": "join_array_by_key",
+        "target": target_path,
+        "source": source_path,
+        "rows_touched": touched,
+    })
+
+
+def _op_derive_fields(root: Dict[str, Any], op: Dict[str, Any], report: Dict[str, Any]) -> None:
+    target_path = str(op.get("target_object_path") or "")
+    fields = op.get("fields") or {}
+    if not target_path or not isinstance(fields, dict):
+        return
+    target = _path_get(root, target_path)
+    if not isinstance(target, dict):
+        return
+    for field_name, spec in fields.items():
+        target[str(field_name)] = _derive_value(spec, root=root, source=target, target=target)
+    report.setdefault("transform_ops_applied", []).append({"name": str(op.get("name") or ""), "type": "derive_fields", "target": target_path, "field_count": len(fields)})
+
+
+def _op_slice_preview(root: Dict[str, Any], op: Dict[str, Any], report: Dict[str, Any]) -> None:
+    target_path = str(op.get("target_path") or "")
+    if not target_path:
+        return
+    values = _path_get(root, target_path)
+    if not isinstance(values, list):
+        return
+    try:
+        k = int(op.get("k", len(values)))
+    except (TypeError, ValueError):
+        k = len(values)
+    try:
+        k_max = int(op.get("k_max", k))
+    except (TypeError, ValueError):
+        k_max = k
+    limit = max(0, min(k, k_max))
+    if len(values) <= limit:
+        return
+    _path_set(root, target_path, values[:limit])
+    report.setdefault("transform_ops_applied", []).append({
+        "name": str(op.get("name") or ""),
+        "type": "slice_preview",
+        "target": target_path,
+        "before": len(values),
+        "after": limit,
+    })
+
+
+def _apply_transform_stage(
+    node: Any,
+    artifact_id: str,
+    transforms: Dict[str, Any],
+    report: Dict[str, Any],
+) -> Any:
+    if not isinstance(node, dict):
+        return node
+    artifact_transforms = _normalize_transform_ops((transforms.get(artifact_id) or {}) if isinstance(transforms, dict) else {})
+    for transform_name in sorted(artifact_transforms.keys()):
+        op = artifact_transforms.get(transform_name)
+        if not isinstance(op, dict):
+            continue
+        op = dict(op)
+        op["name"] = transform_name
+        op_type = str(op.get("type", "")).strip().lower()
+        if op_type == "join_array_by_key":
+            _op_join_array_by_key(node, op, report)
+        elif op_type == "derive_fields":
+            _op_derive_fields(node, op, report)
+        elif op_type == "slice_preview":
+            _op_slice_preview(node, op, report)
+    return node
+
+
+def _build_policies_by_target(artifact_policies: Dict[str, Any]) -> Dict[str, Tuple[str, Dict[str, Any]]]:
+    by_target: Dict[str, Tuple[str, Dict[str, Any]]] = {}
+    for policy_name, policy in artifact_policies.items():
+        if not isinstance(policy, dict):
+            continue
+        target = _resolve_policy_target_path(policy_name, policy)
+        if not target:
+            continue
+        by_target[target] = (policy_name, policy)
+    return by_target
+
+def _apply_limits(
+    node: Any,    path: str,
+    artifact_id: str,
+    effective_limits: Dict[str, int],
+    policies: Dict[str, Any],
+    value_filter: Optional[Any],
+    report: Dict[str, Any],
+    root_node: Optional[Dict[str, Any]] = None,
+) -> Any:
+    if root_node is None and isinstance(node, dict):
+        root_node = node
+
+    if isinstance(node, list):
+        current_limit = _resolve_limit_for_path(effective_limits, artifact_id, path)
+        next_list = [
+            _apply_limits(
+                item,
+                path=f"{path}[]" if path else "[]",
+                artifact_id=artifact_id,
+                effective_limits=effective_limits,
+                policies=policies,
+                value_filter=value_filter,
+                report=report,
+                root_node=root_node,
+            )
+            for item in node
+        ]
+        if current_limit is not None and len(next_list) > current_limit:
+            report["truncated_arrays"].append({"path": path or "[]", "before": len(next_list), "after": current_limit})
+            next_list = next_list[:current_limit]
+        return next_list
+
+    if isinstance(node, dict):
+        next_dict: Dict[str, Any] = {}
+        artifact_policies = (policies.get(artifact_id) or {}) if isinstance(policies, dict) else {}
+        policies_by_target = _build_policies_by_target(artifact_policies) if isinstance(artifact_policies, dict) else {}
+        for key, value in node.items():
+            child_path = f"{path}.{key}" if path else key
+            if isinstance(value, list) and child_path in policies_by_target:
+                policy_name, policy = policies_by_target[child_path]
+                next_dict[key] = _apply_typed_array_policy(
+                    node=root_node or node,
+                    items=value,
+                    policy_name=policy_name,
+                    policy=policy,
+                    value_filter=value_filter,
+                    report=report,
+                )
+                continue
+            next_dict[key] = _apply_limits(
+                value,                child_path,
+                artifact_id,
+                effective_limits,
+                policies,
+                value_filter,
+                report,
+                root_node=root_node,
+            )
+        return next_dict
+
+    return node
+
+
+def apply_llm_pruning(
+    payload: Any,
+    artifact_id: str,
+    mode: str,
+    keep_keys: Optional[Iterable[str]],
+    drop_keys: Optional[Iterable[str]],
+    limits: Optional[Dict[str, int]],
+    policy_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
+    replace_policies: Optional[Iterable[str]] = None,
+    transform_overrides: Optional[Dict[str, Any]] = None,
+    replace_transforms: Optional[Iterable[str]] = None,
+    value_filter: Optional[Any] = None,
+    debug: bool = False,
+    effective_policies: Optional[Dict[str, Any]] = None,
+    effective_transforms: Optional[Dict[str, Any]] = None,
+    mode_config: Optional[Dict[str, Any]] = None,
+) -> Tuple[Any, Dict[str, Any]]:
+    mode_config = mode_config or _resolve_pruning_mode(mode)
+
+    keep_set = set(keep_keys or [])
+    tier1_cfg = mode_config.get("tier1", {})
+    tier2_cfg = mode_config.get("tier2", {})
+    tier3_cfg = mode_config.get("tier3", {})
+
+    drop_rules = list(tier1_cfg.get("global_drop_rules", []) or [])
+    drop_rules.extend(tier2_cfg.get("artifact_drop_rules", {}).get(artifact_id, []) or [])
+    guarded_rule_keys = {str(rule.get("key")) for rule in drop_rules if rule.get("key")}
+
+    effective_drops = set(tier1_cfg.get("global_drop_keys", []))
+    effective_drops.update(tier2_cfg.get("artifact_drop_keys", {}).get(artifact_id, []))
+    effective_drops.update(drop_keys or [])
+    effective_drops = {k for k in effective_drops if k not in guarded_rule_keys}
+
+    default_limits: Dict[str, int] = dict(tier3_cfg.get("limits", {}))
+    policy_clamps: List[Dict[str, Any]] = []
+    if limits:
+        default_limits.update(_guard_limits_map(limits, "limits", policy_clamps) or {})
+
+    requested_drop_keys = [str(k) for k in (drop_keys or [])]
+    report: Dict[str, Any] = {
+        "mode": mode,
+        "artifact_id": artifact_id,
+        "dropped_keys": Counter(),
+        "truncated_arrays": [],
+        "effective_limits": default_limits,
+        "seen_keys": Counter(),
+        "kept_key_hits": Counter(),
+        "keep_requested": sorted(list(keep_set)),
+        "drop_requested": requested_drop_keys,
+    }
+    resolved_policies = effective_policies or _build_effective_policies(
+        base_policies=tier3_cfg.get("policies", {}),
+        policy_overrides=policy_overrides,
+        replace_policies=replace_policies,
+        report=report if debug else None,
+        scope_artifact_id=artifact_id,
+    )
+    if debug and effective_policies is not None:
+        report["policy_effective"] = {artifact_id: dict((resolved_policies.get(artifact_id) or {}))}
+        report["policy_overrides_received"] = policy_overrides or {}
+        report["policy_clamps"] = []
+    if debug and policy_clamps:
+        report.setdefault("policy_clamps", []).extend(policy_clamps)
+
+    resolved_transforms = effective_transforms or _build_effective_transforms(
+        base_transforms=tier3_cfg.get("transforms", {}),
+        transform_overrides=transform_overrides,
+        replace_transforms=replace_transforms,
+        report=report if debug else None,
+        scope_artifact_id=artifact_id,
+    )
+    if debug and effective_transforms is not None:
+        report["transform_effective"] = {artifact_id: dict((resolved_transforms.get(artifact_id) or {}))}
+        report["transform_overrides_received"] = transform_overrides or {}
+        replace_set = set(replace_transforms or [])
+        report["replace_transforms_applied"] = sorted([
+            key for key in (transform_overrides or {}).keys() if key in replace_set
+        ])
+
+    if mode == "raw" and not drop_keys and not keep_keys and not limits and not value_filter and not policy_overrides and not transform_overrides:
+        report["drop_requested_not_found"] = [k for k in requested_drop_keys if report["seen_keys"].get(k, 0) == 0]
+        report["dropped_keys"] = dict(report["dropped_keys"])
+        report["kept_key_hits"] = dict(report["kept_key_hits"])
+        report.pop("seen_keys", None)
+        return payload, report
+
+    working_payload = copy.deepcopy(payload)
+    transformed = _apply_transform_stage(
+        node=working_payload,
+        artifact_id=artifact_id,
+        transforms=resolved_transforms,
+        report=report,
+    )
+    pruned = _recursive_prune_keys(
+        transformed,
+        key_drops=effective_drops,
+        keep_keys=keep_set,
+        drop_rules=drop_rules,
+        report=report,
+        path="",
+    )
+
+    pruned = _apply_limits(
+        pruned,
+        path="",
+        artifact_id=artifact_id,
+        effective_limits=default_limits,
+        policies=resolved_policies,
+        value_filter=value_filter,
+        report=report,
+        root_node=pruned if isinstance(pruned, dict) else None,
+    )
+
+    report["drop_requested_not_found"] = [k for k in requested_drop_keys if report["seen_keys"].get(k, 0) == 0]
+    report["dropped_keys"] = dict(report["dropped_keys"])
+    report["kept_key_hits"] = dict(report["kept_key_hits"])
+    report.pop("seen_keys", None)
+    if not debug:
+        report = {
+            "mode": report["mode"],
+            "artifact_id": report["artifact_id"],
+            "dropped_key_count": sum(report["dropped_keys"].values()),
+            "truncation_count": len(report["truncated_arrays"]),
+        }
+    return pruned, report
+
+
+def _run_pruning_smoke_checks() -> None:
+    mode_cfg = _resolve_pruning_mode("llm_baseline")
+    assert mode_cfg["tier3"]["limits"].get("A6.tests") == 15
+    assert isinstance(mode_cfg["tier3"].get("transforms", {}).get("A8"), dict)
+
+    sample_a9 = {
+        "columns": [            {"column": "z_measure", "primary_role": "measure"},
+            {"column": "id_a", "primary_role": "id_key"},
+            {"column": "id_b", "primary_role": "id_key"},
+            {"column": "time_1", "primary_role": "time_index"},
+            {"column": "time_1", "primary_role": "time_index"},
+        ]
+    }
+    pruned_a9, _ = apply_llm_pruning(
+        payload=sample_a9,
+        artifact_id="A9",
+        mode="llm_baseline",
+        keep_keys=[],
+        drop_keys=[],
+        limits=None,
+        value_filter=None,
+        debug=True,
+    )
+    selected_names = [c.get("column") for c in pruned_a9.get("columns", []) if isinstance(c, dict)]
+    assert "id_a" in selected_names and "id_b" in selected_names
+
+    sample_a6 = {
+        "row_grain_assessment": {"best_candidate": {"keys": ["order_id"]}},
+        "tests": [
+            {"keys_tested": ["order_id"], "pivot_safety": 0.5, "collision_severity_score": 0.1, "non_key_conflict_group_pct": 0.1, "uniqueness_rate": 0.8},
+            {"keys_tested": ["customer_id"], "pivot_safety": 0.9, "collision_severity_score": 0.5, "non_key_conflict_group_pct": 0.2, "uniqueness_rate": 0.6},
+        ],
+    }
+    pruned_a6, _ = apply_llm_pruning(
+        payload=sample_a6,
+        artifact_id="A6",
+        mode="llm_baseline",
+        keep_keys=[],
+        drop_keys=[],
+        limits=None,
+        value_filter=None,
+        debug=True,
+    )
+    first_test = (pruned_a6.get("tests") or [{}])[0]
+    assert _normalize_keys_tested(first_test.get("keys_tested")) == ("order_id",)
+
+    sample_a8 = {
+        "families": [
+            {
+                "family_id": "f1",
+                "stem_evidence": {"normalized_stem": "metric", "raw_stem": "Metric"},
+                "patterns": ["suffix_keyword_numeric"],
+                "columns_preview": ["metric_q1", "metric_q2", "metric_q3", "metric_q4"],
+                "columns_count": 4,
+            }
+        ],
+        "families_index": [
+            {"family_id": "f1", "repeat_dim": "quarter", "patterns": ["suffix_keyword_numeric"]}
+        ],
+    }
+    pruned_a8, _ = apply_llm_pruning(
+        payload=sample_a8,
+        artifact_id="A8",
+        mode="llm_baseline",
+        keep_keys=[],
+        drop_keys=[],
+        limits=None,
+        value_filter=None,
+        debug=True,
+    )
+    first_family = (pruned_a8.get("families_index") or [{}])[0]
+    assert isinstance(first_family.get("family_signature"), dict)
+    assert "families" not in pruned_a8
+
+    grain_profile, profile_source = _load_profile_local("grain_worker")
+    assert profile_source == "local"
+    assert grain_profile["profile"] == "grain_worker"
+    assert grain_profile["artifacts"] == ["A5", "A6", "A7", "A8", "A9", "A10"]
+
+    profile_cfg = grain_profile["mode_config"]
+    assert "inputs" in profile_cfg["tier2"]["artifact_drop_keys"]["A5"]
+
+    pruned_a9_profile, _ = apply_llm_pruning(
+        payload=sample_a9,
+        artifact_id="A9",
+        mode="grain_worker",
+        keep_keys=[],
+        drop_keys=[],
+        limits=None,
+        value_filter=None,
+        debug=True,
+        mode_config=profile_cfg,
+    )
+    selected_names_profile = [c.get("column") for c in pruned_a9_profile.get("columns", []) if isinstance(c, dict)]
+    assert "id_a" in selected_names_profile and "id_b" in selected_names_profile
+
+    pruned_a8_profile, _ = apply_llm_pruning(
+        payload=sample_a8,
+        artifact_id="A8",
+        mode="grain_worker",
+        keep_keys=[],
+        drop_keys=[],
+        limits=None,
+        value_filter=None,
+        debug=True,
+        mode_config=profile_cfg,
+    )
+    profile_first_family = (pruned_a8_profile.get("families_index") or [{}])[0]
+    assert isinstance(profile_first_family.get("family_signature"), dict)
+
+    pruned_a6_override, _ = apply_llm_pruning(
+        payload=sample_a6,
+        artifact_id="A6",
+        mode="grain_worker",
+        keep_keys=[],
+        drop_keys=[],
+        limits=None,
+        policy_overrides={"A6.tests_policy": {"k": 1}},
+        value_filter=None,
+        debug=True,
+        mode_config=profile_cfg,
+    )
+    assert len(pruned_a6_override.get("tests", [])) == 1
+
+    try:
+        _load_profile_local("missing_profile")
+        raise AssertionError("Expected missing profile to raise HTTPException")
+    except HTTPException as exc:
+        assert exc.status_code == 404
+
+    mode_cfg_bundle, mode_meta_bundle = _resolve_mode_config("grain_worker")
+    assert mode_meta_bundle["profile_artifacts"] == ["A5", "A6", "A7", "A8", "A9", "A10"]
+    assert mode_cfg_bundle == profile_cfg
+    assert parse_csv_list("A5,A8") == ["A5", "A8"]
+
+    skip_df = pd.DataFrame({
+        "Q1_Screening": ["No", "No", "No", "No", "No", "Yes", "Yes", "Yes", "Yes", "Yes"],
+        "Q2_Freq": [None, None, None, None, None, "Weekly", "Monthly", "Daily", "Rarely", "Weekly"],
+        "Q3_Type": [None, None, None, None, None, "A", "B", "C", "A", "B"],
+        "Noise": [None, "x", None, "y", None, "m", None, "n", None, "p"],
+    })
+    skip_cols_profile = {
+        "Q1_Screening": {"missing_pct": 0.0, "unique_count": 2},
+        "Q2_Freq": {"missing_pct": 50.0, "unique_count": 5},
+        "Q3_Type": {"missing_pct": 50.0, "unique_count": 3},
+        "Noise": {"missing_pct": 50.0, "unique_count": 4},
+    }
+    skip_signal_map = {
+        "Q1_Screening": {"missing_pct": 0.0, "unique_count": 2},
+        "Q2_Freq": {"missing_pct": 50.0, "unique_count": 5},
+        "Q3_Type": {"missing_pct": 50.0, "unique_count": 3},
+        "Noise": {"missing_pct": 50.0, "unique_count": 4},
+    }
+    skip_artifact = _build_conditional_missingness_artifact(
+        df=skip_df,
+        cols_profile=skip_cols_profile,
+        column_signal_map=skip_signal_map,
+        artifact_inputs={"A16": {"uses": ["dataset", "A4", "cols_profile", "column_signal_map"]}},
+    )
+    rules = skip_artifact.get("detected_skip_logic", [])
+    matched = next(
+        (
+            rule for rule in rules
+            if rule.get("trigger_column") == "Q1_Screening" and rule.get("trigger_value") == "No"
+        ),
+        None,
+    )
+    assert matched is not None
+    assert matched.get("affected_column_count") == 2
+    assert sorted(matched.get("sample_affected_columns", [])) == ["Q2_Freq", "Q3_Type"]
+    assert matched.get("rule_strength") == 1.0
+    assert matched.get("directionality") == "bidirectional"
+    assert matched.get("missing_explained_pct") == 100.0
+    master_switches = skip_artifact.get("master_switch_candidates", [])
+    assert master_switches
+    assert master_switches[0].get("trigger_column") == "Q1_Screening"
+    assert master_switches[0].get("explained_column_count") == 2
+    assert skip_artifact.get("audit_assumptions", {}).get("family_member_triggers_excluded_from_master_switch_candidates") is True
+
+    type_transform_profile, type_transform_source = _load_profile_local("type_transform_worker")
+    assert type_transform_source == "local"
+    assert "A16" in type_transform_profile["artifacts"]
+
+
+if os.getenv("RUN_PRUNING_SMOKE_TESTS", "").strip().lower() in {"1", "true", "yes"}:
+    _run_pruning_smoke_checks()
+
+def _get_decoded_payload(run_id: str, artifact_id: str) -> Tuple[str, Any, Dict[str, Any]]:
+    content_type, data, artifact_meta = load_artifact_bytes(run_id=run_id, artifact_id=artifact_id)
+    digest = sha256_hex(data)
+    cache_key = (run_id, artifact_id, digest)
+    if cache_key in _DECODE_CACHE:
+        kind, payload = _DECODE_CACHE[cache_key]
+        return kind, payload, artifact_meta
+
+    kind, payload = decode_payload(content_type, data)
+    if len(_DECODE_CACHE) >= _DECODE_CACHE_MAX:
+        _DECODE_CACHE.pop(next(iter(_DECODE_CACHE)))
+    _DECODE_CACHE[cache_key] = (kind, payload)
+    return kind, payload, artifact_meta
+
+
+def _build_view_response(kind: str, payload: Any, report: Dict[str, Any], debug: bool, profile_header: str) -> Response:
+    if kind == "json":
+        headers: Dict[str, str] = {"X-Pruning-Profile": profile_header}
+        if debug:
+            headers["X-Prune-Report"] = json.dumps(report, separators=(",", ":"), default=_json_default)[:4096]
+        return JSONResponse(content=payload, headers=headers)
+
+    if kind == "jsonl":
+        headers = {"X-Pruning-Profile": profile_header}
+        if debug:
+            headers["X-Prune-Report"] = json.dumps(report, separators=(",", ":"), default=_json_default)[:4096]
+        return StreamingResponse(_iter_jsonl_bytes(payload), media_type="application/jsonl", headers=headers)
+
+    raise HTTPException(status_code=415, detail="Artifact view supports only JSON/JSONL. Use /download for raw bytes.")
+
+
+@app.get("/artifacts/{artifact_id}")
+def artifact_view_get(
+    artifact_id: str,
+    run_id: str,
+    mode: str = "raw",
+    keep: str = "",
+    drop: str = "",
+    limits: str = "",
+    debug: bool = False,
+    _=Depends(require_token),
+):
+    kind, payload, _artifact_meta = _get_decoded_payload(run_id=run_id, artifact_id=artifact_id)
+    if kind == "other":
+        raise HTTPException(status_code=415, detail="Artifact view supports only JSON/JSONL. Use /download for raw bytes.")
+
+    keep_keys = parse_csv_list(keep)
+    drop_keys = parse_csv_list(drop)
+    limits_map = parse_limits_csv(limits)
+    resolved_mode_cfg, mode_meta = _resolve_mode_config(mode)
+    has_overrides = any([keep_keys, drop_keys, limits_map])
+    profile_header = mode_meta["header"] if not has_overrides else f"{mode_meta['header']}; overrides=keep,drop,limits"
+
+    pruned, report = apply_llm_pruning(
+        payload=payload,
+        artifact_id=artifact_id,
+        mode=mode,
+        keep_keys=keep_keys,
+        drop_keys=drop_keys,
+        limits=limits_map,
+        policy_overrides=None,
+        replace_policies=None,
+        transform_overrides=None,
+        replace_transforms=None,
+        value_filter=None,
+        debug=debug,
+        mode_config=resolved_mode_cfg,
+    )
+
+    if debug and kind == "json" and isinstance(pruned, dict):
+        with_report = dict(pruned)
+        with_report["_prune_report"] = report
+        return JSONResponse(content=with_report, headers={"X-Pruning-Profile": profile_header})
+
+    return _build_view_response(kind=kind, payload=pruned, report=report, debug=debug, profile_header=profile_header)
+
+
+@app.post("/artifacts/{artifact_id}/view")
+def artifact_view_post(
+    artifact_id: str,
+    req: ArtifactViewRequest,
+    _=Depends(require_token),
+):
+    kind, payload, _artifact_meta = _get_decoded_payload(run_id=req.run_id, artifact_id=artifact_id)
+    if kind == "other":
+        raise HTTPException(status_code=415, detail="Artifact view supports only JSON/JSONL. Use /download for raw bytes.")
+
+    mode_config, mode_meta = _resolve_mode_config(req.mode)
+    override_parts: List[str] = []
+    if req.policy_overrides:
+        override_parts.append("policy_overrides")
+    if req.transform_overrides:
+        override_parts.append("transform_overrides")
+    if req.keep:
+        override_parts.append("keep")
+    if req.drop:
+        override_parts.append("drop")
+    if req.limits:
+        override_parts.append("limits")
+    profile_header = f"{mode_meta['header']}; overrides={','.join(override_parts) if override_parts else 'none'}"
+    bundle_effective_policies = _build_effective_policies(
+        base_policies=mode_config.get("tier3", {}).get("policies", {}),
+        policy_overrides=req.policy_overrides,
+        replace_policies=req.replace_policies,
+        report=None,
+    )
+    bundle_effective_transforms = _build_effective_transforms(
+        base_transforms=mode_config.get("tier3", {}).get("transforms", {}),
+        transform_overrides=req.transform_overrides,
+        replace_transforms=req.replace_transforms,
+        report=None,
+    )
+
+    pruned, report = apply_llm_pruning(
+        payload=payload,
+        artifact_id=artifact_id,
+        mode=req.mode,
+        keep_keys=req.keep,
+        drop_keys=req.drop,
+        effective_policies=bundle_effective_policies,
+        limits=req.limits,
+        policy_overrides=req.policy_overrides,
+        replace_policies=req.replace_policies,
+        transform_overrides=req.transform_overrides,
+        replace_transforms=req.replace_transforms,
+        value_filter=req.value_filter,
+        debug=req.debug,
+        effective_transforms=bundle_effective_transforms,
+        mode_config=mode_config,
+    )
+
+    if req.debug and kind == "json" and isinstance(pruned, dict):
+        with_report = dict(pruned)
+        with_report["_prune_report"] = report
+        return JSONResponse(content=with_report, headers={"X-Pruning-Profile": profile_header})
+
+    return _build_view_response(kind=kind, payload=pruned, report=report, debug=req.debug, profile_header=profile_header)
+
+
+def _artifact_bundle_view(
+    req: ArtifactBundleRequest,
+    response: Response,
+) -> Dict[str, Any]:
+    artifacts_out: Dict[str, Any] = {}
+    bundle_report: Dict[str, Any] = {}
+
+    global_scope = req.global_scope or ArtifactBundleScope(mode=req.mode or "raw")
+    if req.mode and req.mode != "raw" and (global_scope.mode is None or global_scope.mode == "raw"):
+        global_scope.mode = req.mode
+    if not global_scope.mode:
+        global_scope.mode = req.mode or "raw"
+    per_artifact = req.per_artifact or {}
+    profile_mode_cfg: Optional[Dict[str, Any]] = None
+    mode_meta: Optional[Dict[str, Any]] = None
+
+    if global_scope.mode not in {"raw", "llm_baseline"}:
+        profile_mode_cfg, mode_meta = _resolve_mode_config(global_scope.mode)
+
+    effective_artifact_ids = list(req.artifact_ids or [])
+    if not effective_artifact_ids:
+        if mode_meta and mode_meta.get("profile_artifacts"):
+            effective_artifact_ids = list(mode_meta.get("profile_artifacts") or [])
+        else:
+            raise HTTPException(status_code=422, detail="artifact_ids are required for mode raw or llm_baseline")
+
+    override_parts: List[str] = []
+    if req.policy_overrides:
+        override_parts.append("policy_overrides")
+    if req.transform_overrides:
+        override_parts.append("transform_overrides")
+    if req.artifact_ids:
+        override_parts.append("artifact_ids")
+    profile_header = (mode_meta or {"header": f"{global_scope.mode}; source=request"})["header"]
+    profile_header = f"{profile_header}; overrides={','.join(override_parts) if override_parts else 'none'}"
+    response.headers["X-Pruning-Profile"] = profile_header
+
+    for artifact_id in effective_artifact_ids:
+        artifact_scope = per_artifact.get(artifact_id) or ArtifactBundleScope()
+        effective_mode = artifact_scope.mode or global_scope.mode or "raw"
+        resolved_mode_cfg, _effective_mode_meta = (profile_mode_cfg, mode_meta) if (profile_mode_cfg is not None and effective_mode == global_scope.mode) else _resolve_mode_config(effective_mode)
+        effective_keep = artifact_scope.keep if artifact_scope.keep is not None else global_scope.keep
+        effective_drop = artifact_scope.drop if artifact_scope.drop is not None else global_scope.drop
+        effective_limits = artifact_scope.limits if artifact_scope.limits is not None else global_scope.limits
+        effective_value_filter = artifact_scope.value_filter if artifact_scope.value_filter is not None else global_scope.value_filter
+
+        kind, payload, _ = _get_decoded_payload(run_id=req.run_id, artifact_id=artifact_id)
+        if kind == "other":
+            raise HTTPException(status_code=415, detail=f"Artifact {artifact_id} is not JSON/JSONL; use /download")
+
+        pruned, report = apply_llm_pruning(
+            payload=payload,
+            artifact_id=artifact_id,
+            mode=effective_mode,
+            keep_keys=effective_keep,
+            drop_keys=effective_drop,
+            limits=effective_limits,
+            policy_overrides=req.policy_overrides,
+            replace_policies=req.replace_policies,
+            transform_overrides=req.transform_overrides,
+            replace_transforms=req.replace_transforms,
+            value_filter=effective_value_filter,
+            debug=req.debug,
+            mode_config=resolved_mode_cfg,
+        )
+        artifacts_out[artifact_id] = pruned
+        if req.debug:
+            bundle_report[artifact_id] = report
+
+    body: Dict[str, Any] = {
+        "run_id": req.run_id,
+        "mode": global_scope.mode or "raw",
+        "artifact_ids": effective_artifact_ids,
+        "artifacts": artifacts_out,
+    }
+    if req.debug:
+        body["_bundle_prune_report"] = bundle_report
+    return body
+
+
+@app.get("/artifact-bundles")
+def artifact_bundle_view_get(
+    run_id: str,
+    response: Response,
+    mode: str = "raw",
+    artifact_ids: str = "",
+    debug: bool = False,
+    _=Depends(require_token),
+) -> Dict[str, Any]:
+    req = ArtifactBundleRequest(
+        run_id=run_id,
+        mode=mode,
+        artifact_ids=parse_csv_list(artifact_ids) or None,
+        debug=debug,
+    )
+    return _artifact_bundle_view(req=req, response=response)
+
+
+@app.post("/artifact-bundles/view")
+def artifact_bundle_view_post(
+    req: ArtifactBundleRequest,
+    response: Response,
+    _=Depends(require_token),
+) -> Dict[str, Any]:
+    return _artifact_bundle_view(req=req, response=response)
