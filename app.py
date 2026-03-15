@@ -2679,6 +2679,10 @@ class LightContractXlsxRequest(BaseModel):
     filename: str | None = None
 
 
+class LightContractFinalizeAcceptedRequest(BaseModel):
+    run_id: str
+
+
 def _sanitize_export_filename(name: str, default_name: str) -> str:
     name = (name or "").strip().replace("\n", "").replace("\r", "")
     name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
@@ -2770,6 +2774,16 @@ def _load_json_from_run_object(run_id: str, object_name: str) -> Dict[str, Any]:
         raise
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Failed to load light contract context: {exc}") from exc
+
+
+def _persist_light_contract_decisions(run_id: str, handoff: Dict[str, Any], source: str) -> Tuple[Dict[str, Any], str]:
+    decisions = dict(handoff)
+    decisions["run_id"] = run_id
+    decisions["source"] = source
+    decisions["finalized_at"] = pd.Timestamp.utcnow().isoformat()
+    decisions.setdefault("parse_validation", {})
+    object_path = _upload_json_to_run_object(run_id, "light_contract_decisions.json", decisions)
+    return decisions, object_path
 
 
 def _first_non_empty(items: List[Any]) -> str:
@@ -3308,6 +3322,26 @@ def get_light_contract_context(
     }
 
 
+@app.post("/light-contracts/finalize-accepted")
+def finalize_accepted_light_contract(
+    req: LightContractFinalizeAcceptedRequest,
+    _: None = Depends(require_token),
+):
+    context = _load_json_from_run_object(req.run_id, "light_contract_context.json")
+    handoff = _build_accepted_light_contract_handoff(context)
+    decisions, object_path = _persist_light_contract_decisions(
+        run_id=req.run_id,
+        handoff=handoff,
+        source="accepted_context",
+    )
+    return {
+        "run_id": req.run_id,
+        "light_contract_status": decisions.get("light_contract_status"),
+        "light_contract_decisions": decisions,
+        "object_path": object_path,
+    }
+
+
 @app.post("/light-contracts/parse")
 async def parse_light_contract_xlsx(
     run_id: str = Form(...),
@@ -3335,6 +3369,59 @@ async def parse_light_contract_xlsx(
         "parsed_workbook": parsed,
         "downstream_handoff": downstream_handoff,
     }
+
+
+@app.post("/light-contracts/finalize-modified")
+async def finalize_modified_light_contract(
+    run_id: str = Form(...),
+    file: UploadFile = File(...),
+    _: None = Depends(require_token),
+):
+    filename = str(file.filename or "").lower()
+    if not (filename.endswith(".xlsx") or filename.endswith(".xlsm") or filename.endswith(".xltx") or filename.endswith(".xltm")):
+        raise HTTPException(status_code=415, detail="Expected an Excel workbook upload")
+
+    payload = await file.read()
+    if not payload:
+        raise HTTPException(status_code=400, detail="Uploaded workbook is empty")
+
+    try:
+        parsed = parse_light_contract_xlsx_bytes(payload)
+        handoff = _build_parsed_light_contract_handoff(run_id=run_id, parsed_workbook=parsed)
+        decisions, object_path = _persist_light_contract_decisions(
+            run_id=run_id,
+            handoff=handoff,
+            source="uploaded_workbook",
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to finalize modified light contract workbook: {exc}") from exc
+
+    return {
+        "run_id": run_id,
+        "light_contract_status": decisions.get("light_contract_status"),
+        "light_contract_decisions": decisions,
+        "object_path": object_path,
+        "parsed_workbook": parsed,
+    }
+
+
+@app.get("/light-contracts/decisions")
+def get_light_contract_decisions(
+    run_id: str,
+    _: None = Depends(require_token),
+):
+    try:
+        decisions = _load_json_from_run_object(run_id, "light_contract_decisions.json")
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            raise HTTPException(
+                status_code=404,
+                detail="light_contract_decisions.json not found for run_id. Finalize the light contract before continuing.",
+            ) from exc
+        raise
+    return decisions
 
 @app.post("/export/manifest-txt", include_in_schema=False, deprecated=True)
 def export_manifest_txt(body: dict):
