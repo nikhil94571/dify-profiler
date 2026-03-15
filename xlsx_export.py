@@ -86,6 +86,14 @@ def _autosize_columns(ws) -> None:
         ws.column_dimensions[letter].width = min(max(12, max_len + 2), 60)
 
 
+def _apply_fixed_widths(ws, fixed_widths: Dict[str, float]) -> None:
+    header_map = {str(ws.cell(row=1, column=idx).value or ""): get_column_letter(idx) for idx in range(1, ws.max_column + 1)}
+    for header, width in fixed_widths.items():
+        letter = header_map.get(header)
+        if letter:
+            ws.column_dimensions[letter].width = width
+
+
 def _estimate_line_count(text: str, width: float) -> int:
     if not text:
         return 1
@@ -126,7 +134,13 @@ def _style_data_region(ws, recommended_cols: List[str], editable_cols: List[str]
             cell.alignment = Alignment(wrap_text=True, vertical="top")
 
 
-def _write_table_sheet(ws, headers: List[str], rows: List[List[Any]], freeze: str = "A2") -> None:
+def _write_table_sheet(
+    ws,
+    headers: List[str],
+    rows: List[List[Any]],
+    freeze: str = "A2",
+    fixed_widths: Dict[str, float] | None = None,
+) -> None:
     ws.append(headers)
     _style_header_row(ws)
     for row in rows:
@@ -135,11 +149,18 @@ def _write_table_sheet(ws, headers: List[str], rows: List[List[Any]], freeze: st
     if headers:
         ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{max(1, ws.max_row)}"
     _autosize_columns(ws)
+    if fixed_widths:
+        _apply_fixed_widths(ws, fixed_widths)
     _apply_row_heights(ws)
 
 
-def _build_readme_rows() -> List[List[str]]:
-    return [
+def _build_readme_rows(contract: Dict[str, Any]) -> List[List[str]]:
+    metadata_rows = [
+        ["run_id", str(contract.get("run_id") or "")],
+        ["generated_at", str(contract.get("generated_at") or "")],
+        ["source_endpoint", str(contract.get("source_endpoint") or "")],
+    ]
+    return metadata_rows + [
         ["section", "details"],
         ["Workbook purpose", "Use this workbook to review the grain worker's structural recommendations before later specialists continue. The goal is to confirm the base row grain, validate repeat families, and capture any naming or structural overrides."],
         ["Primary Grain", "The minimal key or key combination that should identify one row in the base table."],
@@ -150,6 +171,7 @@ def _build_readme_rows() -> List[List[str]]:
         ["Status: modify", "Leave the recommended columns untouched and fill the your_* columns with your corrected values."],
         ["Status: reject", "Reject the recommendation and explain why in comments. A later step will review the rejection."],
         ["Status: unsure", "Leave comments that explain what is unclear or what extra review is needed."],
+        ["Modify scope", "In this light contract, modify is mainly intended for the Primary Grain sheet. For families and dimensions, prefer accept, reject, unsure, and comments."],
         ["Composite key guidance", "To create a composite key, fill your_key_1 and then add any additional key parts in your_key_2 and your_key_3. Leave unused trailing key cells blank. Example: a two-part key uses only your_key_1 and your_key_2."],
         ["3-step workflow", "1) Review the recommendation sheets. 2) Set status for each row. 3) Fill the your_* fields only when modifying or rejecting."],
     ]
@@ -176,14 +198,14 @@ def build_light_contract_xlsx_bytes(contract: Dict[str, Any]) -> bytes:
     # Sheet 1: Read Me
     ws = wb.active
     ws.title = "Read Me"
-    readme_rows = _build_readme_rows()
-    ws.append(readme_rows[0])
+    readme_rows = _build_readme_rows(contract)
+    ws.append(["section", "details"])
     _style_header_row(ws)
-    for row in readme_rows[1:]:
+    for row in readme_rows:
         ws.append(row)
     ws.freeze_panes = "A2"
     ws.column_dimensions["A"].width = 24
-    ws.column_dimensions["B"].width = 120
+    ws.column_dimensions["B"].width = 72
     for row in ws.iter_rows():
         for cell in row:
             cell.alignment = Alignment(wrap_text=True, vertical="top")
@@ -201,7 +223,7 @@ def build_light_contract_xlsx_bytes(contract: Dict[str, Any]) -> bytes:
         ]
         for row in contract.get("column_guide_rows", [])
     ]
-    _write_table_sheet(ws_cols, column_headers, column_rows)
+    _write_table_sheet(ws_cols, column_headers, column_rows, fixed_widths={"column_name": 28, "family_id": 18, "notes": 40})
 
     # Sheet 3: Grain Summary
     ws_summary = wb.create_sheet(title="Grain Summary")
@@ -215,7 +237,7 @@ def build_light_contract_xlsx_bytes(contract: Dict[str, Any]) -> bytes:
         ]
         for row in contract.get("grain_summary_rows", [])
     ]
-    _write_table_sheet(ws_summary, summary_headers, summary_rows)
+    _write_table_sheet(ws_summary, summary_headers, summary_rows, fixed_widths={"topic": 22, "recommendation": 30, "why": 56, "needs_review": 14})
 
     # Sheet 4: Primary Grain
     ws_grain = wb.create_sheet(title="Primary Grain")
@@ -244,7 +266,7 @@ def build_light_contract_xlsx_bytes(contract: Dict[str, Any]) -> bytes:
         ]
         for row in contract.get("primary_grain_rows", [])
     ]
-    _write_table_sheet(ws_grain, grain_headers, grain_rows)
+    _write_table_sheet(ws_grain, grain_headers, grain_rows, fixed_widths={"item": 18, "comments": 50})
     _style_data_region(
         ws_grain,
         recommended_cols=["recommended_key_1", "recommended_key_2", "recommended_key_3"],
@@ -280,7 +302,7 @@ def build_light_contract_xlsx_bytes(contract: Dict[str, Any]) -> bytes:
         ]
         for row in contract.get("dimension_rows", [])
     ]
-    _write_table_sheet(ws_dim, dim_headers, dim_rows)
+    _write_table_sheet(ws_dim, dim_headers, dim_rows, fixed_widths={"table_name": 28, "relationship_to_primary": 18, "comments": 48})
     _style_data_region(
         ws_dim,
         recommended_cols=["recommended_key_1", "recommended_key_2", "recommended_key_3", "relationship_to_primary"],
@@ -314,7 +336,7 @@ def build_light_contract_xlsx_bytes(contract: Dict[str, Any]) -> bytes:
         ]
         for row in contract.get("repeat_family_rows", [])
     ]
-    _write_table_sheet(ws_fam, fam_headers, fam_rows)
+    _write_table_sheet(ws_fam, fam_headers, fam_rows, fixed_widths={"family_id": 18, "recommended_table_name": 28, "recommended_repeat_index_name": 20, "recommended_parent_key": 24, "comments": 56})
     _style_data_region(
         ws_fam,
         recommended_cols=["recommended_table_name", "recommended_repeat_index_name", "recommended_parent_key"],
@@ -345,7 +367,7 @@ def build_light_contract_xlsx_bytes(contract: Dict[str, Any]) -> bytes:
             ]
             for row in structural_gate_rows
         ]
-        _write_table_sheet(ws_gates, gate_headers, gate_rows)
+        _write_table_sheet(ws_gates, gate_headers, gate_rows, fixed_widths={"trigger_column": 24, "trigger_value": 18, "affected_family_ids": 32, "interpretation": 54})
 
     # Sheet 7/8: Overrides
     ws_over = wb.create_sheet(title="Overrides")
@@ -358,20 +380,20 @@ def build_light_contract_xlsx_bytes(contract: Dict[str, Any]) -> bytes:
         ]
         for row in contract.get("override_rows", [])
     ]
-    _write_table_sheet(ws_over, override_headers, override_rows)
+    _write_table_sheet(ws_over, override_headers, override_rows, fixed_widths={"field": 34, "description": 58, "user_input": 58})
     _style_data_region(ws_over, recommended_cols=["field", "description"], editable_cols=["user_input"])
 
     grain_status = DataValidation(type="list", formula1='"accept,modify,reject,unsure"', allow_blank=True)
     ws_grain.add_data_validation(grain_status)
     grain_status.add(f"H2:H{max(2, ws_grain.max_row)}")
 
-    dim_status = DataValidation(type="list", formula1='"accept,modify,reject,unsure"', allow_blank=True)
+    dim_status = DataValidation(type="list", formula1='"accept,reject,unsure"', allow_blank=True)
     ws_dim.add_data_validation(dim_status)
     dim_status.add(f"I2:I{max(2, ws_dim.max_row)}")
 
     fam_status = DataValidation(
         type="list",
-        formula1='"accept_as_child_table,modify,keep_wide,merge_with_other_family,unsure"',
+        formula1='"accept,reject,unsure"',
         allow_blank=True,
     )
     ws_fam.add_data_validation(fam_status)

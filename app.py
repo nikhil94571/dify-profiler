@@ -2769,6 +2769,19 @@ def _keys_to_label(keys: Any) -> str:
     return " + ".join(parts)
 
 
+def _family_id_from_table_name(table_name: Any) -> str:
+    text = str(table_name or "").strip().lower()
+    if not text:
+        return ""
+    for prefix in ("survey_", "family_", "dim_"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+    for suffix in ("_rows", "_row", "_table", "_child", "_family"):
+        if text.endswith(suffix):
+            text = text[: -len(suffix)]
+    return "_".join(_tokenize_col_name(text))
+
+
 def _load_run_manifest(run_id: str) -> Dict[str, Any]:
     bucket_name = os.getenv("EXPORT_BUCKET")
     if not bucket_name:
@@ -2817,14 +2830,23 @@ def _family_column_map(run_id: str) -> Dict[str, str]:
         return {}
     mapping: Dict[str, str] = {}
     for family in _coerce_list_of_dicts(a8_payload.get("families")):
-        family_id = str(family.get("family_id") or "").strip()
-        if not family_id:
-            continue
+        family_id = _fallback_family_id(
+            family.get("family_id"),
+            [str(col) for col in (family.get("columns") or [])],
+            ((family.get("stem_evidence") or {}).get("raw_stem") if isinstance(family.get("stem_evidence"), dict) else None),
+        )
         for col in family.get("columns", []) or []:
             col_name = str(col).strip()
             if col_name and col_name not in mapping:
                 mapping[col_name] = family_id
     return mapping
+
+
+def _is_numeric_like_text(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    return bool(re.fullmatch(r"[+-]?\d+(?:\.\d+)?", text))
 
 
 def _load_structural_gate_rows(run_id: str) -> List[Dict[str, Any]]:
@@ -2840,11 +2862,18 @@ def _load_structural_gate_rows(run_id: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     master_switches = _coerce_list_of_dicts(a16_payload.get("master_switch_candidates"))
     for candidate in master_switches[:5]:
+        top_values = [str(v) for v in (candidate.get("top_trigger_values") or [])[:3] if str(v).strip()]
+        explained_cols = int(candidate.get("explained_column_count") or 0)
+        family_ids = [str(v) for v in (candidate.get("affected_family_ids") or []) if str(v).strip()]
+        if top_values and all(_is_numeric_like_text(v) for v in top_values):
+            continue
+        if explained_cols < 3 and not family_ids:
+            continue
         rows.append({
             "trigger_column": str(candidate.get("trigger_column") or ""),
-            "trigger_value": ", ".join([str(v) for v in (candidate.get("top_trigger_values") or [])[:3]]),
-            "affected_column_count": int(candidate.get("explained_column_count") or 0),
-            "affected_family_ids": [str(v) for v in (candidate.get("affected_family_ids") or []) if str(v).strip()],
+            "trigger_value": ", ".join(top_values),
+            "affected_column_count": explained_cols,
+            "affected_family_ids": family_ids,
             "missing_explained_pct": "",
             "directionality": "master_switch_candidate",
             "interpretation": str(candidate.get("interpretation") or "Likely structural gate controlling downstream question blocks."),
@@ -2854,11 +2883,18 @@ def _load_structural_gate_rows(run_id: str) -> List[Dict[str, Any]]:
         return rows
 
     for rule in _coerce_list_of_dicts(a16_payload.get("detected_skip_logic"))[:5]:
+        trigger_value = str(rule.get("trigger_value") or "")
+        family_ids = [str(v) for v in (rule.get("affected_family_ids") or []) if str(v).strip()]
+        affected_count = int(rule.get("affected_column_count") or 0)
+        if _is_numeric_like_text(trigger_value):
+            continue
+        if affected_count < 3 and not family_ids:
+            continue
         rows.append({
             "trigger_column": str(rule.get("trigger_column") or ""),
-            "trigger_value": str(rule.get("trigger_value") or ""),
-            "affected_column_count": int(rule.get("affected_column_count") or 0),
-            "affected_family_ids": [str(v) for v in (rule.get("affected_family_ids") or []) if str(v).strip()],
+            "trigger_value": trigger_value,
+            "affected_column_count": affected_count,
+            "affected_family_ids": family_ids,
             "missing_explained_pct": rule.get("missing_explained_pct", ""),
             "directionality": str(rule.get("directionality") or ""),
             "interpretation": str(rule.get("interpretation") or ""),
@@ -2912,11 +2948,18 @@ def _build_grain_summary_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[
         })
 
     assumptions = _coerce_list_of_dicts(grain_worker_output.get("assumptions"))
-    for assumption in assumptions[:3]:
+    for assumption in assumptions[:2]:
+        assumption_text = str(assumption.get("assumption") or "")
+        lower = assumption_text.lower()
+        target = "Overrides"
+        if any(token in lower for token in ("grain", "key", "row", "respondent")):
+            target = "Primary Grain"
+        elif any(token in lower for token in ("family", "repeat", "matrix", "rown")):
+            target = "Repeat Families"
         rows.append({
-            "topic": "Assumption requiring validation",
-            "recommendation": str(assumption.get("assumption") or ""),
-            "why": str(assumption.get("explanation") or ""),
+            "topic": "Open question",
+            "recommendation": assumption_text,
+            "why": f"{str(assumption.get('explanation') or '')} Respond on the {target} sheet.".strip(),
             "needs_review": "yes" if assumption.get("needs_user_validation") else "no",
         })
     return rows
@@ -2967,7 +3010,11 @@ def _build_repeat_family_rows(grain_worker_output: Dict[str, Any], structural_ga
             gate_map.setdefault(str(family_id), []).append(trigger)
     rows: List[Dict[str, Any]] = []
     for family in _coerce_list_of_dicts(grain_worker_output.get("family_review_candidates")):
-        family_id = str(family.get("family_id") or "")
+        family_id = _fallback_family_id(
+            family.get("family_id"),
+            [str(col) for col in (family.get("source_columns") or []) if str(col).strip()],
+            _family_id_from_table_name(family.get("suggested_table_name")),
+        )
         gate_context = gate_map.get(family_id, [])
         comment = str(family.get("why_review") or "")
         if gate_context:
@@ -2981,7 +3028,7 @@ def _build_repeat_family_rows(grain_worker_output: Dict[str, Any], structural_ga
             "your_repeat_index_name": "",
             "recommended_parent_key": primary_label,
             "your_parent_key": "",
-            "status": "accept_as_child_table" if str(family.get("status") or "") == "confirm_detected" else "unsure",
+            "status": "accept" if str(family.get("status") or "") == "confirm_detected" else "unsure",
             "comments": comment,
         })
     return rows
@@ -3024,6 +3071,9 @@ def _normalize_light_contract_payload(run_id: str, grain_worker_output: Dict[str
         for idx, col in enumerate(column_order)
     ]
     return {
+        "run_id": run_id,
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "source_endpoint": "/light-contracts/xlsx",
         "readme_rows": [],
         "column_guide_rows": column_guide_rows,
         "grain_summary_rows": _build_grain_summary_rows(grain_worker_output),
@@ -3296,6 +3346,31 @@ def _tokenize_col_name(col: str) -> List[str]:
     return [t for t in re.split(r"[_]+", base.lower()) if t]
 
 
+def _fallback_family_id(candidate_id: Any, columns: List[str], raw_stem: Any = None) -> str:
+    for value in (candidate_id, raw_stem):
+        text = "_".join(_tokenize_col_name(str(value))) if value is not None else ""
+        if text:
+            return text
+
+    clean_cols = [str(col).strip() for col in columns if str(col).strip()]
+    if clean_cols:
+        alpha_prefixes = []
+        for col in clean_cols:
+            match = re.match(r"^([A-Za-z]+)\d+$", col)
+            if not match:
+                alpha_prefixes = []
+                break
+            alpha_prefixes.append(match.group(1).lower())
+        if alpha_prefixes and len(set(alpha_prefixes)) == 1:
+            return alpha_prefixes[0]
+
+        first_col = "_".join(_tokenize_col_name(clean_cols[0]))
+        if first_col:
+            return f"family_{first_col}"
+
+    return "family_unknown"
+
+
 def _build_families(columns: List[str]) -> Dict[str, Any]:
     family_map: Dict[str, Dict[str, Any]] = {}
     rejected: List[Dict[str, Any]] = []
@@ -3406,8 +3481,9 @@ def _build_families(columns: List[str]) -> Dict[str, Any]:
         conf = min(0.99, conf)
 
         recommended_repeat = keyword if keyword in repeat_keywords else ("index" if index_type == "ordinal" else "label")
+        family_id = _fallback_family_id(stem, cols, (info.get("stem_evidence") or {}).get("raw_stem"))
         families.append({
-            "family_id": stem,
+            "family_id": family_id,
             "detection_confidence": round(conf, 6),
             "columns_count": len(cols),
             "columns": cols,

@@ -248,6 +248,7 @@ Rules:
 - suggested repeat index names
 - whether the family is already confidently detected or still needs user input
 - why the user should review it
+- `family_id` must never be blank for a detected family. Prefer a short normalized stem-style identifier such as `q`, `dass`, or `lab_panel`.
 
 ### STEP 8 — Build light-contract review fields
 `review_questions` must be concise and directly usable by the next Dify node.
