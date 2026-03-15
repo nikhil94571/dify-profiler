@@ -7282,17 +7282,25 @@ def _apply_a6_tests_policy(node: Dict[str, Any], tests: List[Any], policy: Dict[
     return selected
 
 
-def _extract_force_include_columns(value_filter: Optional[Any]) -> Set[str]:
+def _extract_columns_from_value_filter(
+    value_filter: Optional[Any],
+    filter_keys: Optional[Iterable[str]] = None,
+) -> Set[str]:
+    keys = [str(key).strip() for key in (filter_keys or ["force_include_columns", "a9_force_include_columns"]) if str(key).strip()]
     forced_names: Set[str] = set()
     if isinstance(value_filter, dict):
-        forced_names.update(str(v) for v in (value_filter.get("force_include_columns") or []))
-        forced_names.update(str(v) for v in (value_filter.get("a9_force_include_columns") or []))
+        for key in keys:
+            forced_names.update(str(v) for v in (value_filter.get(key) or []))
     elif isinstance(value_filter, list):
         for item in value_filter:
             if isinstance(item, dict):
-                forced_names.update(str(v) for v in (item.get("force_include_columns") or []))
-                forced_names.update(str(v) for v in (item.get("a9_force_include_columns") or []))
+                for key in keys:
+                    forced_names.update(str(v) for v in (item.get(key) or []))
     return {name for name in forced_names if name}
+
+
+def _extract_force_include_columns(value_filter: Optional[Any]) -> Set[str]:
+    return _extract_columns_from_value_filter(value_filter)
 
 
 def _sorted_columns_for_bucket(columns: List[Tuple[int, Dict[str, Any]]], name_field: str) -> List[Tuple[int, Dict[str, Any]]]:
@@ -7417,11 +7425,12 @@ def _apply_column_scope_selector_policy(
         for field, threshold in (policy.get("include_numeric_lte") or {}).items()
         if str(field).strip()
     }
+    filter_keys = [str(field) for field in (policy.get("include_from_filter_keys") or ["force_include_columns"]) if str(field).strip()]
 
     valid_items: List[Tuple[int, Dict[str, Any]]] = [
         (idx, row) for idx, row in enumerate(items) if isinstance(row, dict)
     ]
-    forced_names = _extract_force_include_columns(value_filter)
+    forced_names = _extract_columns_from_value_filter(value_filter, filter_keys)
     selected: List[Tuple[int, Dict[str, Any]]] = []
     selected_idx: Set[int] = set()
 
@@ -7470,6 +7479,7 @@ def _apply_column_scope_selector_policy(
         "input": len(items),
         "output": len(final_selected),
         "forced_includes": sorted(forced_names),
+        "include_from_filter_keys": filter_keys,
         "bool_true_fields": bool_true_fields,
         "nonempty_fields": nonempty_fields,
         "numeric_gte": numeric_gte,
@@ -8480,8 +8490,9 @@ def _sorted_nonempty_strings(values: Iterable[Any]) -> List[str]:
     return sorted({str(value).strip() for value in values if str(value or "").strip()})
 
 
-def _merge_value_filter_force_include_columns(
+def _merge_value_filter_column_bucket(
     value_filter: Optional[Any],
+    bucket_key: str,
     extra_columns: Iterable[Any],
 ) -> Optional[Any]:
     extra = _sorted_nonempty_strings(extra_columns)
@@ -8489,23 +8500,30 @@ def _merge_value_filter_force_include_columns(
         return value_filter
 
     if value_filter is None:
-        return {"force_include_columns": extra}
+        return {bucket_key: extra}
 
     if isinstance(value_filter, dict):
         merged = dict(value_filter)
-        combined = _extract_force_include_columns(merged)
+        combined = _extract_columns_from_value_filter(merged, [bucket_key])
         combined.update(extra)
-        merged["force_include_columns"] = sorted(combined)
+        merged[bucket_key] = sorted(combined)
         return merged
 
     if isinstance(value_filter, list):
         merged_items = list(value_filter)
-        combined = _extract_force_include_columns(merged_items)
+        combined = _extract_columns_from_value_filter(merged_items, [bucket_key])
         combined.update(extra)
-        merged_items.append({"force_include_columns": sorted(combined)})
+        merged_items.append({bucket_key: sorted(combined)})
         return merged_items
 
-    return {"force_include_columns": extra}
+    return {bucket_key: extra}
+
+
+def _merge_value_filter_force_include_columns(
+    value_filter: Optional[Any],
+    extra_columns: Iterable[Any],
+) -> Optional[Any]:
+    return _merge_value_filter_column_bucket(value_filter, "force_include_columns", extra_columns)
 
 
 def _light_contract_force_include_columns(decisions: Dict[str, Any]) -> List[str]:
@@ -8530,8 +8548,11 @@ def _light_contract_force_include_columns(decisions: Dict[str, Any]) -> List[str
     return _sorted_nonempty_strings(columns)
 
 
-def _build_type_transform_auto_scope_columns(run_id: str) -> List[str]:
-    scoped: Set[str] = set()
+def _build_type_transform_auto_scope_buckets(run_id: str) -> Dict[str, List[str]]:
+    review_columns: Set[str] = set()
+    structural_columns: Set[str] = set()
+    skip_trigger_columns: Set[str] = set()
+    skip_affected_preview_columns: Set[str] = set()
 
     try:
         kind, payload, _ = _get_decoded_payload(run_id=run_id, artifact_id="A3-T")
@@ -8540,7 +8561,7 @@ def _build_type_transform_auto_scope_columns(run_id: str) -> List[str]:
                 if isinstance(item, dict):
                     col = str(item.get("column") or "").strip()
                     if col:
-                        scoped.add(col)
+                        review_columns.add(col)
     except HTTPException:
         pass
 
@@ -8551,7 +8572,7 @@ def _build_type_transform_auto_scope_columns(run_id: str) -> List[str]:
                 if isinstance(item, dict):
                     col = str(item.get("column") or "").strip()
                     if col:
-                        scoped.add(col)
+                        review_columns.add(col)
     except HTTPException:
         pass
 
@@ -8565,7 +8586,7 @@ def _build_type_transform_auto_scope_columns(run_id: str) -> List[str]:
                 role = str(row.get("primary_role") or "").strip()
                 review_required = bool(row.get("review_required", False))
                 if col and (review_required or role in {"id_key", "time_index", "repeat_index"}):
-                    scoped.add(col)
+                    structural_columns.add(col)
     except HTTPException:
         pass
 
@@ -8577,20 +8598,25 @@ def _build_type_transform_auto_scope_columns(run_id: str) -> List[str]:
                     continue
                 trigger = str(rule.get("trigger_column") or "").strip()
                 if trigger:
-                    scoped.add(trigger)
+                    skip_trigger_columns.add(trigger)
                 for col in rule.get("sample_affected_columns") or []:
                     col_text = str(col or "").strip()
                     if col_text:
-                        scoped.add(col_text)
+                        skip_affected_preview_columns.add(col_text)
             for candidate in payload.get("master_switch_candidates") or []:
                 if isinstance(candidate, dict):
                     trigger = str(candidate.get("trigger_column") or "").strip()
                     if trigger:
-                        scoped.add(trigger)
+                        skip_trigger_columns.add(trigger)
     except HTTPException:
         pass
 
-    return sorted(scoped)
+    return {
+        "review_columns": sorted(review_columns),
+        "structural_columns": sorted(structural_columns),
+        "skip_trigger_columns": sorted(skip_trigger_columns),
+        "skip_affected_preview_columns": sorted(skip_affected_preview_columns),
+    }
 
 
 def _effective_value_filter_for_mode(
@@ -8600,8 +8626,11 @@ def _effective_value_filter_for_mode(
 ) -> Optional[Any]:
     if str(mode or "").strip() != "type_transform_worker":
         return value_filter
-    auto_scope = _build_type_transform_auto_scope_columns(run_id)
-    return _merge_value_filter_force_include_columns(value_filter, auto_scope)
+    buckets = _build_type_transform_auto_scope_buckets(run_id)
+    merged = value_filter
+    for bucket_key, columns in buckets.items():
+        merged = _merge_value_filter_column_bucket(merged, bucket_key, columns)
+    return merged
 
 
 def _build_view_response(kind: str, payload: Any, report: Dict[str, Any], debug: bool, profile_header: str) -> Response:

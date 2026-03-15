@@ -78,6 +78,14 @@ Current view surfaces:
 
 For workers that need request-scoped pruning inputs, use `POST /artifact-bundles/view`. This now matters for `type_transform_worker`, which can accept `global.value_filter.force_include_columns` so finalized grain and family columns are always retained in a scoped bundle.
 
+The type/value worker also applies server-side typed auto-scope buckets from stored artifacts:
+
+- `review_columns` from `A3-T` and `A3-V`
+- `structural_columns` from `A9` role evidence
+- `skip_trigger_columns` and `skip_affected_preview_columns` from `A16`
+
+Those buckets are then consumed selectively per artifact, rather than being merged into one broad force-include list.
+
 Example:
 
 ```http
@@ -157,7 +165,7 @@ Examples from the current implementation:
 - `A6` ranked retention preserves the best grain candidate
 - `A8` uses transforms to create compact `family_signature` views
 - `A9` uses role-aware selection to preserve structurally important columns
-- `type_transform_worker` uses scoped column selection plus compact evidence previews to reduce token waste in `A2`, `A3-T`, `A4`, `A9`, `A13`, and `A14`
+- `type_transform_worker` uses typed scoped column selection plus compact evidence previews to reduce token waste in `A2`, `A3-T`, `A4`, `A9`, `A13`, and `A14`
 
 ### Worker profiles
 
