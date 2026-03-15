@@ -74,7 +74,9 @@ Current view surfaces:
 - `GET /artifact-bundles`
 - `POST /artifact-bundles/view`
 
-The new `GET /artifact-bundles` endpoint is the simplest Dify-facing interface for specialist workers.
+`GET /artifact-bundles` is the simplest Dify-facing interface for workers that only need profile-default pruning.
+
+For workers that need request-scoped pruning inputs, use `POST /artifact-bundles/view`. This now matters for `type_transform_worker`, which can accept `global.value_filter.force_include_columns` so finalized grain and family columns are always retained in a scoped bundle.
 
 Example:
 
@@ -83,6 +85,23 @@ GET /artifact-bundles?run_id=<run_id>&mode=grain_worker
 ```
 
 If `artifact_ids` is omitted and `mode` maps to a named profile, the service infers the worker's artifact list from that profile.
+
+Example scoped request for the type/value worker:
+
+```http
+POST /artifact-bundles/view
+Content-Type: application/json
+
+{
+  "run_id": "<run_id>",
+  "mode": "type_transform_worker",
+  "global": {
+    "value_filter": {
+      "force_include_columns": ["order_id", "customer_id", "event_date"]
+    }
+  }
+}
+```
 
 ## Artifact Set
 
@@ -138,6 +157,7 @@ Examples from the current implementation:
 - `A6` ranked retention preserves the best grain candidate
 - `A8` uses transforms to create compact `family_signature` views
 - `A9` uses role-aware selection to preserve structurally important columns
+- `type_transform_worker` uses scoped column selection plus compact evidence previews to reduce token waste in `A2`, `A3-T`, `A4`, `A9`, `A13`, and `A14`
 
 ### Worker profiles
 
@@ -170,7 +190,7 @@ The intended Dify pattern is:
 
 1. upload a dataset to `POST /full-bundle`
 2. receive a `run_id`
-3. request worker-specific bundles from `/artifact-bundles`
+3. request worker-specific bundles from `/artifact-bundles` or `/artifact-bundles/view`
 4. convert the returned artifact payload into an LLM-safe string inside Dify
 5. run specialist workers on those pruned bundles
 
@@ -183,6 +203,19 @@ GET /artifact-bundles?run_id=<run_id>&mode=grain_worker
 ```
 
 and receive the profile-defined artifact set for grain reasoning.
+
+The type/value worker should prefer:
+
+```http
+POST /artifact-bundles/view
+```
+
+with `global.value_filter.force_include_columns` derived from finalized `light_contract_decisions`:
+
+- `primary_grain_decision.keys`
+- `dimension_decisions[].keys`
+- `family_decisions[].parent_key`
+- `family_decisions[].repeat_index_name`
 
 This keeps Dify focused on orchestration and LLM adjudication while leaving evidence generation, storage, and compression inside this service.
 

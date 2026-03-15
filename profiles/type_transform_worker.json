@@ -1,24 +1,55 @@
 {
   "profile": "type_transform_worker",
-  "description": "Pruning profile optimized for the post-grain type and transform specialist. Includes typing queues, missingness evidence, semantic anchors, drift evidence, and conditional missingness proofs.",
-  "artifacts": ["A2", "A3-T", "A3-V", "A4", "A13", "A14", "A16"],
+  "description": "Pruning profile optimized for the post-light-contract type and value standardization specialist. Includes typing queues, transform queues, structural role evidence, semantic anchors, quality signals, missingness context, and conditional missingness guardrails.",
+  "artifacts": ["A2", "A3-T", "A3-V", "A4", "A9", "A13", "A14", "A16"],
   "pruning": {
     "A2": {
       "drop": [
         "artifact_inputs",
         "profiler_samples",
-        "a2_samples",
         "numeric_profile",
         "datetime_profile"
-      ]
+      ],
+      "policies": {
+        "root_scope_policy": {
+          "type": "column_scope_selector",
+          "target_array": "__root__",
+          "name_field": "column",
+          "include_bool_true_fields": [
+            "is_one_hot_like",
+            "high_missingness"
+          ],
+          "include_nonempty_fields": [
+            "missing_tokens_observed"
+          ],
+          "hard_cap_total": 100
+        }
+      },
+      "transforms": {
+        "compact_a2_samples": {
+          "type": "compact_keyed_string_arrays",
+          "target_array_path": "__root__",
+          "field": "a2_samples",
+          "max_items_per_key": 3,
+          "max_chars": 80
+        }
+      }
     },
     "A3-T": {
       "drop": [
-        "inputs",
-        "evidence_snippets"
+        "inputs"
       ],
       "limits": {
         "items": 60
+      },
+      "transforms": {
+        "compact_evidence_snippets": {
+          "type": "compact_keyed_string_arrays",
+          "target_array_path": "items",
+          "field": "evidence_snippets",
+          "max_items_per_key": 2,
+          "max_chars": 120
+        }
       }
     },
     "A3-V": {
@@ -31,25 +62,142 @@
     },
     "A4": {
       "drop": [
-        "inputs"
-      ]
+        "inputs",
+        "global_tokens",
+        "token_classification"
+      ],
+      "policies": {
+        "per_column_policy": {
+          "type": "column_scope_selector",
+          "target_array": "per_column",
+          "name_field": "column",
+          "include_numeric_gte": {
+            "missing_pct": 40
+          },
+          "hard_cap_total": 120
+        }
+      }
+    },
+    "A9": {
+      "drop": [
+        "inputs",
+        "uses",
+        {
+          "key": "rows",
+          "scope": "recursive_key_drop",
+          "guards": {
+            "value_kind_any_of": ["list_of_objects"],
+            "path_hints_any_of": [
+              "row_samples.panels[].rows",
+              "example_conflicts[].rows",
+              "F_subset.rows"
+            ]
+          },
+          "note": "Mitigation for name-collision risk: only drop when the value looks like row payloads (list of objects) and/or appears under known row-sample containers."
+        },
+        "evidence_primitives",
+        "role_scores",
+        "role_candidates",
+        "role_decision",
+        "audit",
+        "evidence_used",
+        "evidence_not_used",
+        "features"
+      ],
+      "transforms": {
+        "derive_role_candidate_preview": {
+          "type": "derive_role_candidate_preview",
+          "target_array_path": "columns",
+          "output_field": "role_candidate_preview",
+          "top_k": 2
+        }
+      },
+      "policies": {
+        "columns_policy": {
+          "type": "role_bucket_selector",
+          "target_array": "columns",
+          "role_field": "primary_role",
+          "name_field": "column",
+          "review_field": "review_required",
+          "include_roles_all": [
+            {
+              "role": "id_key",
+              "cap": 60
+            },
+            {
+              "role": "time_index",
+              "cap": 40
+            },
+            {
+              "role": "repeat_index",
+              "cap": 40
+            },
+            {
+              "role": "measure",
+              "cap": 40
+            },
+            {
+              "role": "measure_numeric",
+              "cap": 40
+            },
+            {
+              "role": "measure_item",
+              "cap": 40
+            },
+            {
+              "role": "invariant_attr",
+              "cap": 60
+            },
+            {
+              "role": "coded_categorical",
+              "cap": 60
+            }
+          ],
+          "include_review_required_topk": 80
+        }
+      }
     },
     "A13": {
       "drop": [
         "inputs"
-      ]
+      ],
+      "policies": {
+        "columns_policy": {
+          "type": "column_scope_selector",
+          "target_array": "columns",
+          "name_field": "column",
+          "include_nonempty_fields": [
+            "detected_anchors"
+          ],
+          "hard_cap_total": 80
+        }
+      }
     },
     "A14": {
       "drop": [
-        "inputs"
+        "inputs",
+        "segments"
       ],
-      "limits": {
-        "columns": 120
+      "policies": {
+        "columns_policy": {
+          "type": "column_scope_selector",
+          "target_array": "columns",
+          "name_field": "column",
+          "include_bool_true_fields": [
+            "drift_detected"
+          ],
+          "include_numeric_lte": {
+            "global_quality_score": 0.85
+          },
+          "hard_cap_total": 80
+        }
       }
     },
     "A16": {
       "drop": [
-        "inputs"
+        "inputs",
+        "target_columns_scanned",
+        "trigger_columns_scanned"
       ]
     }
   }
