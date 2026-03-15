@@ -3,7 +3,7 @@ import json
 import math
 from typing import Any, Dict, List, Tuple
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
@@ -168,12 +168,11 @@ def _build_readme_rows(contract: Dict[str, Any]) -> List[List[str]]:
         ["Repeat Family", "A group of repeated or matrix-style columns that may need to become a child table instead of staying wide."],
         ["How to edit", "Do not overwrite recommended columns. Only edit status, your_* columns, and comments on the editable sheets."],
         ["Status: accept", "Keep the recommendation exactly as shown. You do not need to fill the your_* columns."],
-        ["Status: modify", "Leave the recommended columns untouched and fill the your_* columns with your corrected values."],
-        ["Status: reject", "Reject the recommendation and explain why in comments. A later step will review the rejection."],
-        ["Status: unsure", "Leave comments that explain what is unclear or what extra review is needed."],
+        ["Status: modify", "Replace the recommended grain with your own key columns by filling the your_* columns. Leave the recommended columns untouched."],
+        ["Status: unsure", "Do not finalize the recommendation yet. Leave comments explaining the uncertainty or what extra review is needed."],
         ["Modify scope", "In this light contract, modify is mainly intended for the Primary Grain sheet. For families and dimensions, prefer accept, reject, unsure, and comments."],
         ["Composite key guidance", "To create a composite key, fill your_key_1 and then add any additional key parts in your_key_2 and your_key_3. Leave unused trailing key cells blank. Example: a two-part key uses only your_key_1 and your_key_2."],
-        ["3-step workflow", "1) Review the recommendation sheets. 2) Set status for each row. 3) Fill the your_* fields only when modifying or rejecting."],
+        ["3-step workflow", "1) Review the recommendation sheets. 2) Set status for each row. 3) Fill the your_* fields only when modifying."],
     ]
 
 
@@ -383,7 +382,7 @@ def build_light_contract_xlsx_bytes(contract: Dict[str, Any]) -> bytes:
     _write_table_sheet(ws_over, override_headers, override_rows, fixed_widths={"field": 34, "description": 58, "user_input": 58})
     _style_data_region(ws_over, recommended_cols=["field", "description"], editable_cols=["user_input"])
 
-    grain_status = DataValidation(type="list", formula1='"accept,modify,reject,unsure"', allow_blank=True)
+    grain_status = DataValidation(type="list", formula1='"accept,modify,unsure"', allow_blank=True)
     ws_grain.add_data_validation(grain_status)
     grain_status.add(f"H2:H{max(2, ws_grain.max_row)}")
 
@@ -400,9 +399,52 @@ def build_light_contract_xlsx_bytes(contract: Dict[str, Any]) -> bytes:
     fam_status.add(f"H2:H{max(2, ws_fam.max_row)}")
 
     for sheet in wb.worksheets:
-        _autosize_columns(sheet)
         _apply_row_heights(sheet)
 
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+def _sheet_rows_as_dicts(ws) -> List[Dict[str, Any]]:
+    if ws.max_row < 2 or ws.max_column < 1:
+        return []
+    headers = [str(ws.cell(row=1, column=idx).value or "").strip() for idx in range(1, ws.max_column + 1)]
+    rows: List[Dict[str, Any]] = []
+    for row_idx in range(2, ws.max_row + 1):
+        values = [ws.cell(row=row_idx, column=idx).value for idx in range(1, ws.max_column + 1)]
+        if not any(v not in (None, "") for v in values):
+            continue
+        rows.append({headers[idx - 1]: values[idx - 1] for idx in range(1, ws.max_column + 1) if headers[idx - 1]})
+    return rows
+
+
+def parse_light_contract_xlsx_bytes(xlsx_bytes: bytes) -> Dict[str, Any]:
+    wb = load_workbook(io.BytesIO(xlsx_bytes), data_only=True)
+
+    def _sheet(name: str):
+        if name not in wb.sheetnames:
+            return None
+        return wb[name]
+
+    readme_ws = _sheet("Read Me")
+    readme_rows = _sheet_rows_as_dicts(readme_ws) if readme_ws else []
+    metadata: Dict[str, str] = {}
+    for row in readme_rows:
+        section = str(row.get("section") or "").strip()
+        details = "" if row.get("details") is None else str(row.get("details"))
+        if section in {"run_id", "generated_at", "source_endpoint"}:
+            metadata[section] = details
+
+    primary_rows = _sheet_rows_as_dicts(_sheet("Primary Grain")) if _sheet("Primary Grain") else []
+    dimension_rows = _sheet_rows_as_dicts(_sheet("Dimension Tables")) if _sheet("Dimension Tables") else []
+    family_rows = _sheet_rows_as_dicts(_sheet("Repeat Families")) if _sheet("Repeat Families") else []
+    override_rows = _sheet_rows_as_dicts(_sheet("Overrides")) if _sheet("Overrides") else []
+
+    return {
+        "metadata": metadata,
+        "primary_grain_rows": primary_rows,
+        "dimension_rows": dimension_rows,
+        "repeat_family_rows": family_rows,
+        "override_rows": override_rows,
+    }

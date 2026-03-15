@@ -26,7 +26,7 @@ import google.auth
 from google.auth import impersonated_credentials
 
 
-from xlsx_export import build_light_contract_xlsx_bytes, build_xlsx_bytes
+from xlsx_export import build_light_contract_xlsx_bytes, build_xlsx_bytes, parse_light_contract_xlsx_bytes
 
 
 try:
@@ -2741,6 +2741,37 @@ def _upload_xlsx_and_sign(xlsx_bytes: bytes, filename: str) -> Dict[str, Any]:
     }
 
 
+def _upload_json_to_run_object(run_id: str, object_name: str, payload: Dict[str, Any]) -> str:
+    bucket_name = os.getenv("EXPORT_BUCKET")
+    if not bucket_name:
+        raise HTTPException(status_code=500, detail="Missing EXPORT_BUCKET env var")
+    try:
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(f"runs/{run_id}/{object_name}")
+        blob.upload_from_string(_json_bytes(payload), content_type="application/json")
+        return blob.name
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to persist light contract context: {exc}") from exc
+
+
+def _load_json_from_run_object(run_id: str, object_name: str) -> Dict[str, Any]:
+    bucket_name = os.getenv("EXPORT_BUCKET")
+    if not bucket_name:
+        raise HTTPException(status_code=500, detail="Missing EXPORT_BUCKET env var")
+    try:
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(f"runs/{run_id}/{object_name}")
+        if not blob.exists(client):
+            raise HTTPException(status_code=404, detail=f"{object_name} not found for run_id")
+        return json.loads(blob.download_as_bytes().decode("utf-8"))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to load light contract context: {exc}") from exc
+
+
 def _first_non_empty(items: List[Any]) -> str:
     for item in items:
         if item is None:
@@ -3057,6 +3088,134 @@ def _build_override_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[str, 
     return rows
 
 
+def _keys_from_row(row: Dict[str, Any], prefix: str) -> List[str]:
+    return [
+        str(row.get(f"{prefix}_key_{idx}") or "").strip()
+        for idx in (1, 2, 3)
+        if str(row.get(f"{prefix}_key_{idx}") or "").strip()
+    ]
+
+
+def _build_accepted_light_contract_handoff(contract_payload: Dict[str, Any]) -> Dict[str, Any]:
+    primary_row = (contract_payload.get("primary_grain_rows") or [{}])[0] if contract_payload.get("primary_grain_rows") else {}
+    override_notes = {
+        str(row.get("field") or ""): str(row.get("user_input") or "")
+        for row in (contract_payload.get("override_rows") or [])
+        if str(row.get("field") or "").strip()
+    }
+    return {
+        "run_id": str(contract_payload.get("run_id") or ""),
+        "light_contract_status": "accepted",
+        "primary_grain_decision": {
+            "status": "accept",
+            "keys": _keys_from_row(primary_row, "recommended"),
+            "comments": str(primary_row.get("comments") or ""),
+        },
+        "dimension_decisions": [
+            {
+                "table_name": str(row.get("table_name") or ""),
+                "status": str(row.get("status") or "accept"),
+                "keys": _keys_from_row(row, "recommended"),
+                "relationship_to_primary": str(row.get("relationship_to_primary") or ""),
+                "comments": str(row.get("comments") or ""),
+            }
+            for row in (contract_payload.get("dimension_rows") or [])
+        ],
+        "family_decisions": [
+            {
+                "family_id": str(row.get("family_id") or ""),
+                "status": str(row.get("status") or "accept"),
+                "table_name": str(row.get("recommended_table_name") or ""),
+                "repeat_index_name": str(row.get("recommended_repeat_index_name") or ""),
+                "parent_key": str(row.get("recommended_parent_key") or ""),
+                "comments": str(row.get("comments") or ""),
+            }
+            for row in (contract_payload.get("repeat_family_rows") or [])
+        ],
+        "override_notes": override_notes,
+        "parse_validation": {
+            "source": "stored_recommendation",
+            "run_id_match": True,
+        },
+    }
+
+
+def _build_parsed_light_contract_handoff(run_id: str, parsed_workbook: Dict[str, Any]) -> Dict[str, Any]:
+    workbook_run_id = str((parsed_workbook.get("metadata") or {}).get("run_id") or "").strip()
+    if workbook_run_id and workbook_run_id != run_id:
+        raise HTTPException(status_code=422, detail=f"Workbook run_id '{workbook_run_id}' does not match submitted run_id '{run_id}'")
+
+    primary_rows = parsed_workbook.get("primary_grain_rows") or []
+    primary_row = primary_rows[0] if primary_rows else {}
+    primary_status_raw = str(primary_row.get("status") or "").strip().lower() or "unsure"
+    primary_status = "unsure" if primary_status_raw == "reject" else primary_status_raw
+    if primary_status not in {"accept", "modify", "unsure"}:
+        primary_status = "unsure"
+    if primary_status == "modify":
+        primary_keys = _keys_from_row(primary_row, "your")
+        if not primary_keys:
+            raise HTTPException(
+                status_code=422,
+                detail="Primary Grain is marked as modify, but no replacement key columns were provided in your_key_1..your_key_3",
+            )
+    else:
+        primary_keys = _keys_from_row(primary_row, "recommended")
+
+    dimension_decisions = []
+    for row in parsed_workbook.get("dimension_rows") or []:
+        status = str(row.get("status") or "").strip().lower() or "unsure"
+        keys = _keys_from_row(row, "recommended")
+        if status == "modify":
+            keys = _keys_from_row(row, "your")
+        dimension_decisions.append({
+            "table_name": str(row.get("table_name") or ""),
+            "status": status,
+            "keys": keys,
+            "relationship_to_primary": str(row.get("relationship_to_primary") or ""),
+            "comments": str(row.get("comments") or ""),
+        })
+
+    family_decisions = []
+    for row in parsed_workbook.get("repeat_family_rows") or []:
+        status = str(row.get("status") or "").strip().lower() or "unsure"
+        table_name = str(row.get("your_table_name") or "").strip() if status == "modify" else str(row.get("recommended_table_name") or "")
+        repeat_index_name = str(row.get("your_repeat_index_name") or "").strip() if status == "modify" else str(row.get("recommended_repeat_index_name") or "")
+        parent_key = str(row.get("your_parent_key") or "").strip() if status == "modify" else str(row.get("recommended_parent_key") or "")
+        family_decisions.append({
+            "family_id": str(row.get("family_id") or ""),
+            "status": status,
+            "table_name": table_name,
+            "repeat_index_name": repeat_index_name,
+            "parent_key": parent_key,
+            "comments": str(row.get("comments") or ""),
+        })
+
+    override_notes = {
+        str(row.get("field") or ""): str(row.get("user_input") or "")
+        for row in (parsed_workbook.get("override_rows") or [])
+        if str(row.get("field") or "").strip()
+    }
+
+    return {
+        "run_id": run_id,
+        "light_contract_status": "modified",
+        "primary_grain_decision": {
+            "status": primary_status,
+            "keys": primary_keys,
+            "comments": str(primary_row.get("comments") or ""),
+        },
+        "dimension_decisions": dimension_decisions,
+        "family_decisions": family_decisions,
+        "override_notes": override_notes,
+        "parse_validation": {
+            "source": "uploaded_workbook",
+            "workbook_run_id": workbook_run_id,
+            "run_id_match": (workbook_run_id == run_id) if workbook_run_id else True,
+            "primary_grain_reject_coerced_to_unsure": primary_status_raw == "reject",
+        },
+    }
+
+
 def _normalize_light_contract_payload(run_id: str, grain_worker_output: Dict[str, Any]) -> Dict[str, Any]:
     column_order = _column_order_from_manifest_and_a2(run_id)
     family_map = _family_column_map(run_id)
@@ -3122,6 +3281,7 @@ def export_structured_light_contract_xlsx(
             run_id=req.run_id,
             grain_worker_output=req.grain_worker_output,
         )
+        _upload_json_to_run_object(req.run_id, "light_contract_context.json", normalized_payload)
         xlsx_bytes = build_light_contract_xlsx_bytes(normalized_payload)
     except HTTPException:
         raise
@@ -3132,6 +3292,49 @@ def export_structured_light_contract_xlsx(
     result = _upload_xlsx_and_sign(xlsx_bytes=xlsx_bytes, filename=filename)
     result["run_id"] = req.run_id
     return result
+
+
+@app.get("/light-contracts/context")
+def get_light_contract_context(
+    run_id: str,
+    _: None = Depends(require_token),
+):
+    context = _load_json_from_run_object(run_id, "light_contract_context.json")
+    handoff = _build_accepted_light_contract_handoff(context)
+    return {
+        "run_id": run_id,
+        "light_contract_context": context,
+        "downstream_handoff": handoff,
+    }
+
+
+@app.post("/light-contracts/parse")
+async def parse_light_contract_xlsx(
+    run_id: str = Form(...),
+    file: UploadFile = File(...),
+    _: None = Depends(require_token),
+):
+    filename = str(file.filename or "").lower()
+    if not (filename.endswith(".xlsx") or filename.endswith(".xlsm") or filename.endswith(".xltx") or filename.endswith(".xltm")):
+        raise HTTPException(status_code=415, detail="Expected an Excel workbook upload")
+
+    payload = await file.read()
+    if not payload:
+        raise HTTPException(status_code=400, detail="Uploaded workbook is empty")
+
+    try:
+        parsed = parse_light_contract_xlsx_bytes(payload)
+        downstream_handoff = _build_parsed_light_contract_handoff(run_id=run_id, parsed_workbook=parsed)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to parse light contract workbook: {exc}") from exc
+
+    return {
+        "run_id": run_id,
+        "parsed_workbook": parsed,
+        "downstream_handoff": downstream_handoff,
+    }
 
 @app.post("/export/manifest-txt", include_in_schema=False, deprecated=True)
 def export_manifest_txt(body: dict):
