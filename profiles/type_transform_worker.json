@@ -27,6 +27,7 @@
           "include_nonempty_fields": [
             "missing_tokens_observed"
           ],
+          "hard_cap_per_inferred_group": 4,
           "hard_cap_total": 100
         }
       },
@@ -37,6 +38,13 @@
           "field": "a2_samples",
           "max_items_per_key": 3,
           "max_chars": 80
+        },
+        "drop_empty_a2_fields": {
+          "type": "drop_fields_when_empty",
+          "target_array_path": "__root__",
+          "fields": [
+            "missing_tokens_observed"
+          ]
         }
       }
     },
@@ -83,7 +91,17 @@
           "include_numeric_gte": {
             "missing_pct": 40
           },
+          "hard_cap_per_inferred_group": 8,
           "hard_cap_total": 80
+        }
+      },
+      "transforms": {
+        "drop_empty_a4_fields": {
+          "type": "drop_fields_when_empty",
+          "target_array_path": "per_column",
+          "fields": [
+            "token_breakdown"
+          ]
         }
       }
     },

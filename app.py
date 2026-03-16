@@ -7402,6 +7402,26 @@ def _is_nonempty_field_value(value: Any) -> bool:
     return True
 
 
+def _infer_column_group_key(name: Any) -> str:
+    text = str(name or "").strip()
+    if not text:
+        return ""
+
+    match = re.match(r"^([A-Za-z]\d+)_Q\d+$", text)
+    if match:
+        return match.group(1)
+
+    match = re.match(r"^([A-Za-z]+\d+(?:Main|Secondary)?_cell_group)Row\d+$", text)
+    if match:
+        return match.group(1)
+
+    match = re.match(r"^([A-Za-z]+\d+_[A-Za-z0-9]+)Row\d+$", text)
+    if match:
+        return match.group(1)
+
+    return text
+
+
 def _apply_column_scope_selector_policy(
     items: List[Any],
     policy: Dict[str, Any],
@@ -7426,6 +7446,10 @@ def _apply_column_scope_selector_policy(
         if str(field).strip()
     }
     filter_keys = [str(field) for field in (policy.get("include_from_filter_keys") or ["force_include_columns"]) if str(field).strip()]
+    try:
+        hard_cap_per_group = int(policy.get("hard_cap_per_inferred_group", 0) or 0)
+    except (TypeError, ValueError):
+        hard_cap_per_group = 0
 
     valid_items: List[Tuple[int, Dict[str, Any]]] = [
         (idx, row) for idx, row in enumerate(items) if isinstance(row, dict)
@@ -7433,12 +7457,16 @@ def _apply_column_scope_selector_policy(
     forced_names = _extract_columns_from_value_filter(value_filter, filter_keys)
     selected: List[Tuple[int, Dict[str, Any]]] = []
     selected_idx: Set[int] = set()
+    selected_group_counts: Dict[str, int] = {}
 
     def _take(pair: Tuple[int, Dict[str, Any]]) -> None:
         idx, _row = pair
         if idx not in selected_idx:
             selected_idx.add(idx)
             selected.append(pair)
+            group_key = _infer_column_group_key(_row.get(name_field, ""))
+            if group_key:
+                selected_group_counts[group_key] = selected_group_counts.get(group_key, 0) + 1
 
     def _matches(row: Dict[str, Any]) -> bool:
         for field in bool_true_fields:
@@ -7471,7 +7499,12 @@ def _apply_column_scope_selector_policy(
         if len(selected) >= effective_cap:
             break
         _, row = pair
+        column_name = str(row.get(name_field, ""))
         if _matches(row):
+            if hard_cap_per_group > 0 and column_name not in forced_names:
+                group_key = _infer_column_group_key(column_name)
+                if group_key and selected_group_counts.get(group_key, 0) >= hard_cap_per_group:
+                    continue
             _take(pair)
 
     final_selected = [row for _, row in selected]
@@ -7485,6 +7518,7 @@ def _apply_column_scope_selector_policy(
         "numeric_gte": numeric_gte,
         "numeric_lte": numeric_lte,
         "hard_cap_total": hard_cap,
+        "hard_cap_per_inferred_group": hard_cap_per_group,
     })
     return final_selected
 
@@ -7881,6 +7915,39 @@ def _op_derive_role_candidate_preview(root: Any, op: Dict[str, Any], report: Dic
         })
 
 
+def _op_drop_fields_when_empty(root: Any, op: Dict[str, Any], report: Dict[str, Any]) -> None:
+    target = _resolve_transform_target(root, str(op.get("target_array_path") or ""))
+    if not isinstance(target, list):
+        return
+
+    fields = [str(field).strip() for field in (op.get("fields") or []) if str(field).strip()]
+    if not fields:
+        return
+
+    rows_touched = 0
+    fields_removed = 0
+    for row in target:
+        if not isinstance(row, dict):
+            continue
+        row_changed = False
+        for field in fields:
+            if field in row and not _is_nonempty_field_value(row.get(field)):
+                row.pop(field, None)
+                fields_removed += 1
+                row_changed = True
+        if row_changed:
+            rows_touched += 1
+
+    if rows_touched:
+        report.setdefault("transform_ops_applied", []).append({
+            "name": str(op.get("name") or ""),
+            "type": "drop_fields_when_empty",
+            "target": str(op.get("target_array_path") or "__root__"),
+            "rows_touched": rows_touched,
+            "fields_removed": fields_removed,
+        })
+
+
 def _apply_transform_stage(
     node: Any,
     artifact_id: str,
@@ -7907,6 +7974,8 @@ def _apply_transform_stage(
             _op_compact_keyed_string_arrays(node, op, report)
         elif op_type == "derive_role_candidate_preview":
             _op_derive_role_candidate_preview(node, op, report)
+        elif op_type == "drop_fields_when_empty":
+            _op_drop_fields_when_empty(node, op, report)
     return node
 
 
@@ -8308,6 +8377,15 @@ def _run_pruning_smoke_checks() -> None:
     assert "A16" in type_transform_profile["artifacts"]
     type_transform_cfg = type_transform_profile["mode_config"]
 
+    missingness_profile, missingness_source = _load_profile_local("missingness_worker")
+    assert missingness_source == "local"
+    assert missingness_profile["artifacts"] == ["A2", "A4", "A13", "A14", "A16"]
+    missingness_cfg = missingness_profile["mode_config"]
+
+    mode_cfg_missingness, mode_meta_missingness = _resolve_mode_config("missingness_worker")
+    assert mode_meta_missingness["profile_artifacts"] == ["A2", "A4", "A13", "A14", "A16"]
+    assert mode_cfg_missingness == missingness_cfg
+
     sample_a2_type = [
         {
             "column": "force_col",
@@ -8467,6 +8545,125 @@ def _run_pruning_smoke_checks() -> None:
     assert "target_columns_scanned" not in (pruned_a16_type.get("audit_trace") or {})
     assert "trigger_columns_scanned" not in (pruned_a16_type.get("audit_trace") or {})
 
+    sample_a2_missingness = [
+        {
+            "column": "force_col",
+            "high_missingness": False,
+            "missing_tokens_observed": [],
+            "a2_samples": {"head": ["A", "B", "C"], "tail": ["D"], "random": ["E"]},
+        },
+        {
+            "column": "skip_target",
+            "high_missingness": False,
+            "missing_tokens_observed": {"token": ["n/a"]},
+            "a2_samples": {"head": ["n/a", "x"]},
+        },
+        {
+            "column": "wide_null_col",
+            "high_missingness": True,
+            "missing_tokens_observed": [],
+            "a2_samples": {"head": ["", "", "z"]},
+        },
+        {
+            "column": "drop_me",
+            "high_missingness": False,
+            "missing_tokens_observed": [],
+            "a2_samples": {"head": ["x"]},
+        },
+    ]
+    pruned_a2_missingness, _ = apply_llm_pruning(
+        payload=sample_a2_missingness,
+        artifact_id="A2",
+        mode="missingness_worker",
+        keep_keys=[],
+        drop_keys=[],
+        limits=None,
+        value_filter={
+            "force_include_columns": ["force_col"],
+            "skip_affected_preview_columns": ["skip_target"],
+        },
+        debug=True,
+        mode_config=missingness_cfg,
+    )
+    a2_missing_names = [row.get("column") for row in pruned_a2_missingness if isinstance(row, dict)]
+    assert a2_missing_names == ["force_col", "skip_target", "wide_null_col"]
+    assert "missing_tokens_observed" not in pruned_a2_missingness[0]
+    assert pruned_a2_missingness[0].get("a2_samples", {}).get("head") == ["A", "B"]
+
+    sample_a4_missingness = {
+        "summary": {"columns_with_any_missing": 3},
+        "global_missingness": {"true_na_total": 5},
+        "global_tokens": {"na": 2},
+        "token_classification": {"na": "missing_like"},
+        "per_column": [
+            {
+                "column": "force_col",
+                "missing_pct": 5.0,
+                "token_breakdown": {},
+            },
+            {
+                "column": "high_missing_col",
+                "missing_pct": 45.0,
+                "token_breakdown": {},
+            },
+            {
+                "column": "token_col",
+                "missing_pct": 8.0,
+                "token_breakdown": {"n/a": 4},
+            },
+            {
+                "column": "drop_me",
+                "missing_pct": 2.0,
+                "token_breakdown": {},
+            },
+        ],
+        "audit_trace": {"classification_rules_version": "v2"},
+    }
+    pruned_a4_missingness, _ = apply_llm_pruning(
+        payload=sample_a4_missingness,
+        artifact_id="A4",
+        mode="missingness_worker",
+        keep_keys=[],
+        drop_keys=[],
+        limits=None,
+        value_filter={"force_include_columns": ["force_col"]},
+        debug=True,
+        mode_config=missingness_cfg,
+    )
+    a4_missing_names = [row.get("column") for row in pruned_a4_missingness.get("per_column", []) if isinstance(row, dict)]
+    assert a4_missing_names == ["force_col", "high_missing_col", "token_col"]
+    assert "global_tokens" not in pruned_a4_missingness
+    assert "token_classification" not in pruned_a4_missingness
+    assert "token_breakdown" not in pruned_a4_missingness.get("per_column", [])[0]
+
+    sample_a16_missingness = {
+        "inputs": {"uses": ["dataset"]},
+        "detected_skip_logic": [{"trigger_column": f"Trig{i}", "sample_affected_columns": ["c1", "c2"]} for i in range(60)],
+        "master_switch_candidates": [{"trigger_column": f"Master{i}"} for i in range(20)],
+        "audit_assumptions": {"family_member_triggers_excluded_from_master_switch_candidates": True},
+        "audit_trace": {
+            "target_columns_scanned": ["a", "b"],
+            "trigger_columns_scanned": ["c"],
+            "rows_evaluated": 100,
+        },
+    }
+    pruned_a16_missingness, _ = apply_llm_pruning(
+        payload=sample_a16_missingness,
+        artifact_id="A16",
+        mode="missingness_worker",
+        keep_keys=[],
+        drop_keys=[],
+        limits=None,
+        value_filter=None,
+        debug=True,
+        mode_config=missingness_cfg,
+    )
+    assert len(pruned_a16_missingness.get("detected_skip_logic", [])) == 50
+    assert len(pruned_a16_missingness.get("master_switch_candidates", [])) == 15
+    assert "inputs" not in pruned_a16_missingness
+    assert "target_columns_scanned" not in (pruned_a16_missingness.get("audit_trace") or {})
+    assert "trigger_columns_scanned" not in (pruned_a16_missingness.get("audit_trace") or {})
+
 
 if os.getenv("RUN_PRUNING_SMOKE_TESTS", "").strip().lower() in {"1", "true", "yes"}:
     _run_pruning_smoke_checks()
@@ -8548,7 +8745,7 @@ def _light_contract_force_include_columns(decisions: Dict[str, Any]) -> List[str
     return _sorted_nonempty_strings(columns)
 
 
-def _build_type_transform_auto_scope_buckets(run_id: str) -> Dict[str, List[str]]:
+def _build_post_contract_auto_scope_buckets(run_id: str) -> Dict[str, List[str]]:
     review_columns: Set[str] = set()
     structural_columns: Set[str] = set()
     skip_trigger_columns: Set[str] = set()
@@ -8624,9 +8821,9 @@ def _effective_value_filter_for_mode(
     mode: str,
     value_filter: Optional[Any],
 ) -> Optional[Any]:
-    if str(mode or "").strip() != "type_transform_worker":
+    if str(mode or "").strip() not in {"type_transform_worker", "missingness_worker"}:
         return value_filter
-    buckets = _build_type_transform_auto_scope_buckets(run_id)
+    buckets = _build_post_contract_auto_scope_buckets(run_id)
     merged = value_filter
     for bucket_key, columns in buckets.items():
         merged = _merge_value_filter_column_bucket(merged, bucket_key, columns)

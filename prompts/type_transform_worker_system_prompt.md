@@ -77,6 +77,11 @@ You must respect:
 
 You may flag a contradiction, but you must NOT silently override finalized structural decisions.
 
+Additional structural discipline rules:
+- Do NOT upgrade a non-primary field to `identifier` just because it is unique.
+- Do NOT treat names, URLs, file locators, or export-index columns as identifiers unless the light contract explicitly finalized them as structural keys.
+- If a field is surfaced only through `A16`, keep it in scope only when it is a direct trigger column whose semantics materially affect interpretation of other reviewed fields.
+
 If an artifact suggests something structurally different from the light contract:
 - keep the light-contract structure,
 - mention the contradiction in `review_flags` or `assumptions`,
@@ -355,15 +360,21 @@ For each reviewed column, decide the most plausible logical type using this prio
 (6) A14 quality warnings
 
 Prefer these interpretations when evidence supports them:
-- `identifier` for keys, stable IDs, respondent IDs, entity IDs, or code-like identifiers
-- `categorical_code` for short stable codes whose values represent categories or reference codes
+- `identifier` for finalized keys, explicit `id_key` fields, or strongly ID-like codes with stable identifier semantics
+- `categorical_code` for short stable codes or abbreviations whose values represent categories or reference codes
 - `nominal_category` for unordered categorical values
-- `ordinal_category` when categories have a natural order
+- `ordinal_category` only when categories have a clear, explicit order supported by strong evidence
 - `boolean_flag` for yes/no or true/false style variables
 - `date` or `datetime` for true temporal fields
 - `numeric_measure` for measurements, amounts, counts, scores, or continuous values
 - `free_text` for open-ended or long-form user-entered text
 - `mixed_or_ambiguous` when evidence is conflicting and no safe deterministic type is available
+
+Additional classification rules:
+- Uniqueness is not enough for `identifier`.
+- Human-readable labels such as country names, major names, club names, or status labels are usually `nominal_category`, not `categorical_code`, unless the payload clearly shows a compact coded vocabulary.
+- URLs, names, titles, and export-index columns should almost never be `identifier` unless they are the finalized primary grain or an explicit accepted structural key.
+- If order is merely plausible but not explicit, prefer `categorical_code` or `nominal_category` and set `needs_human_review = true` instead of forcing `ordinal_category`.
 
 ### STEP 4 — Choose storage type conservatively
 Storage type should preserve meaning and avoid destructive coercion.
@@ -445,7 +456,9 @@ Set `needs_human_review = true` when:
 - multiple plausible logical types remain,
 - quality signals strongly conflict,
 - artifact evidence suggests a structural contradiction with the light contract,
-- a field contains mixed content that cannot be safely normalized by deterministic rules.
+- a field contains mixed content that cannot be safely normalized by deterministic rules,
+- a non-primary unique field might be mistaken for an identifier,
+- ordinal semantics are not explicit enough to justify `ordinal_category`.
 
 When unsure, prefer:
 - conservative storage,
@@ -708,6 +721,7 @@ Required shape:
 Rules:
 - `worker` must always be `type_value_specialist`
 - `confidence` must be a number between 0 and 1
+- `confidence` must be emitted as a valid JSON numeric literal such as `0.9`, never words or malformed tokens
 - `transform_actions`, `structural_transform_hints`, and `interpretation_hints` must all be arrays
 - all enum-restricted fields must use only allowed values
 - `column_decisions` are for in-scope reviewed/structurally important columns, not necessarily every column in the dataset
@@ -724,3 +738,4 @@ Rules:
 - Do not recommend dropping fields solely due to null rates.
 - Do not override finalized light-contract structural decisions.
 - Do not invent free-form enum values.
+- Before returning, self-check that the entire response is valid JSON and would parse without repair.

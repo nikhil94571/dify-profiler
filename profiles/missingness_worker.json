@@ -1,0 +1,150 @@
+{
+  "profile": "missingness_worker",
+  "description": "Pruning profile optimized for the post-light-contract missingness and structural-validity specialist. Keeps null-heavy columns, token-missingness cues, semantic anchor context, quality cautions, and compact skip-logic evidence without shipping full wide-family payloads.",
+  "artifacts": ["A2", "A4", "A13", "A14", "A16"],
+  "pruning": {
+    "A2": {
+      "drop": [
+        "artifact_inputs",
+        "profiler_samples",
+        "numeric_profile",
+        "datetime_profile"
+      ],
+      "policies": {
+        "root_scope_policy": {
+          "type": "column_scope_selector",
+          "target_array": "__root__",
+          "name_field": "column",
+          "include_from_filter_keys": [
+            "force_include_columns",
+            "review_columns",
+            "structural_columns",
+            "skip_trigger_columns",
+            "skip_affected_preview_columns"
+          ],
+          "include_bool_true_fields": [
+            "high_missingness"
+          ],
+          "include_nonempty_fields": [
+            "missing_tokens_observed"
+          ],
+          "hard_cap_per_inferred_group": 8,
+          "hard_cap_total": 120
+        }
+      },
+      "transforms": {
+        "compact_a2_samples": {
+          "type": "compact_keyed_string_arrays",
+          "target_array_path": "__root__",
+          "field": "a2_samples",
+          "max_items_per_key": 2,
+          "max_chars": 80
+        },
+        "drop_empty_a2_fields": {
+          "type": "drop_fields_when_empty",
+          "target_array_path": "__root__",
+          "fields": [
+            "missing_tokens_observed"
+          ]
+        }
+      }
+    },
+    "A4": {
+      "drop": [
+        "inputs",
+        "global_tokens",
+        "token_classification"
+      ],
+      "policies": {
+        "per_column_policy": {
+          "type": "column_scope_selector",
+          "target_array": "per_column",
+          "name_field": "column",
+          "include_from_filter_keys": [
+            "force_include_columns",
+            "review_columns",
+            "structural_columns",
+            "skip_trigger_columns",
+            "skip_affected_preview_columns"
+          ],
+          "include_numeric_gte": {
+            "missing_pct": 20
+          },
+          "include_nonempty_fields": [
+            "token_breakdown"
+          ],
+          "hard_cap_per_inferred_group": 12,
+          "hard_cap_total": 140
+        }
+      },
+      "transforms": {
+        "drop_empty_a4_fields": {
+          "type": "drop_fields_when_empty",
+          "target_array_path": "per_column",
+          "fields": [
+            "token_breakdown"
+          ]
+        }
+      }
+    },
+    "A13": {
+      "drop": [
+        "inputs"
+      ],
+      "policies": {
+        "columns_policy": {
+          "type": "column_scope_selector",
+          "target_array": "columns",
+          "name_field": "column",
+          "include_from_filter_keys": [
+            "force_include_columns",
+            "review_columns",
+            "skip_trigger_columns",
+            "skip_affected_preview_columns"
+          ],
+          "include_nonempty_fields": [
+            "detected_anchors"
+          ],
+          "hard_cap_total": 40
+        }
+      }
+    },
+    "A14": {
+      "drop": [
+        "inputs",
+        "segments"
+      ],
+      "policies": {
+        "columns_policy": {
+          "type": "column_scope_selector",
+          "target_array": "columns",
+          "name_field": "column",
+          "include_from_filter_keys": [
+            "force_include_columns",
+            "review_columns",
+            "skip_trigger_columns",
+            "skip_affected_preview_columns"
+          ],
+          "include_bool_true_fields": [
+            "drift_detected"
+          ],
+          "include_numeric_lte": {
+            "global_quality_score": 0.85
+          },
+          "hard_cap_total": 100
+        }
+      }
+    },
+    "A16": {
+      "drop": [
+        "inputs",
+        "target_columns_scanned",
+        "trigger_columns_scanned"
+      ],
+      "limits": {
+        "detected_skip_logic": 50,
+        "master_switch_candidates": 15
+      }
+    }
+  }
+}

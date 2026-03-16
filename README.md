@@ -223,9 +223,25 @@ with `global.value_filter.force_include_columns` derived from finalized `light_c
 - `primary_grain_decision.keys`
 - `dimension_decisions[].keys`
 - `family_decisions[].parent_key`
-- `family_decisions[].repeat_index_name`
 
 This keeps Dify focused on orchestration and LLM adjudication while leaving evidence generation, storage, and compression inside this service.
+
+For the type/value worker, add a post-LLM validation step in Dify:
+
+1. parse the LLM `text` as JSON
+2. verify the top-level object contains:
+   - `worker`
+   - `summary`
+   - `column_decisions`
+   - `global_transform_rules`
+   - `review_flags`
+   - `assumptions`
+3. fail fast or retry once if parsing fails
+
+Why this matters:
+- the worker is intended to emit strict JSON only
+- downstream stages should not silently accept malformed outputs
+- this is the safest place to guard against prompt drift or formatting failures
 
 ## Likely Worker Structure
 
