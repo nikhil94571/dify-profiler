@@ -76,7 +76,10 @@ Current view surfaces:
 
 `GET /artifact-bundles` is the simplest Dify-facing interface for workers that only need profile-default pruning.
 
-For workers that need request-scoped pruning inputs, use `POST /artifact-bundles/view`. This now matters for `type_transform_worker`, `missingness_worker`, and `semantic_context_worker`, which can accept `global.value_filter.force_include_columns` so finalized grain and family columns are always retained in a scoped bundle.
+For workers that need request-scoped pruning inputs, use `POST /artifact-bundles/view`. This now matters for `type_transform_worker`, `missingness_worker`, `semantic_context_worker`, and `family_worker`.
+
+- `type_transform_worker`, `missingness_worker`, and `semantic_context_worker` can accept `global.value_filter.force_include_columns` so finalized grain and family linkage columns are always retained in a scoped bundle.
+- `family_worker` can additionally accept `global.value_filter.force_include_family_ids` so `A8` and `B1` are reduced to just the accepted families under review.
 
 The post-light-contract worker path also applies server-side auto-scope buckets from stored artifacts:
 
@@ -106,6 +109,24 @@ Content-Type: application/json
   "global": {
     "value_filter": {
       "force_include_columns": ["order_id", "customer_id", "event_date"]
+    }
+  }
+}
+```
+
+Example scoped request for the family worker:
+
+```http
+POST /artifact-bundles/view
+Content-Type: application/json
+
+{
+  "run_id": "<run_id>",
+  "mode": "family_worker",
+  "global": {
+    "value_filter": {
+      "force_include_columns": ["respondent_id", "wave"],
+      "force_include_family_ids": ["a_1", "m_2"]
     }
   }
 }
@@ -166,6 +187,7 @@ Examples from the current implementation:
 - `A8` uses transforms to create compact `family_signature` views
 - `A9` uses role-aware selection to preserve structurally important columns
 - `type_transform_worker` uses typed scoped column selection plus compact evidence previews to reduce token waste in `A2`, `A3-T`, `A4`, `A9`, `A13`, and `A14`
+- `family_worker` uses `force_include_family_ids` to reduce `A8` and `B1` to accepted families only
 
 ### Worker profiles
 
@@ -191,6 +213,7 @@ profiles/<mode>.json
 The repository also contains a local profile example:
 
 - [`profiles/grain_worker.json`](/Users/nikhil/Automations/dify-profiler/profiles/grain_worker.json)
+- [`profiles/family_worker.json`](/Users/nikhil/Automations/dify-profiler/profiles/family_worker.json)
 
 ## Current Dify Integration Model
 
@@ -203,6 +226,19 @@ The intended Dify pattern is:
 5. run specialist workers on those pruned bundles
 
 Post-grain workers can also consume `A16` so they do not misread structurally valid skip-logic nulls as generic low-quality missingness.
+
+After semantic, type, and missingness workers have produced validated JSON outputs, the intended next stage is a per-family loop:
+
+1. parse finalized light-contract decisions and derive accepted `family_id` values
+2. request `POST /artifact-bundles/view` with `mode = "family_worker"`
+3. build one loop item per accepted family using:
+   - `light_contract_decisions`
+   - `semantic_context_json`
+   - `type_transform_worker_json`
+   - `missingness_worker_json`
+   - matched `A8` and `B1` family evidence
+4. run [`prompts/family_worker_system_prompt.md`](/Users/nikhil/Automations/dify-profiler/prompts/family_worker_system_prompt.md) once per family
+5. validate each family JSON item, repair once if needed, then aggregate into one `family_worker_json`
 
 ## Light Contract Semantic Context
 

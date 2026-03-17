@@ -1,0 +1,144 @@
+{
+  "profile": "family_worker",
+  "description": "Pruning profile optimized for the post-light-contract family specialist. Keeps compact family vocabulary from A8 and family-scoped evidence packets from B1 so one-family-at-a-time review can run with earlier type, missingness, and semantic outputs.",
+  "artifacts": ["A8", "B1"],
+  "pruning": {
+    "A8": {
+      "drop": [
+        "inputs",
+        "uses",
+        {
+          "key": "rows",
+          "scope": "recursive_key_drop",
+          "guards": {
+            "value_kind_any_of": ["list_of_objects"],
+            "path_hints_any_of": [
+              "row_samples.panels[].rows",
+              "example_conflicts[].rows",
+              "F_subset.rows"
+            ]
+          },
+          "note": "Mitigation for name-collision risk: only drop when the value looks like row payloads (list of objects) and/or appears under known row-sample containers."
+        },
+        "families",
+        "near_misses",
+        "rejected_candidates",
+        "coverage",
+        "debug_trace"
+      ],
+      "policies": {
+        "families_index_policy": {
+          "type": "column_scope_selector",
+          "target_array": "families_index",
+          "name_field": "family_id",
+          "include_from_filter_keys": [
+            "force_include_family_ids"
+          ],
+          "hard_cap_total": 40
+        }
+      },
+      "transforms": {
+        "family_signature": {
+          "type": "join_array_by_key",
+          "target_array_path": "families_index",
+          "source_array_path": "families",
+          "join_key": "family_id",
+          "write_field": "family_signature",
+          "field_map": {
+            "normalized_stem": {
+              "from": "source.stem_evidence.normalized_stem"
+            },
+            "raw_stem": {
+              "from": "source.stem_evidence.raw_stem"
+            },
+            "pattern_kind": {
+              "from": "source.patterns[0]",
+              "fallback_from": "target.patterns[0]"
+            },
+            "suffix_keyword": {
+              "from": "target.repeat_dim",
+              "fallback_from": "target.recommended_repeat_dimension_name"
+            },
+            "suffix_keyword_title": {
+              "from": "target.repeat_dim",
+              "fallback_from": "target.recommended_repeat_dimension_name",
+              "transform": "title"
+            },
+            "columns_preview": {
+              "from": "source.columns_preview",
+              "slice": 3,
+              "k_max": 8
+            },
+            "columns_count": {
+              "from": "source.columns_count"
+            },
+            "signature_label": {
+              "from": "source.stem_evidence.normalized_stem",
+              "template": "{source.family_id}:{value}"
+            }
+          }
+        }
+      }
+    },
+    "B1": {
+      "drop": [
+        "inputs",
+        "B_subset",
+        "F_subset",
+        {
+          "key": "grain_collisions_touching_family",
+          "scope": "recursive_key_drop",
+          "guards": {
+            "value_kind_any_of": ["list_of_objects"],
+            "path_hints_any_of": [
+              "C_subset.grain_collisions_touching_family"
+            ]
+          },
+          "note": "Drop nested structural collision diagnostics from family packets; they are large and belong to grain-stage evidence, not family interpretation."
+        },
+        {
+          "key": "index_by_column",
+          "scope": "recursive_key_drop",
+          "guards": {
+            "path_hints_any_of": [
+              "C_subset.repeat_candidate.index_by_column"
+            ]
+          },
+          "note": "Drop duplicate full member-to-index maps from nested repeat_candidate payloads; the family already carries top-level member columns and compact index summary."
+        },
+        {
+          "key": "columns",
+          "scope": "recursive_key_drop",
+          "guards": {
+            "path_hints_any_of": [
+              "C_subset.repeat_candidate.columns"
+            ]
+          },
+          "note": "Drop duplicate full member column lists from nested repeat_candidate payloads; use the top-level family packet columns list instead."
+        },
+        {
+          "key": "rows",
+          "scope": "recursive_key_drop",
+          "guards": {
+            "value_kind_any_of": ["list_of_objects"],
+            "path_hints_any_of": [
+              "F_subset.rows"
+            ]
+          },
+          "note": "Remove row-heavy family preview rows from B1 packets."
+        }
+      ],
+      "policies": {
+        "root_scope_policy": {
+          "type": "column_scope_selector",
+          "target_array": "__root__",
+          "name_field": "family_id",
+          "include_from_filter_keys": [
+            "force_include_family_ids"
+          ],
+          "hard_cap_total": 40
+        }
+      }
+    }
+  }
+}

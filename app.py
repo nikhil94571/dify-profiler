@@ -8513,6 +8513,11 @@ def _run_pruning_smoke_checks() -> None:
     assert semantic_context_profile["artifacts"] == ["A2", "A8", "A9", "A16"]
     semantic_context_cfg = semantic_context_profile["mode_config"]
 
+    family_worker_profile, family_worker_source = _load_profile_local("family_worker")
+    assert family_worker_source == "local"
+    assert family_worker_profile["artifacts"] == ["A8", "B1"]
+    family_worker_cfg = family_worker_profile["mode_config"]
+
     mode_cfg_missingness, mode_meta_missingness = _resolve_mode_config("missingness_worker")
     assert mode_meta_missingness["profile_artifacts"] == ["A2", "A4", "A13", "A14", "A16"]
     assert mode_cfg_missingness == missingness_cfg
@@ -8520,6 +8525,10 @@ def _run_pruning_smoke_checks() -> None:
     mode_cfg_semantic, mode_meta_semantic = _resolve_mode_config("semantic_context_worker")
     assert mode_meta_semantic["profile_artifacts"] == ["A2", "A8", "A9", "A16"]
     assert mode_cfg_semantic == semantic_context_cfg
+
+    mode_cfg_family, mode_meta_family = _resolve_mode_config("family_worker")
+    assert mode_meta_family["profile_artifacts"] == ["A8", "B1"]
+    assert mode_cfg_family == family_worker_cfg
 
     sample_a2_type = [
         {
@@ -8914,6 +8923,114 @@ def _run_pruning_smoke_checks() -> None:
     assert len(pruned_a16_semantic.get("detected_skip_logic", [])) == 40
     assert len(pruned_a16_semantic.get("master_switch_candidates", [])) == 12
     assert "inputs" not in pruned_a16_semantic
+
+    sample_a8_family = {
+        "families": [
+            {
+                "family_id": "fam_a",
+                "stem_evidence": {"normalized_stem": "a", "raw_stem": "A"},
+                "patterns": ["suffix_keyword_numeric"],
+                "columns_preview": ["A_1", "A_2", "A_3"],
+                "columns_count": 3,
+            },
+            {
+                "family_id": "fam_b",
+                "stem_evidence": {"normalized_stem": "b", "raw_stem": "B"},
+                "patterns": ["suffix_keyword_numeric"],
+                "columns_preview": ["B_1", "B_2", "B_3"],
+                "columns_count": 3,
+            },
+        ],
+        "families_index": [
+            {"family_id": "fam_a", "repeat_dim": "wave", "patterns": ["suffix_keyword_numeric"]},
+            {"family_id": "fam_b", "repeat_dim": "wave", "patterns": ["suffix_keyword_numeric"]},
+        ],
+        "near_misses": [{"family_id": "miss"}],
+        "rejected_candidates": [{"family_id": "rej"}],
+    }
+    pruned_a8_family, _ = apply_llm_pruning(
+        payload=sample_a8_family,
+        artifact_id="A8",
+        mode="family_worker",
+        keep_keys=[],
+        drop_keys=[],
+        limits=None,
+        value_filter={"force_include_family_ids": ["fam_b"]},
+        debug=True,
+        mode_config=family_worker_cfg,
+    )
+    family_ids = [row.get("family_id") for row in pruned_a8_family.get("families_index", []) if isinstance(row, dict)]
+    assert family_ids == ["fam_b"]
+    family_sig = (pruned_a8_family.get("families_index") or [{}])[0].get("family_signature")
+    assert isinstance(family_sig, dict)
+    assert "families" not in pruned_a8_family
+    assert "near_misses" not in pruned_a8_family
+    assert "rejected_candidates" not in pruned_a8_family
+
+    sample_b1_family = [
+        {
+            "inputs": {"uses": ["A8"]},
+            "family_id": "fam_a",
+            "columns": ["A_1", "A_2"],
+            "detected_pattern_index_summary": {"patterns": ["suffix_keyword_numeric"]},
+            "family_summary": {"avg_missing_pct": 10.0},
+            "relational_context": {"global_grain": ["id"]},
+            "peer_signature": [{"peer_id": "fam_b", "confidence": 0.8}],
+            "evidence_subset": {"A2_signals": [{"column": "A_1"}]},
+            "C_subset": {
+                "repeat_candidate": {
+                    "family_id": "fam_a",
+                    "columns": ["A_1", "A_2"],
+                    "index_by_column": {"A_1": ["1"], "A_2": ["2"]},
+                },
+                "grain_collisions_touching_family": [{"keys_tested": ["id", "A_1"]}],
+            },
+            "B_subset": [{"column": "A_1"}],
+            "F_subset": {"rows": [{"A_1": "x"}]},
+        },
+        {
+            "inputs": {"uses": ["A8"]},
+            "family_id": "fam_b",
+            "columns": ["B_1", "B_2"],
+            "detected_pattern_index_summary": {"patterns": ["suffix_keyword_numeric"]},
+            "family_summary": {"avg_missing_pct": 15.0},
+            "relational_context": {"global_grain": ["id"]},
+            "peer_signature": [{"peer_id": "fam_a", "confidence": 0.7}],
+            "evidence_subset": {"A2_signals": [{"column": "B_1"}]},
+            "C_subset": {
+                "repeat_candidate": {
+                    "family_id": "fam_b",
+                    "columns": ["B_1", "B_2"],
+                    "index_by_column": {"B_1": ["1"], "B_2": ["2"]},
+                },
+                "grain_collisions_touching_family": [{"keys_tested": ["id", "B_1"]}],
+            },
+            "B_subset": [{"column": "B_1"}],
+            "F_subset": {"rows": [{"B_1": "y"}]},
+        },
+    ]
+    pruned_b1_family, _ = apply_llm_pruning(
+        payload=sample_b1_family,
+        artifact_id="B1",
+        mode="family_worker",
+        keep_keys=[],
+        drop_keys=[],
+        limits=None,
+        value_filter={"force_include_family_ids": ["fam_b"]},
+        debug=True,
+        mode_config=family_worker_cfg,
+    )
+    assert isinstance(pruned_b1_family, list)
+    assert len(pruned_b1_family) == 1
+    assert pruned_b1_family[0].get("family_id") == "fam_b"
+    assert "inputs" not in pruned_b1_family[0]
+    assert "B_subset" not in pruned_b1_family[0]
+    assert "F_subset" not in pruned_b1_family[0]
+    c_subset = pruned_b1_family[0].get("C_subset") or {}
+    repeat_candidate = c_subset.get("repeat_candidate") or {}
+    assert "grain_collisions_touching_family" not in c_subset
+    assert "columns" not in repeat_candidate
+    assert "index_by_column" not in repeat_candidate
 
     light_contract_override_rows = []
     for default in DEFAULT_OVERRIDE_FIELDS:
