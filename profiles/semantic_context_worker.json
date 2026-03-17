@@ -1,0 +1,167 @@
+{
+  "profile": "semantic_context_worker",
+  "description": "Pruning profile optimized for grounding the semantic-context interpreter with full column vocabulary, compact family signatures, structural role hints, low-cardinality code previews, and skip-logic trigger candidates.",
+  "artifacts": ["A2", "A8", "A9", "A16"],
+  "pruning": {
+    "A2": {
+      "transforms": {
+        "project_semantic_context_grounding": {
+          "type": "project_a2_semantic_context_grounding",
+          "low_cardinality_max_unique_count": 12,
+          "low_cardinality_preview_cap": 150,
+          "top_levels_limit": 6,
+          "priority_filter_keys": [
+            "force_include_columns",
+            "review_columns",
+            "structural_columns",
+            "skip_trigger_columns"
+          ]
+        }
+      }
+    },
+    "A8": {
+      "drop": [
+        "inputs",
+        "uses",
+        {
+          "key": "rows",
+          "scope": "recursive_key_drop",
+          "guards": {
+            "value_kind_any_of": ["list_of_objects"],
+            "path_hints_any_of": [
+              "row_samples.panels[].rows",
+              "example_conflicts[].rows",
+              "F_subset.rows"
+            ]
+          },
+          "note": "Mitigation for name-collision risk: only drop when the value looks like row payloads (list of objects) and/or appears under known row-sample containers."
+        },
+        "families",
+        "near_misses",
+        "rejected_candidates",
+        "coverage",
+        "debug_trace"
+      ],
+      "limits": {
+        "families_index": 60
+      },
+      "transforms": {
+        "family_signature": {
+          "type": "join_array_by_key",
+          "target_array_path": "families_index",
+          "source_array_path": "families",
+          "join_key": "family_id",
+          "write_field": "family_signature",
+          "field_map": {
+            "normalized_stem": {
+              "from": "source.stem_evidence.normalized_stem"
+            },
+            "raw_stem": {
+              "from": "source.stem_evidence.raw_stem"
+            },
+            "pattern_kind": {
+              "from": "source.patterns[0]",
+              "fallback_from": "target.patterns[0]"
+            },
+            "suffix_keyword": {
+              "from": "target.repeat_dim",
+              "fallback_from": "target.recommended_repeat_dimension_name"
+            },
+            "suffix_keyword_title": {
+              "from": "target.repeat_dim",
+              "fallback_from": "target.recommended_repeat_dimension_name",
+              "transform": "title"
+            },
+            "columns_preview": {
+              "from": "source.columns_preview",
+              "slice": 3,
+              "k_max": 8
+            },
+            "columns_count": {
+              "from": "source.columns_count"
+            },
+            "signature_label": {
+              "from": "source.stem_evidence.normalized_stem",
+              "template": "{source.family_id}:{value}"
+            }
+          }
+        }
+      }
+    },
+    "A9": {
+      "drop": [
+        "inputs",
+        "uses",
+        {
+          "key": "rows",
+          "scope": "recursive_key_drop",
+          "guards": {
+            "value_kind_any_of": ["list_of_objects"],
+            "path_hints_any_of": [
+              "row_samples.panels[].rows",
+              "example_conflicts[].rows",
+              "F_subset.rows"
+            ]
+          },
+          "note": "Mitigation for name-collision risk: only drop when the value looks like row payloads (list of objects) and/or appears under known row-sample containers."
+        },
+        "evidence_primitives",
+        "role_scores",
+        "role_candidates",
+        "role_decision",
+        "audit",
+        "evidence_used",
+        "evidence_not_used",
+        "features"
+      ],
+      "transforms": {
+        "derive_role_candidate_preview": {
+          "type": "derive_role_candidate_preview",
+          "target_array_path": "columns",
+          "output_field": "role_candidate_preview",
+          "top_k": 2
+        }
+      },
+      "policies": {
+        "columns_policy": {
+          "type": "role_bucket_selector",
+          "target_array": "columns",
+          "role_field": "primary_role",
+          "name_field": "column",
+          "review_field": "review_required",
+          "include_roles_all": [
+            {
+              "role": "id_key",
+              "cap": 20
+            },
+            {
+              "role": "time_index",
+              "cap": 20
+            },
+            {
+              "role": "repeat_index",
+              "cap": 20
+            },
+            {
+              "role": "invariant_attr",
+              "cap": 20
+            }
+          ],
+          "include_review_required_topk": 40,
+          "hard_cap_total": 80
+        }
+      }
+    },
+    "A16": {
+      "drop": [
+        "inputs",
+        "target_columns_scanned",
+        "trigger_columns_scanned"
+      ],
+      "limits": {
+        "detected_skip_logic": 40,
+        "master_switch_candidates": 12
+      }
+    }
+  }
+}

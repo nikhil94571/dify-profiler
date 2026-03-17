@@ -15,8 +15,16 @@ EDITABLE_FILL = PatternFill(fill_type="solid", fgColor="FFF4CC")
 
 DEFAULT_OVERRIDE_FIELDS: List[Dict[str, str]] = [
     {
+        "field": "dataset_context_and_collection_notes",
+        "description": "Describe the purpose of the dataset, what one row generally represents, how the data was collected, whether collection changed across waves/forms/exports, and whether any sections were optional or conditionally shown. Focus on semantic context only; do not describe desired final tables here.",
+    },
+    {
+        "field": "semantic_codebook_and_important_variables",
+        "description": "Explain the meaning of important columns or families, known condition/screener/master-switch columns, code meanings or label mappings, placeholder values with semantic meaning, and which columns act as statuses, flags, or selectors. Focus on meaning rather than final layout.",
+    },
+    {
         "field": "global_renaming_instructions",
-        "description": "Describe global renaming decisions, including friendlier names for identifiers, dates, question blocks, or child tables.",
+        "description": "Describe global renaming decisions, including friendlier names for identifiers, dates, question blocks, or family labels.",
     },
     {
         "field": "global_regex_rules",
@@ -27,8 +35,12 @@ DEFAULT_OVERRIDE_FIELDS: List[Dict[str, str]] = [
         "description": "List repeat or matrix families that were missed, plus any known business labels for their row indices.",
     },
     {
+        "field": "known_skip_logic_or_screening_rules",
+        "description": "Describe any known screening questions, skip logic, or conditionally shown sections that should inform semantic interpretation downstream.",
+    },
+    {
         "field": "free_text_override_instructions",
-        "description": "Capture any downstream structural instructions, such as fields to keep wide, tables to build, or columns that should never be dropped.",
+        "description": "Capture miscellaneous prototype instructions not covered elsewhere. Keep this focused on clarifications or exceptions, not final table-layout design.",
     },
 ]
 
@@ -161,7 +173,7 @@ def _build_readme_rows(contract: Dict[str, Any]) -> List[List[str]]:
         ["source_endpoint", str(contract.get("source_endpoint") or "")],
     ]
     return metadata_rows + [
-        ["section", "details"],
+        ["", ""],
         ["Workbook purpose", "Use this workbook to review the grain worker's structural recommendations before later specialists continue. The goal is to confirm the base row grain, validate repeat families, and capture any naming or structural overrides."],
         ["Primary Grain", "The minimal key or key combination that should identify one row in the base table."],
         ["Candidate Dimension", "A stable grouping or entity that may deserve its own dimension-style table, but is not the primary row grain."],

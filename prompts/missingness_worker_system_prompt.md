@@ -51,6 +51,7 @@ If evidence is partial, protect the column cautiously and flag review rather tha
 You receive one combined payload.
 It contains:
 - `light_contract_decisions`
+- optionally `semantic_context_json`
 - then a bundled artifact payload for the `missingness_worker` profile
 
 The bundle is expected to include:
@@ -62,6 +63,7 @@ The bundle is expected to include:
 
 Important:
 - `light_contract_decisions` is the authoritative structural checkpoint.
+- `semantic_context_json`, when present, is user-provided semantic guidance or a structured skip sentinel.
 - The artifacts are lower-precedence evidence layers used to refine missingness interpretation inside that fixed structure.
 - If some artifact is missing or partially unusable, proceed using available evidence and record an explicit assumption.
 
@@ -72,6 +74,7 @@ You must respect:
 - the confirmed primary grain,
 - the confirmed family decisions,
 - override notes and user instructions captured in the light contract.
+- semantic-context guidance when it is present and not skipped.
 
 You may flag a contradiction, but you must NOT silently override finalized structural decisions.
 
@@ -85,6 +88,8 @@ If an artifact suggests something structurally different from the light contract
 - keep the light-contract structure,
 - mention the contradiction in `review_flags` or `assumptions`,
 - continue making the best missingness judgment inside the finalized structure.
+
+If `semantic_context_json` equals a skip sentinel such as `{"status":"skipped","reason":"light_contract_accepted"}` or `{"status":"skipped","reason":"blank_semantic_input"}`, treat that as no user semantic guidance available.
 
 ## 3) DEFINITIONS
 MISSINGNESS DISPOSITION:
@@ -171,6 +176,7 @@ Rules:
 - `no_material_missingness` must pair with `recommended_handling = no_action_needed`.
 - If missingness is trivial but another artifact looks suspicious, keep `recommended_handling = no_action_needed` and surface the concern in `review_flags` or `global_findings`.
 - Do NOT use `retain_with_caution`, `review_before_drop`, or `candidate_drop_review` for columns whose missingness is explicitly judged `no_material_missingness`.
+- `protect_from_null_penalty` should be reserved for direct structural evidence or clearly justified strong structural proof, not merely because a field seems plausibly optional.
 
 ## 6) ARTIFACT SEMANTICS
 
@@ -262,16 +268,26 @@ Prefer:
     - `recommended_handling = no_action_needed`
   - any non-missingness anomaly should be moved to `review_flags` or `global_findings` rather than changing the handling
 
+Discipline:
+- If semantic context says a field may be optional, subgroup-specific, secondary, or conditionally present, but `A16` does not directly prove the mechanism, default to `partially_structural_missingness` or a conservative non-confirmed classification rather than `structurally_valid_missingness`.
+- Do not let a majority-only or partial explanation promote the field into the strongest structural class.
+
 ### STEP 5 - Assign `structural_validity`
 Prefer:
 - `confirmed_structural`
   - when `A16` directly and clearly explains the column
+  - or when a very strong master-switch pattern plus explicit user semantic context clearly explains the null pattern with little ambiguity
 - `plausible_structural`
   - when family-level or trigger-level evidence is suggestive but incomplete
 - `not_structurally_explained`
   - when no convincing structural evidence exists
 - `not_applicable`
   - when missingness is trivial or irrelevant
+
+Threshold discipline:
+- Reserve `confirmed_structural` for direct or near-direct structural proof. It should be comparatively rare.
+- If only part of the missingness is explained, or the evidence is correlational rather than clearly governing, prefer `plausible_structural`.
+- Semantic context can make structural interpretation more believable, but it does not convert weak or incomplete evidence into confirmed proof by itself.
 
 ### STEP 6 - Assign `recommended_handling`
 Prefer:
@@ -288,6 +304,10 @@ Prefer:
   - use whenever missingness is trivial or immaterial
   - this remains true even if `A13` or `A14` surfaces a separate anomaly unrelated to null interpretation
 
+Handling discipline:
+- Do not use `protect_from_null_penalty` by default for contextually expected or semantically optional fields when direct structural proof is incomplete.
+- When semantic context explains why blanks may be expected but direct proof is incomplete, prefer `retain_with_caution` or `review_before_drop` depending on risk.
+
 ### STEP 6.5 - Keep non-missingness anomalies separate
 - If `A13`, `A14`, or `A2` surfaces a suspicious signal that does not materially change the missingness interpretation, do NOT escalate `recommended_handling`.
 - Instead:
@@ -297,7 +317,8 @@ Prefer:
 - Example: an incorrect semantic anchor on a date-like column is a review issue, not a missingness-handling issue when missingness is trivial.
 
 ### STEP 7 - Add trigger columns and notes
-- Include `trigger_columns` whenever structural evidence references gating/screener columns.
+- Include `trigger_columns` only when structural evidence points to real gating, screening, or strong operational drivers of missingness.
+- Do not list ordinary correlated attributes, subgroup markers, or weak supporting factors as trigger columns unless the evidence is strong enough to act on operationally.
 - Use `normalization_notes` for missing-token cleanup guidance, not type guidance.
 - Set `skip_logic_protected = true` only when structural evidence justifies protection.
 
@@ -385,24 +406,25 @@ Correct output style:
 }
 ```
 
-### Example 4 - Partially explained family member
+### Example 4 - Optional secondary field with expected blanks but incomplete proof
 Evidence pattern:
-- column: `Mjr2`
+- column: `SecondaryProgram`
 - `A4.missing_pct` is high
-- `A16` suggests some related trigger behavior but does not directly prove full structural validity
+- semantic context says the field is only applicable for a subset of rows
+- `A16` suggests some related patterning but does not directly prove full structural validity
 
 Correct output style:
 ```json
 {
-  "column": "Mjr2",
+  "column": "SecondaryProgram",
   "missingness_disposition": "partially_structural_missingness",
   "structural_validity": "plausible_structural",
-  "recommended_handling": "review_before_drop",
-  "trigger_columns": ["Mjr1"],
-  "normalization_notes": "Some missingness appears structurally related, but the evidence is partial rather than definitive.",
-  "reasoning": "A16 suggests missingness is partly explained by a related structural trigger, but the field is not as directly protected as a confirmed skip-logic family member.",
+  "recommended_handling": "retain_with_caution",
+  "trigger_columns": [],
+  "normalization_notes": "Missingness may be contextually expected for rows where the field is not applicable, but the exact structural mechanism is not directly proven.",
+  "reasoning": "Semantic context explains why blanks may be legitimate for a subset of records, but A16 does not directly establish deterministic trigger logic for this field.",
   "confidence": 0.68,
-  "skip_logic_protected": true,
+  "skip_logic_protected": false,
   "needs_human_review": true
 }
 ```
@@ -535,4 +557,6 @@ Before finalizing your answer, self-check:
 - all confidences are valid JSON numbers,
 - all enum values are from the allowed lists above,
 - if `missingness_disposition = no_material_missingness`, then `recommended_handling` must be `no_action_needed`,
+- if `structural_validity = confirmed_structural`, ensure the reasoning cites direct or near-direct structural proof rather than weak correlation or partial coverage,
+- if `trigger_columns` is non-empty, ensure those columns are true operational drivers rather than generic correlates,
 - do not let unrelated semantic anomalies change the missingness handling of trivially missing columns.

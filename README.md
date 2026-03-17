@@ -76,9 +76,9 @@ Current view surfaces:
 
 `GET /artifact-bundles` is the simplest Dify-facing interface for workers that only need profile-default pruning.
 
-For workers that need request-scoped pruning inputs, use `POST /artifact-bundles/view`. This now matters for `type_transform_worker`, which can accept `global.value_filter.force_include_columns` so finalized grain and family columns are always retained in a scoped bundle.
+For workers that need request-scoped pruning inputs, use `POST /artifact-bundles/view`. This now matters for `type_transform_worker`, `missingness_worker`, and `semantic_context_worker`, which can accept `global.value_filter.force_include_columns` so finalized grain and family columns are always retained in a scoped bundle.
 
-The type/value worker also applies server-side typed auto-scope buckets from stored artifacts:
+The post-light-contract worker path also applies server-side auto-scope buckets from stored artifacts:
 
 - `review_columns` from `A3-T` and `A3-V`
 - `structural_columns` from `A9` role evidence
@@ -94,7 +94,7 @@ GET /artifact-bundles?run_id=<run_id>&mode=grain_worker
 
 If `artifact_ids` is omitted and `mode` maps to a named profile, the service infers the worker's artifact list from that profile.
 
-Example scoped request for the type/value worker:
+Example scoped request for a post-light-contract worker:
 
 ```http
 POST /artifact-bundles/view
@@ -204,6 +204,35 @@ The intended Dify pattern is:
 
 Post-grain workers can also consume `A16` so they do not misread structurally valid skip-logic nulls as generic low-quality missingness.
 
+## Light Contract Semantic Context
+
+The light-contract workbook now captures two kinds of early semantic input in the `Overrides` sheet:
+
+- `dataset_context_and_collection_notes`
+- `semantic_codebook_and_important_variables`
+
+These rows are intended for:
+
+- dataset purpose and row-meaning notes
+- collection-process changes across waves, forms, or exports
+- known optional or conditioned sections
+- condition, screener, or master-switch variables
+- simple code meanings and label mappings
+- semantic placeholders or status flags
+
+They are intentionally not the place for final table-layout instructions.
+
+When a light contract is accepted or a modified workbook is parsed, the downstream handoff now includes:
+
+```json
+"semantic_context_input": {
+  "dataset_context_and_collection_notes": "...",
+  "semantic_codebook_and_important_variables": "..."
+}
+```
+
+This keeps semantic truth available early without mixing it into the later hard-contract stage.
+
 For example, the grain worker can call:
 
 ```http
@@ -243,12 +272,173 @@ Why this matters:
 - downstream stages should not silently accept malformed outputs
 - this is the safest place to guard against prompt drift or formatting failures
 
+After light-contract finalization, add one more Dify step:
+
+1. if `light_contract_status == "accepted"`, skip the semantic bundle + semantic LLM and emit:
+   - `{"status":"skipped","reason":"light_contract_accepted"}`
+2. if `light_contract_status == "modified"`, request `POST /artifact-bundles/view` with `mode = "semantic_context_worker"`
+3. pass both `light_contract_decisions` and that semantic grounding bundle into [`prompts/semantic_context_interpreter_system_prompt.md`](/Users/nikhil/Automations/dify-profiler/prompts/semantic_context_interpreter_system_prompt.md)
+4. validate the returned JSON
+5. pass the resulting `semantic_context_json` downstream
+
+This semantic-context step should run before later type, missingness, family, or table-modeling stages consume the user notes.
+
+### Semantic Context Validator
+
+Use a validator-only Code node after the semantic-context interpreter. The node should fail fast on malformed output and return only a trivial success marker.
+
+Suggested Dify config:
+
+- input: `semantic_context_output` (`string`)
+- output: `validation_ok` (`string`)
+
+```python
+import json
+
+ALLOWED_KINDS = {
+    "condition_column",
+    "status_or_flag",
+    "code_column",
+    "family_context",
+    "date_or_phase_context",
+    "business_key_context",
+    "placeholder_value_context",
+    "other",
+}
+
+
+def _require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def _is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _require_non_empty_string(value, field_name):
+    _require(isinstance(value, str), f"{field_name} must be a string.")
+    _require(value.strip() != "", f"{field_name} must not be blank.")
+
+
+def _require_dict(value, field_name):
+    _require(isinstance(value, dict), f"{field_name} must be an object.")
+
+
+def _require_list(value, field_name):
+    _require(isinstance(value, list), f"{field_name} must be an array.")
+
+
+def _validate_summary(summary):
+    _require_dict(summary, "summary")
+    _require("overview" in summary, "summary.overview is required.")
+    _require("key_points" in summary, "summary.key_points is required.")
+    _require_non_empty_string(summary["overview"], "summary.overview")
+    _require_list(summary["key_points"], "summary.key_points")
+    for i, item in enumerate(summary["key_points"]):
+        _require_non_empty_string(item, f"summary.key_points[{i}]")
+
+
+def _validate_dataset_context(dataset_context):
+    _require_dict(dataset_context, "dataset_context")
+    for key in [
+        "dataset_purpose",
+        "row_meaning_notes",
+        "collection_change_notes",
+        "known_optional_or_conditioned_sections",
+    ]:
+        _require(key in dataset_context, f"dataset_context.{key} is required.")
+    _require(isinstance(dataset_context["dataset_purpose"], str), "dataset_context.dataset_purpose must be a string.")
+    _require(isinstance(dataset_context["row_meaning_notes"], str), "dataset_context.row_meaning_notes must be a string.")
+    for key in ["collection_change_notes", "known_optional_or_conditioned_sections"]:
+        _require_list(dataset_context[key], f"dataset_context.{key}")
+        for i, item in enumerate(dataset_context[key]):
+            _require_non_empty_string(item, f"dataset_context.{key}[{i}]")
+
+
+def _validate_important_variables(items):
+    _require_list(items, "important_variables")
+    for i, item in enumerate(items):
+        field_prefix = f"important_variables[{i}]"
+        _require_dict(item, field_prefix)
+        for key in ["column_or_family", "kind", "meaning", "downstream_importance", "confidence"]:
+            _require(key in item, f"{field_prefix}.{key} is required.")
+        _require_non_empty_string(item["column_or_family"], f"{field_prefix}.column_or_family")
+        _require_non_empty_string(item["kind"], f"{field_prefix}.kind")
+        _require(item["kind"] in ALLOWED_KINDS, f"{field_prefix}.kind must be one of: {', '.join(sorted(ALLOWED_KINDS))}")
+        _require_non_empty_string(item["meaning"], f"{field_prefix}.meaning")
+        _require_non_empty_string(item["downstream_importance"], f"{field_prefix}.downstream_importance")
+        _require(_is_number(item["confidence"]), f"{field_prefix}.confidence must be numeric.")
+        _require(0 <= float(item["confidence"]) <= 1, f"{field_prefix}.confidence must be between 0 and 1.")
+
+
+def _validate_codebook_hints(items):
+    _require_list(items, "codebook_hints")
+    for i, item in enumerate(items):
+        field_prefix = f"codebook_hints[{i}]"
+        _require_dict(item, field_prefix)
+        for key in ["column", "codes_or_labels_note", "meaning", "confidence"]:
+            _require(key in item, f"{field_prefix}.{key} is required.")
+        _require_non_empty_string(item["column"], f"{field_prefix}.column")
+        _require_non_empty_string(item["codes_or_labels_note"], f"{field_prefix}.codes_or_labels_note")
+        _require_non_empty_string(item["meaning"], f"{field_prefix}.meaning")
+        _require(_is_number(item["confidence"]), f"{field_prefix}.confidence must be numeric.")
+        _require(0 <= float(item["confidence"]) <= 1, f"{field_prefix}.confidence must be between 0 and 1.")
+
+
+def _validate_flat_note_list(items, field_name, item_key):
+    _require_list(items, field_name)
+    for i, item in enumerate(items):
+        field_prefix = f"{field_name}[{i}]"
+        _require_dict(item, field_prefix)
+        for key in [item_key, "issue" if field_name == "review_flags" else "explanation", "why" if field_name == "review_flags" else None]:
+            if key is None:
+                continue
+            _require(key in item, f"{field_prefix}.{key} is required.")
+            _require_non_empty_string(item[key], f"{field_prefix}.{key}")
+
+
+def main(semantic_context_output: str):
+    _require(isinstance(semantic_context_output, str), "semantic_context_output must be a string.")
+    _require(semantic_context_output.strip() != "", "semantic_context_output is empty.")
+
+    try:
+        parsed = json.loads(semantic_context_output)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Semantic context output is not valid JSON: {e}")
+
+    _require_dict(parsed, "root")
+    if parsed.get("status") == "skipped":
+        _require_non_empty_string(parsed.get("reason"), "reason")
+        return {
+            "validation_ok": "true"
+        }
+
+    for key in ["worker", "summary", "dataset_context", "important_variables", "codebook_hints", "review_flags", "assumptions"]:
+        _require(key in parsed, f"Missing required top-level key: {key}")
+
+    _require_non_empty_string(parsed["worker"], "worker")
+    _require(parsed["worker"] == "semantic_context_interpreter", "worker must be 'semantic_context_interpreter'.")
+    _validate_summary(parsed["summary"])
+    _validate_dataset_context(parsed["dataset_context"])
+    _validate_important_variables(parsed["important_variables"])
+    _validate_codebook_hints(parsed["codebook_hints"])
+    _validate_flat_note_list(parsed["review_flags"], "review_flags", "item")
+    _validate_flat_note_list(parsed["assumptions"], "assumptions", "assumption")
+
+    return {
+        "validation_ok": "true"
+    }
+```
+
 ## Likely Worker Structure
 
 The exact Dify workflow is not encoded in this repository, but the current artifact design strongly suggests a specialist pipeline along these lines:
 
 - grain specialist
+- semantic-context interpreter
 - type/transform specialist
+- missingness specialist
 - repeat/family specialist
 - layout/model specialist
 - final consolidator

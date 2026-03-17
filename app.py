@@ -26,7 +26,12 @@ import google.auth
 from google.auth import impersonated_credentials
 
 
-from xlsx_export import build_light_contract_xlsx_bytes, build_xlsx_bytes, parse_light_contract_xlsx_bytes
+from xlsx_export import (
+    DEFAULT_OVERRIDE_FIELDS,
+    build_light_contract_xlsx_bytes,
+    build_xlsx_bytes,
+    parse_light_contract_xlsx_bytes,
+)
 
 
 try:
@@ -3082,13 +3087,7 @@ def _build_repeat_family_rows(grain_worker_output: Dict[str, Any], structural_ga
 def _build_override_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[str, Any]]:
     input_descriptors = grain_worker_output.get("user_inputs_requested") or {}
     rows: List[Dict[str, Any]] = []
-    for default in (
-        {"field": "global_renaming_instructions", "description": "Describe global renaming decisions, including friendlier names for identifiers, dates, question blocks, or child tables."},
-        {"field": "global_regex_rules", "description": "Provide any regex-style grouping or naming rules that should be applied consistently across the dataset."},
-        {"field": "missed_family_information", "description": "List repeat or matrix families that were missed, plus any known business labels for their row indices."},
-        {"field": "known_skip_logic_or_screening_rules", "description": "Describe any known screening questions, skip logic, or conditionally shown question blocks that should inform downstream interpretation."},
-        {"field": "free_text_override_instructions", "description": "Capture any downstream structural instructions, such as fields to keep wide, tables to build, or columns that should never be dropped."},
-    ):
+    for default in DEFAULT_OVERRIDE_FIELDS:
         descriptor = input_descriptors.get(default["field"]) if isinstance(input_descriptors, dict) else None
         purpose = ""
         if isinstance(descriptor, dict):
@@ -3110,11 +3109,24 @@ def _keys_from_row(row: Dict[str, Any], prefix: str) -> List[str]:
     ]
 
 
+def _extract_semantic_context_input(override_rows: List[Dict[str, Any]]) -> Dict[str, str]:
+    override_lookup = {
+        str(row.get("field") or "").strip(): str(row.get("user_input") or "")
+        for row in (override_rows or [])
+        if str(row.get("field") or "").strip()
+    }
+    return {
+        "dataset_context_and_collection_notes": override_lookup.get("dataset_context_and_collection_notes", ""),
+        "semantic_codebook_and_important_variables": override_lookup.get("semantic_codebook_and_important_variables", ""),
+    }
+
+
 def _build_accepted_light_contract_handoff(contract_payload: Dict[str, Any]) -> Dict[str, Any]:
     primary_row = (contract_payload.get("primary_grain_rows") or [{}])[0] if contract_payload.get("primary_grain_rows") else {}
+    override_rows = contract_payload.get("override_rows") or []
     override_notes = {
         str(row.get("field") or ""): str(row.get("user_input") or "")
-        for row in (contract_payload.get("override_rows") or [])
+        for row in override_rows
         if str(row.get("field") or "").strip()
     }
     return {
@@ -3147,6 +3159,7 @@ def _build_accepted_light_contract_handoff(contract_payload: Dict[str, Any]) -> 
             for row in (contract_payload.get("repeat_family_rows") or [])
         ],
         "override_notes": override_notes,
+        "semantic_context_input": _extract_semantic_context_input(override_rows),
         "parse_validation": {
             "source": "stored_recommendation",
             "run_id_match": True,
@@ -3204,9 +3217,10 @@ def _build_parsed_light_contract_handoff(run_id: str, parsed_workbook: Dict[str,
             "comments": str(row.get("comments") or ""),
         })
 
+    override_rows = parsed_workbook.get("override_rows") or []
     override_notes = {
         str(row.get("field") or ""): str(row.get("user_input") or "")
-        for row in (parsed_workbook.get("override_rows") or [])
+        for row in override_rows
         if str(row.get("field") or "").strip()
     }
 
@@ -3221,6 +3235,7 @@ def _build_parsed_light_contract_handoff(run_id: str, parsed_workbook: Dict[str,
         "dimension_decisions": dimension_decisions,
         "family_decisions": family_decisions,
         "override_notes": override_notes,
+        "semantic_context_input": _extract_semantic_context_input(override_rows),
         "parse_validation": {
             "source": "uploaded_workbook",
             "workbook_run_id": workbook_run_id,
@@ -7948,11 +7963,119 @@ def _op_drop_fields_when_empty(root: Any, op: Dict[str, Any], report: Dict[str, 
         })
 
 
+def _op_project_a2_semantic_context_grounding(
+    root: Any,
+    op: Dict[str, Any],
+    report: Dict[str, Any],
+    value_filter: Optional[Any],
+) -> Any:
+    if not isinstance(root, list):
+        return root
+
+    try:
+        low_card_max_unique = int(op.get("low_cardinality_max_unique_count", 12))
+    except (TypeError, ValueError):
+        low_card_max_unique = 12
+    try:
+        preview_cap = int(op.get("low_cardinality_preview_cap", 150))
+    except (TypeError, ValueError):
+        preview_cap = 150
+    try:
+        top_levels_limit = int(op.get("top_levels_limit", 6))
+    except (TypeError, ValueError):
+        top_levels_limit = 6
+
+    priority_keys = [
+        str(key).strip()
+        for key in (op.get("priority_filter_keys") or [])
+        if str(key).strip()
+    ] or [
+        "force_include_columns",
+        "review_columns",
+        "structural_columns",
+        "skip_trigger_columns",
+    ]
+
+    priority_buckets: Dict[str, Set[str]] = {
+        key: _extract_columns_from_value_filter(value_filter, [key])
+        for key in priority_keys
+    }
+
+    columns_index: List[Dict[str, Any]] = []
+    low_card_candidates: List[Dict[str, Any]] = []
+
+    for row in root:
+        if not isinstance(row, dict):
+            continue
+        column = str(row.get("column") or "").strip()
+        if not column:
+            continue
+        top_candidate = row.get("top_candidate") or {}
+        try:
+            unique_count = int(row.get("unique_count", 0) or 0)
+        except (TypeError, ValueError):
+            unique_count = 0
+        try:
+            missing_pct = float(row.get("missing_pct", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            missing_pct = 0.0
+
+        columns_index.append({
+            "column": column,
+            "top_candidate_type": str(top_candidate.get("type") or ""),
+            "unique_count": unique_count,
+            "missing_pct": missing_pct,
+            "high_uniqueness_candidate": bool(row.get("high_uniqueness_candidate", False)),
+        })
+
+        if 0 < unique_count <= low_card_max_unique:
+            preview_row = {
+                "column": column,
+                "unique_count": unique_count,
+                "top_levels": [str(v) for v in (row.get("top_levels") or [])[:max(0, top_levels_limit)] if str(v).strip()],
+                "missing_tokens_observed": row.get("missing_tokens_observed") or {},
+                "is_one_hot_like": bool(row.get("is_one_hot_like", False)),
+            }
+            low_card_candidates.append(preview_row)
+
+    def _preview_sort_key(item: Dict[str, Any]) -> Tuple[Any, ...]:
+        column = str(item.get("column") or "")
+        bucket_rank = len(priority_keys)
+        for idx, key in enumerate(priority_keys):
+            if column in priority_buckets.get(key, set()):
+                bucket_rank = idx
+                break
+        return (
+            bucket_rank,
+            int(item.get("unique_count", 0) or 0),
+            column,
+        )
+
+    low_card_candidates = sorted(low_card_candidates, key=_preview_sort_key)
+    low_cardinality_value_preview = low_card_candidates[:max(0, preview_cap)]
+
+    transformed = {
+        "artifact": "A2",
+        "columns_index": columns_index,
+        "low_cardinality_value_preview": low_cardinality_value_preview,
+    }
+    report.setdefault("transform_ops_applied", []).append({
+        "name": str(op.get("name") or ""),
+        "type": "project_a2_semantic_context_grounding",
+        "columns_index_count": len(columns_index),
+        "low_cardinality_candidates": len(low_card_candidates),
+        "low_cardinality_output": len(low_cardinality_value_preview),
+        "priority_filter_keys": priority_keys,
+    })
+    return transformed
+
+
 def _apply_transform_stage(
     node: Any,
     artifact_id: str,
     transforms: Dict[str, Any],
     report: Dict[str, Any],
+    value_filter: Optional[Any] = None,
 ) -> Any:
     if not isinstance(node, (dict, list)):
         return node
@@ -7976,6 +8099,8 @@ def _apply_transform_stage(
             _op_derive_role_candidate_preview(node, op, report)
         elif op_type == "drop_fields_when_empty":
             _op_drop_fields_when_empty(node, op, report)
+        elif op_type == "project_a2_semantic_context_grounding":
+            node = _op_project_a2_semantic_context_grounding(node, op, report, value_filter)
     return node
 
 
@@ -8158,6 +8283,7 @@ def apply_llm_pruning(
         artifact_id=artifact_id,
         transforms=resolved_transforms,
         report=report,
+        value_filter=value_filter,
     )
     pruned = _recursive_prune_keys(
         transformed,
@@ -8382,9 +8508,18 @@ def _run_pruning_smoke_checks() -> None:
     assert missingness_profile["artifacts"] == ["A2", "A4", "A13", "A14", "A16"]
     missingness_cfg = missingness_profile["mode_config"]
 
+    semantic_context_profile, semantic_context_source = _load_profile_local("semantic_context_worker")
+    assert semantic_context_source == "local"
+    assert semantic_context_profile["artifacts"] == ["A2", "A8", "A9", "A16"]
+    semantic_context_cfg = semantic_context_profile["mode_config"]
+
     mode_cfg_missingness, mode_meta_missingness = _resolve_mode_config("missingness_worker")
     assert mode_meta_missingness["profile_artifacts"] == ["A2", "A4", "A13", "A14", "A16"]
     assert mode_cfg_missingness == missingness_cfg
+
+    mode_cfg_semantic, mode_meta_semantic = _resolve_mode_config("semantic_context_worker")
+    assert mode_meta_semantic["profile_artifacts"] == ["A2", "A8", "A9", "A16"]
+    assert mode_cfg_semantic == semantic_context_cfg
 
     sample_a2_type = [
         {
@@ -8664,6 +8799,173 @@ def _run_pruning_smoke_checks() -> None:
     assert "target_columns_scanned" not in (pruned_a16_missingness.get("audit_trace") or {})
     assert "trigger_columns_scanned" not in (pruned_a16_missingness.get("audit_trace") or {})
 
+    sample_a2_semantic = [
+        {
+            "column": "response_id",
+            "top_candidate": {"type": "string"},
+            "unique_count": 100,
+            "missing_pct": 0.0,
+            "high_uniqueness_candidate": True,
+            "top_levels": ["r1", "r2"],
+            "missing_tokens_observed": {},
+            "is_one_hot_like": False,
+            "profiler_samples": {"head": ["r1"]},
+            "a2_samples": {"head": ["r1"]},
+        },
+        {
+            "column": "gender_code",
+            "top_candidate": {"type": "integer"},
+            "unique_count": 2,
+            "missing_pct": 0.0,
+            "high_uniqueness_candidate": False,
+            "top_levels": ["0", "1", "2"],
+            "missing_tokens_observed": {},
+            "is_one_hot_like": False,
+        },
+        {
+            "column": "screen_flag",
+            "top_candidate": {"type": "categorical"},
+            "unique_count": 2,
+            "missing_pct": 5.0,
+            "high_uniqueness_candidate": False,
+            "top_levels": ["Yes", "No"],
+            "missing_tokens_observed": {"UNK": 1},
+            "is_one_hot_like": True,
+        },
+        {
+            "column": "large_card_text",
+            "top_candidate": {"type": "text"},
+            "unique_count": 30,
+            "missing_pct": 0.0,
+            "high_uniqueness_candidate": False,
+            "top_levels": ["a", "b"],
+            "missing_tokens_observed": {},
+            "is_one_hot_like": False,
+        },
+    ]
+    pruned_a2_semantic, _ = apply_llm_pruning(
+        payload=sample_a2_semantic,
+        artifact_id="A2",
+        mode="semantic_context_worker",
+        keep_keys=[],
+        drop_keys=[],
+        limits=None,
+        value_filter={
+            "skip_trigger_columns": ["screen_flag"],
+            "force_include_columns": ["response_id"],
+        },
+        debug=True,
+        mode_config=semantic_context_cfg,
+    )
+    assert pruned_a2_semantic.get("artifact") == "A2"
+    semantic_columns = [row.get("column") for row in pruned_a2_semantic.get("columns_index", []) if isinstance(row, dict)]
+    assert semantic_columns == ["response_id", "gender_code", "screen_flag", "large_card_text"]
+    low_card_columns = [row.get("column") for row in pruned_a2_semantic.get("low_cardinality_value_preview", []) if isinstance(row, dict)]
+    assert low_card_columns == ["screen_flag", "gender_code"]
+    assert "large_card_text" not in low_card_columns
+    assert "response_id" not in low_card_columns
+    gender_preview = next(row for row in pruned_a2_semantic.get("low_cardinality_value_preview", []) if row.get("column") == "gender_code")
+    assert gender_preview.get("top_levels") == ["0", "1", "2"]
+
+    pruned_a8_semantic, _ = apply_llm_pruning(
+        payload=sample_a8,
+        artifact_id="A8",
+        mode="semantic_context_worker",
+        keep_keys=[],
+        drop_keys=[],
+        limits=None,
+        value_filter=None,
+        debug=True,
+        mode_config=semantic_context_cfg,
+    )
+    semantic_family = (pruned_a8_semantic.get("families_index") or [{}])[0]
+    assert isinstance(semantic_family.get("family_signature"), dict)
+    assert "families" not in pruned_a8_semantic
+
+    pruned_a9_semantic, _ = apply_llm_pruning(
+        payload=sample_a9_type,
+        artifact_id="A9",
+        mode="semantic_context_worker",
+        keep_keys=[],
+        drop_keys=[],
+        limits=None,
+        value_filter=None,
+        debug=True,
+        mode_config=semantic_context_cfg,
+    )
+    semantic_a9_row = (pruned_a9_semantic.get("columns") or [{}])[0]
+    assert semantic_a9_row.get("role_candidate_preview") == [
+        {"role": "id_key", "score": 1.0},
+        {"role": "measure", "score": 0.4},
+    ]
+    assert "role_scores" not in semantic_a9_row
+
+    pruned_a16_semantic, _ = apply_llm_pruning(
+        payload=sample_a16_missingness,
+        artifact_id="A16",
+        mode="semantic_context_worker",
+        keep_keys=[],
+        drop_keys=[],
+        limits=None,
+        value_filter=None,
+        debug=True,
+        mode_config=semantic_context_cfg,
+    )
+    assert len(pruned_a16_semantic.get("detected_skip_logic", [])) == 40
+    assert len(pruned_a16_semantic.get("master_switch_candidates", [])) == 12
+    assert "inputs" not in pruned_a16_semantic
+
+    light_contract_override_rows = []
+    for default in DEFAULT_OVERRIDE_FIELDS:
+        row = {
+            "field": default["field"],
+            "description": default["description"],
+            "user_input": "",
+        }
+        if default["field"] == "dataset_context_and_collection_notes":
+            row["user_input"] = "Survey of customer onboarding. One row is one submitted response. Form logic changed after wave 2."
+        elif default["field"] == "semantic_codebook_and_important_variables":
+            row["user_input"] = "Q12 is the master switch. StatusCode values 1=active, 2=paused."
+        light_contract_override_rows.append(row)
+
+    light_contract_payload = {
+        "run_id": "run_smoke",
+        "generated_at": "2026-03-17T00:00:00Z",
+        "source_endpoint": "/light-contracts/xlsx",
+        "column_guide_rows": [],
+        "grain_summary_rows": [],
+        "primary_grain_rows": [
+            {
+                "item": "base_grain",
+                "recommended_key_1": "response_id",
+                "recommended_key_2": "",
+                "recommended_key_3": "",
+                "your_key_1": "",
+                "your_key_2": "",
+                "your_key_3": "",
+                "status": "accept",
+                "comments": "",
+            }
+        ],
+        "dimension_rows": [],
+        "repeat_family_rows": [],
+        "structural_gate_rows": [],
+        "override_rows": light_contract_override_rows,
+    }
+    accepted_handoff = _build_accepted_light_contract_handoff(light_contract_payload)
+    assert accepted_handoff.get("semantic_context_input") == {
+        "dataset_context_and_collection_notes": "Survey of customer onboarding. One row is one submitted response. Form logic changed after wave 2.",
+        "semantic_codebook_and_important_variables": "Q12 is the master switch. StatusCode values 1=active, 2=paused.",
+    }
+    assert accepted_handoff.get("override_notes", {}).get("dataset_context_and_collection_notes")
+
+    light_contract_bytes = build_light_contract_xlsx_bytes(light_contract_payload)
+    parsed_light_contract = parse_light_contract_xlsx_bytes(light_contract_bytes)
+    assert parsed_light_contract.get("metadata", {}).get("run_id") == "run_smoke"
+    parsed_handoff = _build_parsed_light_contract_handoff("run_smoke", parsed_light_contract)
+    assert parsed_handoff.get("semantic_context_input") == accepted_handoff.get("semantic_context_input")
+    assert parsed_handoff.get("override_notes", {}).get("semantic_codebook_and_important_variables") == "Q12 is the master switch. StatusCode values 1=active, 2=paused."
+
 
 if os.getenv("RUN_PRUNING_SMOKE_TESTS", "").strip().lower() in {"1", "true", "yes"}:
     _run_pruning_smoke_checks()
@@ -8821,7 +9123,7 @@ def _effective_value_filter_for_mode(
     mode: str,
     value_filter: Optional[Any],
 ) -> Optional[Any]:
-    if str(mode or "").strip() not in {"type_transform_worker", "missingness_worker"}:
+    if str(mode or "").strip() not in {"type_transform_worker", "missingness_worker", "semantic_context_worker"}:
         return value_filter
     buckets = _build_post_contract_auto_scope_buckets(run_id)
     merged = value_filter
