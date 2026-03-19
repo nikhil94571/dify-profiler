@@ -77,7 +77,7 @@ You DO own:
 
 You DO NOT own:
 - primary grain changes,
-- dimension decisions,
+- reference decisions,
 - final end-to-end table design for the whole dataset,
 - per-column typing,
 - final missingness policy,

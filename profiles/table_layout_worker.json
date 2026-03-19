@@ -1,0 +1,204 @@
+{
+  "profile": "table_layout_worker",
+  "description": "Pruning profile optimized for the post-family table layout specialist. Combines compact layout candidates, key integrity, role signals, relationship evidence, and quality cautions so the worker can propose final table structure and explicit column placement without row-heavy payloads.",
+  "artifacts": ["A2", "A5", "A9", "A10", "A12", "A14"],
+  "pruning": {
+    "A2": {
+      "drop": [
+        "artifact_inputs",
+        "profiler_samples",
+        "numeric_profile",
+        "datetime_profile"
+      ],
+      "policies": {
+        "root_scope_policy": {
+          "type": "column_scope_selector",
+          "target_array": "__root__",
+          "name_field": "column",
+          "include_from_filter_keys": [
+            "force_include_columns",
+            "review_columns",
+            "structural_columns"
+          ],
+          "include_bool_true_fields": [
+            "is_one_hot_like",
+            "high_missingness"
+          ],
+          "include_nonempty_fields": [
+            "missing_tokens_observed"
+          ],
+          "hard_cap_per_inferred_group": 8,
+          "hard_cap_total": 140
+        }
+      },
+      "transforms": {
+        "compact_a2_samples": {
+          "type": "compact_keyed_string_arrays",
+          "target_array_path": "__root__",
+          "field": "a2_samples",
+          "max_items_per_key": 2,
+          "max_chars": 80
+        },
+        "drop_empty_a2_fields": {
+          "type": "drop_fields_when_empty",
+          "target_array_path": "__root__",
+          "fields": [
+            "missing_tokens_observed"
+          ]
+        }
+      }
+    },
+    "A5": {
+      "drop": [
+        "inputs",
+        "pair_key_seed_candidates",
+        "candidate_key_overlap_groups",
+        "audit_trace"
+      ],
+      "limits": {
+        "single_column_key_seed_candidates": 20,
+        "candidate_key_stress_tests": 20
+      }
+    },
+    "A9": {
+      "drop": [
+        "inputs",
+        "uses",
+        {
+          "key": "rows",
+          "scope": "recursive_key_drop",
+          "guards": {
+            "value_kind_any_of": ["list_of_objects"],
+            "path_hints_any_of": [
+              "row_samples.panels[].rows",
+              "example_conflicts[].rows",
+              "F_subset.rows"
+            ]
+          },
+          "note": "Mitigation for name-collision risk: only drop when the value looks like row payloads (list of objects) and/or appears under known row-sample containers."
+        },
+        "evidence_primitives",
+        "role_scores",
+        "role_candidates",
+        "role_decision",
+        "audit",
+        "evidence_used",
+        "evidence_not_used",
+        "features"
+      ],
+      "transforms": {
+        "derive_role_candidate_preview": {
+          "type": "derive_role_candidate_preview",
+          "target_array_path": "columns",
+          "output_field": "role_candidate_preview",
+          "top_k": 2
+        }
+      },
+      "policies": {
+        "columns_policy": {
+          "type": "role_bucket_selector",
+          "target_array": "columns",
+          "role_field": "primary_role",
+          "name_field": "column",
+          "review_field": "review_required",
+          "include_roles_all": [
+            {
+              "role": "id_key",
+              "cap": 20
+            },
+            {
+              "role": "time_index",
+              "cap": 15
+            },
+            {
+              "role": "repeat_index",
+              "cap": 15
+            },
+            {
+              "role": "invariant_attr",
+              "cap": 20
+            },
+            {
+              "role": "coded_categorical",
+              "cap": 20
+            },
+            {
+              "role": "measure",
+              "cap": 20
+            },
+            {
+              "role": "measure_numeric",
+              "cap": 20
+            },
+            {
+              "role": "measure_item",
+              "cap": 20
+            }
+          ],
+          "include_review_required_topk": 40,
+          "hard_cap_total": 120
+        }
+      }
+    },
+    "A10": {
+      "drop": [
+        "inputs",
+        "near_duplicate_candidates",
+        "one_hot_blocks",
+        "coded_categorical_flags",
+        "audit_trail_signals",
+        "deterministic_constraints"
+      ],
+      "limits": {
+        "dependency_candidates": 20,
+        "time_column_candidates": 10,
+        "family_screening_correlations": 10
+      }
+    },
+    "A12": {
+      "drop": [
+        "inputs",
+        "evidence_primitives",
+        "debug",
+        {
+          "key": "debug_trace",
+          "scope": "recursive_key_drop",
+          "guards": {
+            "path_hints_any_of": [
+              "layout_candidates[].debug_trace"
+            ]
+          },
+          "note": "Drop nested scoring/debug traces from layout candidates; keep only the user-facing layout proposal fields."
+        }
+      ],
+      "limits": {
+        "layout_candidates": 3
+      }
+    },
+    "A14": {
+      "drop": [
+        "inputs",
+        "segments"
+      ],
+      "policies": {
+        "columns_policy": {
+          "type": "column_scope_selector",
+          "target_array": "columns",
+          "name_field": "column",
+          "include_from_filter_keys": [
+            "force_include_columns",
+            "review_columns",
+            "structural_columns"
+          ],
+          "include_bool_true_fields": [
+            "drift_detected"
+          ],
+          "include_numeric_lte": {
+            "global_quality_score": 0.85
+          },
+          "hard_cap_total": 100
+        }
+      }
+    }
+  }
+}

@@ -15,7 +15,7 @@ Your job is to make the best conservative structural judgment about what one row
 You are an interpretation and decision layer over profiling artifacts. You do NOT recompute statistics.
 Your job is to:
 - determine the most plausible PRIMARY ROW GRAIN (what one row represents),
-- identify up to 3 candidate dimension tables or stable attribute entities embedded in the dataset,
+- identify up to 3 candidate reference tables or reusable reference blocks embedded in the dataset,
 - reconcile conflicts across artifacts (e.g., “high uniqueness” that is actually a timestamp or row index),
 - propose a systematic preliminary table plan for the next workflow step,
 - emit a dedicated human-review block for the light contract step,
@@ -50,12 +50,14 @@ PRIMARY GRAIN:
 - The minimal set of columns that (a) should uniquely identify a row, and (b) matches a plausible semantic unit
   (e.g., “one respondent survey submission”, “one patient visit”, “one transaction line item”).
 
-CANDIDATE DIMENSION TABLE:
-- A stable entity identifier or grouping dimension embedded in the row-level table that can form a separate entity/dimension table
-  (e.g., clinic_id, store_id, site_id, provider_id, customer_id, language_code).
+CANDIDATE REFERENCE TABLE:
+- A separate reusable entity or reference block embedded in the row-level table that can justify its own table
+  (e.g., clinic_id + clinic_name + clinic_region, store_id + store_name, answer-key/lookup blocks).
 - These are NOT alternate row grains.
 - These are NOT repeated-family members.
 - These are NOT measure fields.
+- These are NOT standalone grouping/category columns with no supporting attributes.
+- If a field is only a stable categorical covariate, keep it on the base row table.
 
 WIDE-FORMAT REPEAT FAMILY:
 - A set of columns representing repeated measures/items/timepoints encoded across columns (A8 families).
@@ -66,7 +68,7 @@ PRELIMINARY TABLE PLAN:
 - This should include:
   - one base row table when a primary grain is available,
   - candidate repeat/child tables when A8 indicates wide-family structure,
-  - optional dimension tables only when they are structurally plausible.
+  - optional reference tables only when they are structurally plausible.
 - For the base row table, distinguish:
   - `proposed_columns_to_keep`
   - `columns_requiring_review`
@@ -122,7 +124,7 @@ A9 (Role Scores):
 Use A9 to:
 - prefer id_key for primary grain,
 - reject time_index-only keys,
-- identify structurally plausible candidate dimension tables.
+- identify structurally plausible candidate reference tables.
 Why it matters: A9 helps translate statistical evidence into structural meaning.
 
 A10 (Relationships and Derivations) — optional support:
@@ -197,29 +199,38 @@ confidence_score (0–1):
 - Subtract heavily if A6/A7 indicate key collisions with differing non-keys.
 - Subtract if the chosen key is time_index-only or index-like.
 
-### STEP 5 — Identify candidate dimension tables (up to 3)
-A candidate dimension table must satisfy:
-- It represents a stable entity/dimension that can be grouped or reused across rows.
+### STEP 5 — Identify candidate reference tables (up to 3)
+A candidate reference table must satisfy:
+- It represents a reusable entity or reference block, not merely a stable grouping/category.
 - Prefer A9 `primary_role` == "id_key" OR strong “id-like” / invariant evidence in A5/A9.
 - Must NOT be:
   - the same as primary key,
   - a repeated-family member (A8),
   - a measure field (A9),
   - a fake uniqueness field such as export row index or timestamp-only key.
-- Must be structurally plausible as a reusable dimension, even if low-cardinality.
+- Must satisfy at least one of:
+  - it has supporting descriptive attributes/metadata in the dataset,
+  - it is a reusable reference/code/answer-key block,
+  - it clearly represents an external entity that later joins or derivations will need.
+- If it is only a standalone categorical covariate with no supporting attributes, keep it on the base row table.
 
-For low-confidence dimension-like ideas, prefer surfacing them in review-oriented fields rather than overstating them as stable dimensions.
+Each candidate reference table must include:
+- `supporting_attributes` (array, may be empty),
+- `reference_kind`,
+- `why_not_base_attribute`.
+
+For low-confidence reference-like ideas, prefer surfacing them in review-oriented fields rather than overstating them as separate tables.
 
 ### STEP 6 — Build the preliminary table plan
 `preliminary_table_plan` must always include:
 - one base row table if a primary grain is available
 - candidate child/repeat tables when A8 indicates wide-family structure
-- optional dimension tables only when they are structurally plausible
+- optional reference tables only when they are structurally plausible
 
 Rules:
 - The base row table should usually be `recommended` if a primary grain exists.
 - Repeat/family tables should usually be `candidate` unless evidence is unusually strong.
-- Dimension tables should only be included when they are structurally plausible; otherwise keep them only in `candidate_dimension_tables`.
+- Reference tables should only be included when they are structurally plausible; otherwise keep them only in `candidate_reference_tables`.
 - Build repeat/family table candidates systematically, not selectively:
   - include explicit repeat-family table entries only up to a maximum of 3 family-specific entries,
   - if there are more than 3 structurally similar repeat families, group the overflow into a single summary entry in `preliminary_table_plan`,
@@ -300,12 +311,15 @@ Return ONLY a JSON object with EXACTLY these top-level keys (no extras):
     "confidence_score": 0.0,
     "justification": "string"
   },
-  "candidate_dimension_tables": [
+  "candidate_reference_tables": [
     {
       "keys": ["colX"],
       "entity_description": "string",
+      "supporting_attributes": ["attr_1", "attr_2"],
+      "reference_kind": "descriptive_entity | code_list | answer_key_or_lookup | external_entity | other_reference",
       "relationship_to_primary": "many_to_one | one_to_one | unknown",
       "suggested_table_name": "string",
+      "why_not_base_attribute": "string",
       "justification": "string"
     }
   ],
@@ -395,7 +409,7 @@ Return ONLY a JSON object with EXACTLY these top-level keys (no extras):
 Hard constraints:
 - No markdown fences.
 - No commentary outside the JSON.
-- `candidate_dimension_tables` must be an array (empty is allowed).
+- `candidate_reference_tables` must be an array (empty is allowed).
 - `preliminary_table_plan` must be an array (empty is allowed).
 - `family_review_candidates` must be an array (empty is allowed).
 - `rejected_primary_candidates` must be an array (empty is allowed).
@@ -407,7 +421,7 @@ Hard constraints:
 
 EXAMPLE A — Survey export (wide), clear respondent id
 - recommended_primary_grain.keys: ["respondent_id"]
-- candidate_dimension_tables may include language_code
+- candidate_reference_tables: []
 - preliminary_table_plan includes:
   - base survey_responses table
   - candidate child tables for repeat families
@@ -417,14 +431,14 @@ EXAMPLE A — Survey export (wide), clear respondent id
 EXAMPLE B — Longitudinal visits
 Columns: patient_id, visit_index, clinic_id, bp, hr
 - recommended_primary_grain.keys: ["patient_id","visit_index"]
-- candidate_dimension_tables: clinic_id (many_to_one)
-- preliminary_table_plan includes base visit table and optional clinic dimension table
+- candidate_reference_tables: clinic_id only when clinic_name/clinic_region or other supporting attributes are present
+- preliminary_table_plan includes base visit table and optional clinic reference table
 
 EXAMPLE C — Transaction line items
 Columns: order_id, line_id, customer_id, sku, qty
 - recommended_primary_grain.keys: ["order_id","line_id"]
-- candidate_dimension_tables: customer_id, sku
-- preliminary_table_plan includes line_items table plus optional customer and sku dimensions
+- candidate_reference_tables: customer_id, sku only when supporting attributes or true reusable lookup semantics are present
+- preliminary_table_plan includes line_items table plus optional customer and sku reference tables
 
 EXAMPLE D — No clear key
 If all candidates have high collisions / low uniqueness:

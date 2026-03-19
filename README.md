@@ -20,7 +20,7 @@ The long-term vision is a compiler-style data understanding pipeline:
 3. let specialist workers consume task-specific artifact views
 4. adjudicate structural and semantic questions through constrained LLM steps
 5. consolidate those decisions into a strict, machine-readable cleaning contract
-6. eventually generate executable cleaning code and cleaned outputs in one or more target layouts
+6. eventually generate executable cleaning code and cleaned outputs in both canonical and analysis-ready target layouts
 
 Today, this repository implements the artifact compiler and artifact serving layers. It does not yet expose a final cleaning-contract endpoint, code-generation endpoint, or execution endpoint for writing cleaned output tables.
 
@@ -34,6 +34,16 @@ The service is designed around:
 - selective LLM consumption through worker-specific bundles
 
 That means the canonical artifact in storage is treated as ground truth, while the LLM-facing response is a compiled view produced on demand through pruning, typed selection policies, and transforms.
+
+## Canonical vs Analysis Outputs
+
+The intended product shape is now explicitly two-layered:
+
+- the **canonical layer** preserves structure, provenance, family identity, reference blocks, and reviewed missingness semantics
+- the **analysis layer** merges compatible sibling families, applies derivation rules, and produces score-ready/model-ready tables
+
+Reference tables are not summary tables.
+They are reusable lookup or reference entities/blocks that justify their own table because they carry their own meaning, attributes, or derivation value. A standalone grouping column with no supporting attributes should usually remain on the canonical base table.
 
 ## What The Service Does Today
 
@@ -76,9 +86,9 @@ Current view surfaces:
 
 `GET /artifact-bundles` is the simplest Dify-facing interface for workers that only need profile-default pruning.
 
-For workers that need request-scoped pruning inputs, use `POST /artifact-bundles/view`. This now matters for `type_transform_worker`, `missingness_worker`, `semantic_context_worker`, and `family_worker`.
+For workers that need request-scoped pruning inputs, use `POST /artifact-bundles/view`. This now matters for `type_transform_worker`, `missingness_worker`, `semantic_context_worker`, `family_worker`, `table_layout_worker`, and `analysis_layout_worker`.
 
-- `type_transform_worker`, `missingness_worker`, and `semantic_context_worker` can accept `global.value_filter.force_include_columns` so finalized grain and family linkage columns are always retained in a scoped bundle.
+- `type_transform_worker`, `missingness_worker`, `semantic_context_worker`, `table_layout_worker`, and `analysis_layout_worker` can accept `global.value_filter.force_include_columns` so finalized grain, reference, and family linkage columns are always retained in a scoped bundle.
 - `family_worker` can additionally accept `global.value_filter.force_include_family_ids` so `A8` and `B1` are reduced to just the accepted families under review.
 
 The post-light-contract worker path also applies server-side auto-scope buckets from stored artifacts:
@@ -127,6 +137,41 @@ Content-Type: application/json
     "value_filter": {
       "force_include_columns": ["respondent_id", "wave"],
       "force_include_family_ids": ["a_1", "m_2"]
+    }
+  }
+}
+```
+
+Example scoped request for the table-layout worker:
+
+```http
+POST /artifact-bundles/view
+Content-Type: application/json
+
+{
+  "run_id": "<run_id>",
+  "mode": "table_layout_worker",
+  "global": {
+    "value_filter": {
+      "force_include_columns": ["respondent_id", "wave"]
+    }
+  }
+}
+```
+
+Example scoped request for the analysis-layout worker:
+
+```http
+POST /artifact-bundles/view
+Content-Type: application/json
+
+{
+  "run_id": "<run_id>",
+  "mode": "analysis_layout_worker",
+  "global": {
+    "value_filter": {
+      "force_include_columns": ["respondent_id", "wave"],
+      "force_include_family_ids": ["a_1", "a_2", "m_1", "m_2", "q"]
     }
   }
 }
@@ -214,6 +259,8 @@ The repository also contains a local profile example:
 
 - [`profiles/grain_worker.json`](/Users/nikhil/Automations/dify-profiler/profiles/grain_worker.json)
 - [`profiles/family_worker.json`](/Users/nikhil/Automations/dify-profiler/profiles/family_worker.json)
+- [`profiles/table_layout_worker.json`](/Users/nikhil/Automations/dify-profiler/profiles/table_layout_worker.json)
+- [`profiles/analysis_layout_worker.json`](/Users/nikhil/Automations/dify-profiler/profiles/analysis_layout_worker.json)
 
 ## Current Dify Integration Model
 
@@ -239,6 +286,48 @@ After semantic, type, and missingness workers have produced validated JSON outpu
    - matched `A8` and `B1` family evidence
 4. run [`prompts/family_worker_system_prompt.md`](/Users/nikhil/Automations/dify-profiler/prompts/family_worker_system_prompt.md) once per family
 5. validate each family JSON item, repair once if needed, then aggregate into one `family_worker_json`
+
+The intended next stage after family is a single-pass canonical table-layout proposal worker:
+
+1. request `POST /artifact-bundles/view` with `mode = "table_layout_worker"`
+2. combine the returned bundle with:
+   - `light_contract_decisions`
+   - `semantic_context_json`
+   - `type_transform_worker_json`
+   - `missingness_worker_json`
+   - `family_worker_json`
+3. run [`prompts/table_layout_worker_system_prompt.md`](/Users/nikhil/Automations/dify-profiler/prompts/table_layout_worker_system_prompt.md)
+4. validate the returned JSON, repair once if needed, then resolve one canonical `table_layout_worker_json`
+
+This canonical stage is intended to produce:
+- a final proposed table set
+- explicit source-column placement for every known column
+- parent-child/reference layout decisions for the canonical layer
+
+It is still a proposal-stage worker. It does not emit merged wave tables, score tables, or other analysis-ready outputs.
+
+The intended next stage after canonical layout is an analysis-layout worker:
+
+1. request `POST /artifact-bundles/view` with `mode = "analysis_layout_worker"`
+2. combine the returned bundle with:
+   - `light_contract_decisions`
+   - `semantic_context_json`
+   - `type_transform_worker_json`
+   - `missingness_worker_json`
+   - `family_worker_json`
+   - `table_layout_worker_json`
+3. run [`prompts/analysis_layout_worker_system_prompt.md`](/Users/nikhil/Automations/dify-profiler/prompts/analysis_layout_worker_system_prompt.md)
+4. validate the returned JSON, repair once if needed, then resolve one canonical `analysis_layout_worker_json`
+
+This stage is intended to produce:
+- merged analysis-ready response tables where justified
+- explicit derivation plans for answer-key scoring and score aggregation
+- respondent-wave analysis marts
+
+The long-term hard/final contract shape is now intended to separate:
+- `canonical_layer`
+- `analysis_layer`
+- `derivations`
 
 ## Light Contract Semantic Context
 
@@ -286,7 +375,7 @@ POST /artifact-bundles/view
 with `global.value_filter.force_include_columns` derived from finalized `light_contract_decisions`:
 
 - `primary_grain_decision.keys`
-- `dimension_decisions[].keys`
+- `reference_decisions[].keys` (legacy `dimension_decisions[].keys` may still appear during migration)
 - `family_decisions[].parent_key`
 
 This keeps Dify focused on orchestration and LLM adjudication while leaving evidence generation, storage, and compression inside this service.

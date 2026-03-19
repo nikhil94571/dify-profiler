@@ -2980,11 +2980,18 @@ def _build_grain_summary_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[
                 "needs_review": "no",
             })
 
-    for dim in _coerce_list_of_dicts(grain_worker_output.get("candidate_dimension_tables"))[:3]:
+    for ref in _candidate_reference_tables(grain_worker_output)[:3]:
+        supporting_attributes = _sorted_nonempty_strings(ref.get("supporting_attributes") or [])
+        why_parts = [
+            str(ref.get("justification") or "").strip(),
+            str(ref.get("why_not_base_attribute") or "").strip(),
+        ]
+        if supporting_attributes:
+            why_parts.append(f"Supporting attributes: {', '.join(supporting_attributes[:4])}")
         rows.append({
-            "topic": "Candidate dimension",
-            "recommendation": _first_non_empty([dim.get("suggested_table_name"), _keys_to_label(dim.get("keys"))]),
-            "why": str(dim.get("justification") or dim.get("entity_description") or ""),
+            "topic": "Candidate reference",
+            "recommendation": _first_non_empty([ref.get("suggested_table_name"), _keys_to_label(ref.get("keys"))]),
+            "why": " ".join(bit for bit in why_parts if bit).strip() or str(ref.get("entity_description") or ""),
             "needs_review": "yes",
         })
 
@@ -3031,23 +3038,62 @@ def _build_primary_grain_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[
     }]
 
 
-def _build_dimension_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _candidate_reference_tables(grain_worker_output: Dict[str, Any]) -> List[Dict[str, Any]]:
+    candidate_reference_tables = _coerce_list_of_dicts(grain_worker_output.get("candidate_reference_tables"))
+    if candidate_reference_tables:
+        return candidate_reference_tables
+    return _coerce_list_of_dicts(grain_worker_output.get("candidate_dimension_tables"))
+
+
+def _build_reference_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
-    for dim in _coerce_list_of_dicts(grain_worker_output.get("candidate_dimension_tables")):
-        keys = _as_key_triplet(dim.get("keys") or [])
+    for ref in _candidate_reference_tables(grain_worker_output):
+        keys = _as_key_triplet(ref.get("keys") or [])
+        supporting_attributes = _sorted_nonempty_strings(ref.get("supporting_attributes") or [])
+        comments_bits = [
+            str(ref.get("justification") or "").strip(),
+            str(ref.get("why_not_base_attribute") or "").strip(),
+        ]
+        if supporting_attributes:
+            comments_bits.append(f"Supporting attributes: {', '.join(supporting_attributes[:6])}")
         rows.append({
-            "table_name": _first_non_empty([dim.get("suggested_table_name"), _keys_to_label(dim.get("keys"))]),
+            "table_name": _first_non_empty([ref.get("suggested_table_name"), _keys_to_label(ref.get("keys"))]),
+            "reference_kind": str(ref.get("reference_kind") or ""),
             "recommended_key_1": keys[0],
             "recommended_key_2": keys[1],
             "recommended_key_3": keys[2],
             "your_key_1": "",
             "your_key_2": "",
             "your_key_3": "",
-            "relationship_to_primary": str(dim.get("relationship_to_primary") or ""),
-            "status": "unsure" if "review" in str(dim.get("justification") or "").lower() else "accept",
-            "comments": str(dim.get("justification") or dim.get("entity_description") or ""),
+            "relationship_to_primary": str(ref.get("relationship_to_primary") or ""),
+            "supporting_attributes_preview": ", ".join(supporting_attributes[:6]),
+            "status": "unsure" if "review" in str(ref.get("justification") or "").lower() else "accept",
+            "comments": " ".join(bit for bit in comments_bits if bit).strip() or str(ref.get("entity_description") or ""),
         })
     return rows
+
+
+def _light_contract_reference_rows(source_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return _coerce_list_of_dicts(source_payload.get("reference_rows") or source_payload.get("dimension_rows"))
+
+
+def _reference_decisions_from_rows(rows: List[Dict[str, Any]], key_mode: str) -> List[Dict[str, Any]]:
+    decisions: List[Dict[str, Any]] = []
+    for row in rows:
+        status = str(row.get("status") or "").strip().lower() or "unsure"
+        if key_mode == "your_if_modify":
+            keys = _keys_from_row(row, "your") if status == "modify" else _keys_from_row(row, "recommended")
+        else:
+            keys = _keys_from_row(row, "recommended")
+        decisions.append({
+            "table_name": str(row.get("table_name") or ""),
+            "status": status if key_mode == "your_if_modify" else str(row.get("status") or "accept"),
+            "keys": keys,
+            "relationship_to_primary": str(row.get("relationship_to_primary") or ""),
+            "reference_kind": str(row.get("reference_kind") or ""),
+            "comments": str(row.get("comments") or ""),
+        })
+    return decisions
 
 
 def _build_repeat_family_rows(grain_worker_output: Dict[str, Any], structural_gate_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -3129,6 +3175,7 @@ def _build_accepted_light_contract_handoff(contract_payload: Dict[str, Any]) -> 
         for row in override_rows
         if str(row.get("field") or "").strip()
     }
+    reference_decisions = _reference_decisions_from_rows(_light_contract_reference_rows(contract_payload), key_mode="recommended")
     return {
         "run_id": str(contract_payload.get("run_id") or ""),
         "light_contract_status": "accepted",
@@ -3137,16 +3184,8 @@ def _build_accepted_light_contract_handoff(contract_payload: Dict[str, Any]) -> 
             "keys": _keys_from_row(primary_row, "recommended"),
             "comments": str(primary_row.get("comments") or ""),
         },
-        "dimension_decisions": [
-            {
-                "table_name": str(row.get("table_name") or ""),
-                "status": str(row.get("status") or "accept"),
-                "keys": _keys_from_row(row, "recommended"),
-                "relationship_to_primary": str(row.get("relationship_to_primary") or ""),
-                "comments": str(row.get("comments") or ""),
-            }
-            for row in (contract_payload.get("dimension_rows") or [])
-        ],
+        "reference_decisions": reference_decisions,
+        "dimension_decisions": reference_decisions,
         "family_decisions": [
             {
                 "family_id": str(row.get("family_id") or ""),
@@ -3188,19 +3227,10 @@ def _build_parsed_light_contract_handoff(run_id: str, parsed_workbook: Dict[str,
     else:
         primary_keys = _keys_from_row(primary_row, "recommended")
 
-    dimension_decisions = []
-    for row in parsed_workbook.get("dimension_rows") or []:
-        status = str(row.get("status") or "").strip().lower() or "unsure"
-        keys = _keys_from_row(row, "recommended")
-        if status == "modify":
-            keys = _keys_from_row(row, "your")
-        dimension_decisions.append({
-            "table_name": str(row.get("table_name") or ""),
-            "status": status,
-            "keys": keys,
-            "relationship_to_primary": str(row.get("relationship_to_primary") or ""),
-            "comments": str(row.get("comments") or ""),
-        })
+    reference_decisions = _reference_decisions_from_rows(
+        _light_contract_reference_rows(parsed_workbook),
+        key_mode="your_if_modify",
+    )
 
     family_decisions = []
     for row in parsed_workbook.get("repeat_family_rows") or []:
@@ -3232,7 +3262,8 @@ def _build_parsed_light_contract_handoff(run_id: str, parsed_workbook: Dict[str,
             "keys": primary_keys,
             "comments": str(primary_row.get("comments") or ""),
         },
-        "dimension_decisions": dimension_decisions,
+        "reference_decisions": reference_decisions,
+        "dimension_decisions": reference_decisions,
         "family_decisions": family_decisions,
         "override_notes": override_notes,
         "semantic_context_input": _extract_semantic_context_input(override_rows),
@@ -3266,7 +3297,7 @@ def _normalize_light_contract_payload(run_id: str, grain_worker_output: Dict[str
         "column_guide_rows": column_guide_rows,
         "grain_summary_rows": _build_grain_summary_rows(grain_worker_output),
         "primary_grain_rows": _build_primary_grain_rows(grain_worker_output),
-        "dimension_rows": _build_dimension_rows(grain_worker_output),
+        "reference_rows": _build_reference_rows(grain_worker_output),
         "repeat_family_rows": _build_repeat_family_rows(grain_worker_output, structural_gate_rows),
         "structural_gate_rows": structural_gate_rows,
         "override_rows": _build_override_rows(grain_worker_output),
@@ -8518,6 +8549,16 @@ def _run_pruning_smoke_checks() -> None:
     assert family_worker_profile["artifacts"] == ["A8", "B1"]
     family_worker_cfg = family_worker_profile["mode_config"]
 
+    table_layout_profile, table_layout_source = _load_profile_local("table_layout_worker")
+    assert table_layout_source == "local"
+    assert table_layout_profile["artifacts"] == ["A2", "A5", "A9", "A10", "A12", "A14"]
+    table_layout_cfg = table_layout_profile["mode_config"]
+
+    analysis_layout_profile, analysis_layout_source = _load_profile_local("analysis_layout_worker")
+    assert analysis_layout_source == "local"
+    assert analysis_layout_profile["artifacts"] == ["A2", "A8", "A10", "A14", "A16", "B1"]
+    analysis_layout_cfg = analysis_layout_profile["mode_config"]
+
     mode_cfg_missingness, mode_meta_missingness = _resolve_mode_config("missingness_worker")
     assert mode_meta_missingness["profile_artifacts"] == ["A2", "A4", "A13", "A14", "A16"]
     assert mode_cfg_missingness == missingness_cfg
@@ -8529,6 +8570,14 @@ def _run_pruning_smoke_checks() -> None:
     mode_cfg_family, mode_meta_family = _resolve_mode_config("family_worker")
     assert mode_meta_family["profile_artifacts"] == ["A8", "B1"]
     assert mode_cfg_family == family_worker_cfg
+
+    mode_cfg_table_layout, mode_meta_table_layout = _resolve_mode_config("table_layout_worker")
+    assert mode_meta_table_layout["profile_artifacts"] == ["A2", "A5", "A9", "A10", "A12", "A14"]
+    assert mode_cfg_table_layout == table_layout_cfg
+
+    mode_cfg_analysis_layout, mode_meta_analysis_layout = _resolve_mode_config("analysis_layout_worker")
+    assert mode_meta_analysis_layout["profile_artifacts"] == ["A2", "A8", "A10", "A14", "A16", "B1"]
+    assert mode_cfg_analysis_layout == analysis_layout_cfg
 
     sample_a2_type = [
         {
@@ -9032,6 +9081,213 @@ def _run_pruning_smoke_checks() -> None:
     assert "columns" not in repeat_candidate
     assert "index_by_column" not in repeat_candidate
 
+    sample_a2_table_layout = [
+        {
+            "column": "response_id",
+            "high_missingness": False,
+            "is_one_hot_like": False,
+            "missing_tokens_observed": [],
+            "a2_samples": {"head": ["r1", "r2", "r3"], "tail": ["r4"]},
+            "profiler_samples": {"head": ["too_much"]},
+        },
+        {
+            "column": "one_hot_yes",
+            "high_missingness": False,
+            "is_one_hot_like": True,
+            "missing_tokens_observed": [],
+            "a2_samples": {"head": ["0", "1", "0"]},
+        },
+        {
+            "column": "null_heavy",
+            "high_missingness": True,
+            "is_one_hot_like": False,
+            "missing_tokens_observed": {},
+            "a2_samples": {"head": ["", "", "x"]},
+        },
+        {
+            "column": "drop_me",
+            "high_missingness": False,
+            "is_one_hot_like": False,
+            "missing_tokens_observed": [],
+            "a2_samples": {"head": ["x"]},
+        },
+    ]
+    pruned_a2_table_layout, _ = apply_llm_pruning(
+        payload=sample_a2_table_layout,
+        artifact_id="A2",
+        mode="table_layout_worker",
+        keep_keys=[],
+        drop_keys=[],
+        limits=None,
+        value_filter={"force_include_columns": ["response_id"]},
+        debug=True,
+        mode_config=table_layout_cfg,
+    )
+    a2_table_layout_names = [row.get("column") for row in pruned_a2_table_layout if isinstance(row, dict)]
+    assert set(a2_table_layout_names) == {"response_id", "one_hot_yes", "null_heavy"}
+    pruned_a2_table_layout_by_name = {
+        row.get("column"): row for row in pruned_a2_table_layout if isinstance(row, dict) and row.get("column")
+    }
+    assert "profiler_samples" not in pruned_a2_table_layout_by_name["response_id"]
+    assert pruned_a2_table_layout_by_name["response_id"].get("a2_samples", {}).get("head") == ["r1", "r2"]
+
+    sample_a9_table_layout = {
+        "columns": [
+            {
+                "column": "id_col",
+                "primary_role": "id_key",
+                "review_required": False,
+                "role_candidates": [
+                    {"role": "id_key", "score": 1.0},
+                    {"role": "measure", "score": 0.2},
+                ],
+                "role_scores": {"id_key": 1.0},
+            },
+            {
+                "column": "measure_col",
+                "primary_role": "measure_numeric",
+                "review_required": False,
+                "role_candidates": [
+                    {"role": "measure_numeric", "score": 0.95},
+                    {"role": "coded_categorical", "score": 0.2},
+                ],
+                "role_scores": {"measure_numeric": 0.95},
+            },
+            {
+                "column": "cat_col",
+                "primary_role": "coded_categorical",
+                "review_required": False,
+                "role_candidates": [
+                    {"role": "coded_categorical", "score": 0.91},
+                    {"role": "invariant_attr", "score": 0.5},
+                ],
+                "role_scores": {"coded_categorical": 0.91},
+            },
+            {
+                "column": "review_col",
+                "primary_role": "unknown",
+                "review_required": True,
+                "role_candidates": [
+                    {"role": "measure_item", "score": 0.6},
+                    {"role": "coded_categorical", "score": 0.55},
+                ],
+                "role_scores": {"measure_item": 0.6},
+            },
+        ]
+    }
+    pruned_a9_table_layout, _ = apply_llm_pruning(
+        payload=sample_a9_table_layout,
+        artifact_id="A9",
+        mode="table_layout_worker",
+        keep_keys=[],
+        drop_keys=[],
+        limits=None,
+        value_filter=None,
+        debug=True,
+        mode_config=table_layout_cfg,
+    )
+    table_layout_role_names = [row.get("column") for row in pruned_a9_table_layout.get("columns", []) if isinstance(row, dict)]
+    assert set(table_layout_role_names) == {"id_col", "measure_col", "cat_col", "review_col"}
+    assert all("role_scores" not in row for row in pruned_a9_table_layout.get("columns", []) if isinstance(row, dict))
+    assert all(isinstance(row.get("role_candidate_preview"), list) for row in pruned_a9_table_layout.get("columns", []) if isinstance(row, dict))
+
+    sample_a10_table_layout = {
+        "inputs": {"uses": ["dataset"]},
+        "derived_total_candidates": 8,
+        "near_duplicate_candidates": [{"a": "b"}],
+        "dependency_candidates": [{"determinant": f"id_{i}", "dependent": f"col_{i}", "coverage": 0.9 - i * 0.01} for i in range(25)],
+        "time_column_candidates": [{"column": f"dt_{i}", "score": 0.8 - i * 0.02} for i in range(12)],
+        "family_screening_correlations": [{"family_id": f"fam_{i}", "trigger_column": f"screen_{i}"} for i in range(12)],
+        "one_hot_blocks": [{"group": "g", "columns": ["a", "b"]}],
+        "coded_categorical_flags": [{"column": "x"}],
+        "audit_trail_signals": {"included_count": 5},
+        "deterministic_constraints": {"arithmetic": []},
+    }
+    pruned_a10_table_layout, _ = apply_llm_pruning(
+        payload=sample_a10_table_layout,
+        artifact_id="A10",
+        mode="table_layout_worker",
+        keep_keys=[],
+        drop_keys=[],
+        limits=None,
+        value_filter=None,
+        debug=True,
+        mode_config=table_layout_cfg,
+    )
+    assert "inputs" not in pruned_a10_table_layout
+    assert "near_duplicate_candidates" not in pruned_a10_table_layout
+    assert "one_hot_blocks" not in pruned_a10_table_layout
+    assert "coded_categorical_flags" not in pruned_a10_table_layout
+    assert "audit_trail_signals" not in pruned_a10_table_layout
+    assert "deterministic_constraints" not in pruned_a10_table_layout
+    assert len(pruned_a10_table_layout.get("dependency_candidates", [])) == 20
+    assert len(pruned_a10_table_layout.get("time_column_candidates", [])) == 10
+    assert len(pruned_a10_table_layout.get("family_screening_correlations", [])) == 10
+
+    sample_a12_table_layout = {
+        "layout_candidates": [
+            {
+                "layout_id": "L1",
+                "summary": {"proposed_model": "base"},
+                "grain": {"keys_tested": ["id"]},
+                "tables": [{"table_name": "base_a"}],
+                "coverage_summary": {"covered_by_layout_count": 5},
+                "column_placement": {"covered_by_layout": ["id"]},
+                "ambiguities": [],
+                "debug_trace": {"score": 0.9},
+            },
+            {
+                "layout_id": "L2",
+                "summary": {"proposed_model": "base_plus_child"},
+                "grain": {"keys_tested": ["id"]},
+                "tables": [{"table_name": "base_b"}],
+                "coverage_summary": {"covered_by_layout_count": 6},
+                "column_placement": {"covered_by_layout": ["id", "q"]},
+                "ambiguities": [],
+                "debug_trace": {"score": 0.8},
+            },
+            {
+                "layout_id": "L3",
+                "summary": {"proposed_model": "base_plus_dims"},
+                "grain": {"keys_tested": ["id"]},
+                "tables": [{"table_name": "base_c"}],
+                "coverage_summary": {"covered_by_layout_count": 7},
+                "column_placement": {"covered_by_layout": ["id", "country"]},
+                "ambiguities": [],
+                "debug_trace": {"score": 0.7},
+            },
+            {
+                "layout_id": "L4",
+                "summary": {"proposed_model": "mixed"},
+                "grain": {"keys_tested": ["id"]},
+                "tables": [{"table_name": "base_d"}],
+                "coverage_summary": {"covered_by_layout_count": 8},
+                "column_placement": {"covered_by_layout": ["id", "x"]},
+                "ambiguities": [],
+                "debug_trace": {"score": 0.6},
+            },
+        ],
+        "debug": {"candidate_layout_count": 4},
+        "inputs": {"uses": ["A5", "A9"]},
+        "evidence_primitives": {"A5": "used"},
+    }
+    pruned_a12_table_layout, _ = apply_llm_pruning(
+        payload=sample_a12_table_layout,
+        artifact_id="A12",
+        mode="table_layout_worker",
+        keep_keys=[],
+        drop_keys=[],
+        limits=None,
+        value_filter=None,
+        debug=True,
+        mode_config=table_layout_cfg,
+    )
+    assert len(pruned_a12_table_layout.get("layout_candidates", [])) == 3
+    assert "debug" not in pruned_a12_table_layout
+    assert "inputs" not in pruned_a12_table_layout
+    assert "evidence_primitives" not in pruned_a12_table_layout
+    assert all("debug_trace" not in row for row in pruned_a12_table_layout.get("layout_candidates", []) if isinstance(row, dict))
+
     light_contract_override_rows = []
     for default in DEFAULT_OVERRIDE_FIELDS:
         row = {
@@ -9064,22 +9320,45 @@ def _run_pruning_smoke_checks() -> None:
                 "comments": "",
             }
         ],
-        "dimension_rows": [],
+        "reference_rows": [],
         "repeat_family_rows": [],
         "structural_gate_rows": [],
         "override_rows": light_contract_override_rows,
     }
     accepted_handoff = _build_accepted_light_contract_handoff(light_contract_payload)
+    assert accepted_handoff.get("reference_decisions") == []
+    assert accepted_handoff.get("dimension_decisions") == []
     assert accepted_handoff.get("semantic_context_input") == {
         "dataset_context_and_collection_notes": "Survey of customer onboarding. One row is one submitted response. Form logic changed after wave 2.",
         "semantic_codebook_and_important_variables": "Q12 is the master switch. StatusCode values 1=active, 2=paused.",
     }
+
+    legacy_light_contract_payload = dict(light_contract_payload)
+    legacy_light_contract_payload.pop("reference_rows", None)
+    legacy_light_contract_payload["dimension_rows"] = [
+        {
+            "table_name": "dim_clinic",
+            "recommended_key_1": "clinic_id",
+            "recommended_key_2": "",
+            "recommended_key_3": "",
+            "your_key_1": "",
+            "your_key_2": "",
+            "your_key_3": "",
+            "relationship_to_primary": "many_to_one",
+            "status": "accept",
+            "comments": "Legacy dimension row should map to reference decisions.",
+        }
+    ]
+    legacy_handoff = _build_accepted_light_contract_handoff(legacy_light_contract_payload)
+    assert legacy_handoff.get("reference_decisions") == legacy_handoff.get("dimension_decisions")
+    assert legacy_handoff.get("reference_decisions", [])[0].get("table_name") == "dim_clinic"
     assert accepted_handoff.get("override_notes", {}).get("dataset_context_and_collection_notes")
 
     light_contract_bytes = build_light_contract_xlsx_bytes(light_contract_payload)
     parsed_light_contract = parse_light_contract_xlsx_bytes(light_contract_bytes)
     assert parsed_light_contract.get("metadata", {}).get("run_id") == "run_smoke"
     parsed_handoff = _build_parsed_light_contract_handoff("run_smoke", parsed_light_contract)
+    assert parsed_handoff.get("reference_decisions") == parsed_handoff.get("dimension_decisions")
     assert parsed_handoff.get("semantic_context_input") == accepted_handoff.get("semantic_context_input")
     assert parsed_handoff.get("override_notes", {}).get("semantic_codebook_and_important_variables") == "Q12 is the master switch. StatusCode values 1=active, 2=paused."
 
@@ -9147,9 +9426,9 @@ def _light_contract_force_include_columns(decisions: Dict[str, Any]) -> List[str
     primary = decisions.get("primary_grain_decision") or {}
     columns.extend(primary.get("keys") or [])
 
-    for dim in decisions.get("dimension_decisions") or []:
-        if isinstance(dim, dict):
-            columns.extend(dim.get("keys") or [])
+    for ref in (decisions.get("reference_decisions") or decisions.get("dimension_decisions") or []):
+        if isinstance(ref, dict):
+            columns.extend(ref.get("keys") or [])
 
     for family in decisions.get("family_decisions") or []:
         if not isinstance(family, dict):
@@ -9240,7 +9519,7 @@ def _effective_value_filter_for_mode(
     mode: str,
     value_filter: Optional[Any],
 ) -> Optional[Any]:
-    if str(mode or "").strip() not in {"type_transform_worker", "missingness_worker", "semantic_context_worker"}:
+    if str(mode or "").strip() not in {"type_transform_worker", "missingness_worker", "semantic_context_worker", "table_layout_worker", "analysis_layout_worker"}:
         return value_filter
     buckets = _build_post_contract_auto_scope_buckets(run_id)
     merged = value_filter

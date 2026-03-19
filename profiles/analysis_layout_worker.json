@@ -1,0 +1,240 @@
+{
+  "profile": "analysis_layout_worker",
+  "description": "Pruning profile optimized for the post-canonical analysis-layout specialist. Keeps compact family structure, relationship evidence, quality and skip-logic cautions, and scoped column vocabulary so the worker can propose merged response tables and derivation plans without row-heavy payloads.",
+  "artifacts": ["A2", "A8", "A10", "A14", "A16", "B1"],
+  "pruning": {
+    "A2": {
+      "drop": [
+        "artifact_inputs",
+        "profiler_samples",
+        "numeric_profile",
+        "datetime_profile"
+      ],
+      "policies": {
+        "root_scope_policy": {
+          "type": "column_scope_selector",
+          "target_array": "__root__",
+          "name_field": "column",
+          "include_from_filter_keys": [
+            "force_include_columns",
+            "review_columns",
+            "structural_columns",
+            "skip_trigger_columns"
+          ],
+          "include_bool_true_fields": [
+            "high_missingness"
+          ],
+          "include_nonempty_fields": [
+            "missing_tokens_observed"
+          ],
+          "hard_cap_per_inferred_group": 8,
+          "hard_cap_total": 140
+        }
+      },
+      "transforms": {
+        "compact_a2_samples": {
+          "type": "compact_keyed_string_arrays",
+          "target_array_path": "__root__",
+          "field": "a2_samples",
+          "max_items_per_key": 2,
+          "max_chars": 80
+        },
+        "drop_empty_a2_fields": {
+          "type": "drop_fields_when_empty",
+          "target_array_path": "__root__",
+          "fields": [
+            "missing_tokens_observed"
+          ]
+        }
+      }
+    },
+    "A8": {
+      "drop": [
+        "inputs",
+        "uses",
+        {
+          "key": "rows",
+          "scope": "recursive_key_drop",
+          "guards": {
+            "value_kind_any_of": ["list_of_objects"],
+            "path_hints_any_of": [
+              "row_samples.panels[].rows",
+              "example_conflicts[].rows",
+              "F_subset.rows"
+            ]
+          },
+          "note": "Mitigation for name-collision risk: only drop when the value looks like row payloads (list of objects) and/or appears under known row-sample containers."
+        },
+        "families",
+        "near_misses",
+        "rejected_candidates",
+        "coverage",
+        "debug_trace"
+      ],
+      "policies": {
+        "families_index_policy": {
+          "type": "column_scope_selector",
+          "target_array": "families_index",
+          "name_field": "family_id",
+          "include_from_filter_keys": [
+            "force_include_family_ids"
+          ],
+          "hard_cap_total": 60
+        }
+      },
+      "transforms": {
+        "family_signature": {
+          "type": "join_array_by_key",
+          "target_array_path": "families_index",
+          "source_array_path": "families",
+          "join_key": "family_id",
+          "write_field": "family_signature",
+          "field_map": {
+            "normalized_stem": {
+              "from": "source.stem_evidence.normalized_stem"
+            },
+            "raw_stem": {
+              "from": "source.stem_evidence.raw_stem"
+            },
+            "pattern_kind": {
+              "from": "source.patterns[0]",
+              "fallback_from": "target.patterns[0]"
+            },
+            "suffix_keyword": {
+              "from": "target.repeat_dim",
+              "fallback_from": "target.recommended_repeat_dimension_name"
+            },
+            "suffix_keyword_title": {
+              "from": "target.repeat_dim",
+              "fallback_from": "target.recommended_repeat_dimension_name",
+              "transform": "title"
+            },
+            "columns_preview": {
+              "from": "source.columns_preview",
+              "slice": 3,
+              "k_max": 8
+            },
+            "columns_count": {
+              "from": "source.columns_count"
+            },
+            "signature_label": {
+              "from": "source.stem_evidence.normalized_stem",
+              "template": "{source.family_id}:{value}"
+            }
+          }
+        }
+      }
+    },
+    "A10": {
+      "drop": [
+        "inputs",
+        "near_duplicate_candidates",
+        "one_hot_blocks",
+        "coded_categorical_flags",
+        "audit_trail_signals",
+        "deterministic_constraints"
+      ],
+      "limits": {
+        "dependency_candidates": 20,
+        "time_column_candidates": 10,
+        "family_screening_correlations": 12
+      }
+    },
+    "A14": {
+      "drop": [
+        "inputs",
+        "segments"
+      ],
+      "policies": {
+        "columns_policy": {
+          "type": "column_scope_selector",
+          "target_array": "columns",
+          "name_field": "column",
+          "include_from_filter_keys": [
+            "force_include_columns",
+            "review_columns",
+            "structural_columns"
+          ],
+          "include_bool_true_fields": [
+            "drift_detected"
+          ],
+          "include_numeric_lte": {
+            "global_quality_score": 0.85
+          },
+          "hard_cap_total": 100
+        }
+      }
+    },
+    "A16": {
+      "drop": [
+        "inputs",
+        "target_columns_scanned",
+        "trigger_columns_scanned"
+      ],
+      "limits": {
+        "detected_skip_logic": 40,
+        "master_switch_candidates": 12
+      }
+    },
+    "B1": {
+      "drop": [
+        "inputs",
+        "B_subset",
+        "F_subset",
+        {
+          "key": "grain_collisions_touching_family",
+          "scope": "recursive_key_drop",
+          "guards": {
+            "value_kind_any_of": ["list_of_objects"],
+            "path_hints_any_of": [
+              "C_subset.grain_collisions_touching_family"
+            ]
+          },
+          "note": "Drop nested structural collision diagnostics from family packets; they are large and belong to grain-stage evidence, not analysis-layout planning."
+        },
+        {
+          "key": "index_by_column",
+          "scope": "recursive_key_drop",
+          "guards": {
+            "path_hints_any_of": [
+              "C_subset.repeat_candidate.index_by_column"
+            ]
+          },
+          "note": "Drop duplicate full member-to-index maps from nested repeat_candidate payloads."
+        },
+        {
+          "key": "columns",
+          "scope": "recursive_key_drop",
+          "guards": {
+            "path_hints_any_of": [
+              "C_subset.repeat_candidate.columns"
+            ]
+          },
+          "note": "Drop duplicate full member column lists from nested repeat_candidate payloads."
+        },
+        {
+          "key": "rows",
+          "scope": "recursive_key_drop",
+          "guards": {
+            "value_kind_any_of": ["list_of_objects"],
+            "path_hints_any_of": [
+              "F_subset.rows"
+            ]
+          },
+          "note": "Remove row-heavy family preview rows from B1 packets."
+        }
+      ],
+      "policies": {
+        "root_scope_policy": {
+          "type": "column_scope_selector",
+          "target_array": "__root__",
+          "name_field": "family_id",
+          "include_from_filter_keys": [
+            "force_include_family_ids"
+          ],
+          "hard_cap_total": 60
+        }
+      }
+    }
+  }
+}
