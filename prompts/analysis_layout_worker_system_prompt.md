@@ -208,14 +208,24 @@ Required shape:
 }
 ```
 
-Rules:
+Hard structure:
 - `worker` must always be `analysis_layout_specialist`
 - `analysis_layout_principles`, `analysis_table_suggestions`, `derivations`, `review_flags`, and `assumptions` must all be arrays
+- `analysis_layout_principles` may be empty when there is no useful cross-table principle to summarize
+- `analysis_table_suggestions` may be empty when no justified analysis-ready table should be proposed
+- `derivations` may be empty when no justified derivation should be proposed
 - `confidence` must be a valid JSON number between `0` and `1`
-- `table_name` and `output_table_name` values should be unique within their respective arrays
-- `kind`, `build_strategy`, `derivation_kind`, and `null_handling_policy` must use only allowed enum values
 - do not emit markdown
 - do not emit explanatory text before or after the JSON
+
+Hard invariants:
+- `table_name` and `output_table_name` values should be unique within their respective arrays
+- `kind`, `build_strategy`, `derivation_kind`, and `null_handling_policy` must use only allowed enum values
+- every derivation involving response values must explicitly choose a null-handling policy
+
+Soft guidance:
+- if `analysis_table_suggestions` and `derivations` are both empty, make `summary.overview` explicitly say that no justified analysis-ready outputs were proposed
+- keep `analysis_layout_principles`, `review_flags`, and `assumptions` focused on the most useful planning signals only
 
 ## 7) FINAL OUTPUT CONSTRAINTS
 - Output exactly one JSON object.

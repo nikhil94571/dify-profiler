@@ -7345,6 +7345,55 @@ def _extract_columns_from_value_filter(
     return {name for name in forced_names if name}
 
 
+def _ordered_nonempty_strings(values: Iterable[Any]) -> List[str]:
+    ordered: List[str] = []
+    seen: Set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            ordered.append(text)
+    return ordered
+
+
+def _extract_string_list_from_value_filter(
+    value_filter: Optional[Any],
+    filter_keys: Iterable[str],
+) -> List[str]:
+    keys = [str(key).strip() for key in filter_keys if str(key).strip()]
+    if not keys:
+        return []
+
+    ordered: List[str] = []
+    seen: Set[str] = set()
+
+    def _take(raw: Any) -> None:
+        iterable: Iterable[Any]
+        if raw is None:
+            iterable = []
+        elif isinstance(raw, (list, tuple, set)):
+            iterable = raw
+        else:
+            iterable = [raw]
+        for item in iterable:
+            text = str(item or "").strip()
+            if text and text not in seen:
+                seen.add(text)
+                ordered.append(text)
+
+    if isinstance(value_filter, dict):
+        for key in keys:
+            _take(value_filter.get(key))
+    elif isinstance(value_filter, list):
+        for item in value_filter:
+            if not isinstance(item, dict):
+                continue
+            for key in keys:
+                _take(item.get(key))
+
+    return ordered
+
+
 def _extract_force_include_columns(value_filter: Optional[Any]) -> Set[str]:
     return _extract_columns_from_value_filter(value_filter)
 
@@ -8101,6 +8150,282 @@ def _op_project_a2_semantic_context_grounding(
     return transformed
 
 
+def _extract_layout_candidate_grain_keys(candidate: Dict[str, Any]) -> List[str]:
+    grain = candidate.get("grain") if isinstance(candidate.get("grain"), dict) else {}
+    summary = candidate.get("summary") if isinstance(candidate.get("summary"), dict) else {}
+
+    raw_candidates = [
+        grain.get("keys_tested"),
+        summary.get("current_row_grain"),
+    ]
+    for raw in raw_candidates:
+        if isinstance(raw, (list, tuple, set)):
+            ordered = _ordered_nonempty_strings(raw)
+            if ordered:
+                return ordered
+        elif raw is not None:
+            text = str(raw).strip()
+            if text:
+                return [text]
+    return []
+
+
+def _extract_layout_candidate_score(candidate: Dict[str, Any]) -> float:
+    summary = candidate.get("summary") if isinstance(candidate.get("summary"), dict) else {}
+    debug_trace = candidate.get("debug_trace") if isinstance(candidate.get("debug_trace"), dict) else {}
+
+    for raw in [candidate.get("score"), summary.get("score"), debug_trace.get("score")]:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def _classify_preferred_grain_match(
+    candidate_keys: Iterable[Any],
+    preferred_keys: Iterable[Any],
+) -> Tuple[int, str]:
+    candidate_ordered = _ordered_nonempty_strings(candidate_keys)
+    preferred_ordered = _ordered_nonempty_strings(preferred_keys)
+    if not preferred_ordered or not candidate_ordered:
+        return 3, "none"
+    if candidate_ordered == preferred_ordered:
+        return 0, "exact"
+    if _normalize_keys_tested(candidate_ordered) == _normalize_keys_tested(preferred_ordered):
+        return 1, "exact"
+    if set(candidate_ordered) & set(preferred_ordered):
+        return 2, "overlap"
+    return 3, "none"
+
+
+def _nonempty_sequence_count(value: Any) -> int:
+    if not isinstance(value, (list, tuple, set)):
+        return 0
+    return sum(1 for item in value if str(item or "").strip())
+
+
+def _compact_a12_family_reference(reference: Any, preview_cap: int) -> Optional[Dict[str, Any]]:
+    if not isinstance(reference, dict):
+        return None
+
+    compact: Dict[str, Any] = {}
+    for key in [
+        "family_id",
+        "detection_confidence",
+        "columns_count",
+        "recommended_repeat_dimension_name",
+        "flags",
+    ]:
+        if key in reference:
+            compact[key] = copy.deepcopy(reference.get(key))
+
+    columns_preview = reference.get("columns_preview")
+    if not isinstance(columns_preview, list):
+        columns_preview = reference.get("columns")
+    preview_values = _ordered_nonempty_strings(columns_preview or [])[:max(0, preview_cap)]
+    if preview_values:
+        compact["columns_preview"] = preview_values
+    if "columns_count" not in compact and isinstance(reference.get("columns"), list):
+        compact["columns_count"] = len(reference.get("columns") or [])
+
+    return compact or None
+
+
+def _compact_a12_table(table: Any, family_preview_cap: int) -> Optional[Dict[str, Any]]:
+    if not isinstance(table, dict):
+        return None
+
+    compact: Dict[str, Any] = {}
+    for key in [
+        "table_id",
+        "table_name",
+        "kind",
+        "grain",
+        "repeat_dimension_candidates",
+        "column_counts",
+        "foreign_keys",
+    ]:
+        if key in table:
+            compact[key] = copy.deepcopy(table.get(key))
+
+    family_reference = _compact_a12_family_reference(table.get("family_reference"), family_preview_cap)
+    if family_reference:
+        compact["family_reference"] = family_reference
+
+    return compact or None
+
+
+def _compact_a12_column_placement(
+    placement: Any,
+    coverage_summary: Any,
+    preview_cap: int,
+) -> Dict[str, Any]:
+    placement_dict = placement if isinstance(placement, dict) else {}
+    coverage_dict = coverage_summary if isinstance(coverage_summary, dict) else {}
+    compact: Dict[str, Any] = {}
+
+    covered_by_layout = _ordered_nonempty_strings(placement_dict.get("covered_by_layout") or [])
+    unmapped = _ordered_nonempty_strings(placement_dict.get("unmapped") or [])
+
+    if covered_by_layout:
+        compact["covered_by_layout_preview"] = covered_by_layout[:max(0, preview_cap)]
+    if unmapped:
+        compact["unmapped_preview"] = unmapped[:max(0, preview_cap)]
+
+    covered_by_role_only_count = _nonempty_sequence_count(placement_dict.get("covered_by_role_only"))
+    if covered_by_role_only_count <= 0:
+        try:
+            covered_by_role_only_count = int(coverage_dict.get("covered_by_role_only_count") or 0)
+        except (TypeError, ValueError):
+            covered_by_role_only_count = 0
+    if covered_by_role_only_count > 0:
+        compact["covered_by_role_only_count"] = covered_by_role_only_count
+
+    ambiguous_count = _nonempty_sequence_count(placement_dict.get("ambiguous"))
+    if ambiguous_count <= 0:
+        try:
+            ambiguous_count = int(coverage_dict.get("ambiguous_count") or 0)
+        except (TypeError, ValueError):
+            ambiguous_count = 0
+    if ambiguous_count > 0:
+        compact["ambiguous_count"] = ambiguous_count
+
+    return compact
+
+
+def _compact_a12_ambiguities(ambiguities: Any, cap: int) -> List[Dict[str, Any]]:
+    if not isinstance(ambiguities, list):
+        return []
+
+    compact: List[Dict[str, Any]] = []
+    for row in ambiguities:
+        if not isinstance(row, dict):
+            continue
+        column = str(row.get("column") or "").strip()
+        if not column:
+            continue
+        compact_row: Dict[str, Any] = {"column": column}
+        primary_role = str(row.get("primary_role") or "").strip()
+        if primary_role:
+            compact_row["primary_role"] = primary_role
+
+        alternate_roles: List[Dict[str, Any]] = []
+        for alt in (row.get("alternate_roles") or []):
+            if not isinstance(alt, dict):
+                continue
+            role = str(alt.get("role") or "").strip()
+            if not role:
+                continue
+            compact_alt: Dict[str, Any] = {"role": role}
+            try:
+                if alt.get("score") is not None:
+                    compact_alt["score"] = float(alt.get("score"))
+            except (TypeError, ValueError):
+                pass
+            alternate_roles.append(compact_alt)
+        if alternate_roles:
+            compact_row["alternate_roles"] = alternate_roles
+
+        compact.append(compact_row)
+        if len(compact) >= max(0, cap):
+            break
+
+    return compact
+
+
+def _op_project_a12_table_layout_grounding(
+    root: Any,
+    op: Dict[str, Any],
+    report: Dict[str, Any],
+    value_filter: Optional[Any],
+) -> Any:
+    if not isinstance(root, dict):
+        return root
+
+    try:
+        layout_candidates_top_k = int(op.get("layout_candidates_top_k", 2))
+    except (TypeError, ValueError):
+        layout_candidates_top_k = 2
+    try:
+        column_preview_cap = int(op.get("column_placement_preview_cap", 12))
+    except (TypeError, ValueError):
+        column_preview_cap = 12
+    try:
+        ambiguities_cap = int(op.get("ambiguities_cap", 8))
+    except (TypeError, ValueError):
+        ambiguities_cap = 8
+    try:
+        family_preview_cap = int(op.get("family_columns_preview_cap", 8))
+    except (TypeError, ValueError):
+        family_preview_cap = 8
+
+    preferred_grain_keys = _extract_string_list_from_value_filter(
+        value_filter,
+        [str(op.get("preferred_grain_filter_key") or "preferred_primary_grain_keys")],
+    )
+
+    ranked_candidates: List[Tuple[Any, ...]] = []
+    for idx, candidate in enumerate(root.get("layout_candidates") or []):
+        if not isinstance(candidate, dict):
+            continue
+        candidate_keys = _extract_layout_candidate_grain_keys(candidate)
+        match_rank, match_label = _classify_preferred_grain_match(candidate_keys, preferred_grain_keys)
+        score = _extract_layout_candidate_score(candidate)
+
+        projected_candidate: Dict[str, Any] = {
+            "layout_id": str(candidate.get("layout_id") or ""),
+            "score": score,
+            "preferred_grain_match": match_label,
+            "summary": copy.deepcopy(candidate.get("summary") or {}),
+            "grain": copy.deepcopy(candidate.get("grain") or {}),
+            "tables": [],
+            "coverage_summary": copy.deepcopy(candidate.get("coverage_summary") or {}),
+            "column_placement": _compact_a12_column_placement(
+                candidate.get("column_placement"),
+                candidate.get("coverage_summary"),
+                column_preview_cap,
+            ),
+            "ambiguities": _compact_a12_ambiguities(candidate.get("ambiguities"), ambiguities_cap),
+        }
+
+        if not projected_candidate["grain"] and candidate_keys:
+            projected_candidate["grain"] = {"keys_tested": candidate_keys}
+
+        for table in candidate.get("tables") or []:
+            compact_table = _compact_a12_table(table, family_preview_cap)
+            if compact_table:
+                projected_candidate["tables"].append(compact_table)
+
+        if preferred_grain_keys:
+            ranked_candidates.append((match_rank, -score, idx, projected_candidate))
+        else:
+            ranked_candidates.append((-score, idx, projected_candidate))
+
+    ranked_candidates = sorted(ranked_candidates)
+    if preferred_grain_keys:
+        projected_layouts = [row[3] for row in ranked_candidates[:max(0, layout_candidates_top_k)]]
+    else:
+        projected_layouts = [row[2] for row in ranked_candidates[:max(0, layout_candidates_top_k)]]
+
+    transformed = {
+        "artifact": str(root.get("artifact") or "A12"),
+        "purpose": str(root.get("purpose") or "table_layout_candidates"),
+        "layout_candidates": projected_layouts,
+    }
+    if "version" in root:
+        transformed["version"] = copy.deepcopy(root.get("version"))
+
+    report.setdefault("transform_ops_applied", []).append({
+        "name": str(op.get("name") or ""),
+        "type": "project_a12_table_layout_grounding",
+        "input_layout_candidates": len(root.get("layout_candidates") or []),
+        "output_layout_candidates": len(projected_layouts),
+        "preferred_primary_grain_keys": preferred_grain_keys,
+    })
+    return transformed
+
+
 def _apply_transform_stage(
     node: Any,
     artifact_id: str,
@@ -8132,6 +8457,8 @@ def _apply_transform_stage(
             _op_drop_fields_when_empty(node, op, report)
         elif op_type == "project_a2_semantic_context_grounding":
             node = _op_project_a2_semantic_context_grounding(node, op, report, value_filter)
+        elif op_type == "project_a12_table_layout_grounding":
+            node = _op_project_a12_table_layout_grounding(node, op, report, value_filter)
     return node
 
 
@@ -9123,13 +9450,13 @@ def _run_pruning_smoke_checks() -> None:
         debug=True,
         mode_config=table_layout_cfg,
     )
-    a2_table_layout_names = [row.get("column") for row in pruned_a2_table_layout if isinstance(row, dict)]
-    assert set(a2_table_layout_names) == {"response_id", "one_hot_yes", "null_heavy"}
-    pruned_a2_table_layout_by_name = {
-        row.get("column"): row for row in pruned_a2_table_layout if isinstance(row, dict) and row.get("column")
-    }
-    assert "profiler_samples" not in pruned_a2_table_layout_by_name["response_id"]
-    assert pruned_a2_table_layout_by_name["response_id"].get("a2_samples", {}).get("head") == ["r1", "r2"]
+    assert pruned_a2_table_layout.get("artifact") == "A2"
+    a2_table_layout_names = [
+        row.get("column")
+        for row in pruned_a2_table_layout.get("columns_index", [])
+        if isinstance(row, dict)
+    ]
+    assert a2_table_layout_names == ["response_id", "one_hot_yes", "null_heavy", "drop_me"]
 
     sample_a9_table_layout = {
         "columns": [
@@ -9225,41 +9552,99 @@ def _run_pruning_smoke_checks() -> None:
     assert len(pruned_a10_table_layout.get("family_screening_correlations", [])) == 10
 
     sample_a12_table_layout = {
+        "artifact": "A12",
+        "purpose": "table_layout_candidates",
+        "version": "2",
         "layout_candidates": [
             {
-                "layout_id": "L1",
-                "summary": {"proposed_model": "base"},
-                "grain": {"keys_tested": ["id"]},
-                "tables": [{"table_name": "base_a"}],
-                "coverage_summary": {"covered_by_layout_count": 5},
-                "column_placement": {"covered_by_layout": ["id"]},
-                "ambiguities": [],
-                "debug_trace": {"score": 0.9},
+                "layout_id": "L_wrong",
+                "score": 0.95,
+                "summary": {"proposed_model": "base_plus_child"},
+                "grain": {"keys_tested": ["final_grade", "a1_q10"]},
+                "tables": [
+                    {
+                        "table_id": "T1",
+                        "table_name": "base_a",
+                        "kind": "entity",
+                        "grain": ["final_grade", "a1_q10"],
+                        "repeat_dimension_candidates": [],
+                        "column_counts": {"keys": 2, "attributes": 5, "measures": 0},
+                        "foreign_keys": [],
+                        "primary_role_assignments_preview": {"id": {"primary_role": "id_key"}},
+                        "family_reference": {
+                            "family_id": "fam_a",
+                            "detection_confidence": 0.99,
+                            "columns": ["q1", "q2", "q3"],
+                            "extracted_index_set": ["1", "2", "3"],
+                            "index_by_column": {"q1": ["1"]},
+                            "recommended_repeat_dimension_name": "q",
+                            "flags": {"suspected_item": True},
+                        },
+                    }
+                ],
+                "coverage_summary": {
+                    "covered_by_layout_count": 5,
+                    "covered_by_role_only_count": 2,
+                    "ambiguous_count": 2,
+                },
+                "column_placement": {
+                    "covered_by_layout": ["id", "q1", "q2", "q3"],
+                    "covered_by_role_only": ["extra_1", "extra_2"],
+                    "ambiguous": ["maybe_a", "maybe_b"],
+                    "unmapped": ["mystery_1", "mystery_2"],
+                },
+                "ambiguities": [
+                    {
+                        "column": "q1",
+                        "primary_role": "measure",
+                        "alternate_roles": [
+                            {"role": "invariant_attr", "score": 0.94},
+                            {"role": "measure_item", "score": 0.90},
+                        ],
+                        "why": "should be dropped",
+                    },
+                    {"column": "q2", "primary_role": "measure"},
+                    {"column": "q3", "primary_role": "measure"},
+                ],
+                "debug_trace": {"score": 0.95},
             },
             {
-                "layout_id": "L2",
-                "summary": {"proposed_model": "base_plus_child"},
+                "layout_id": "L_id",
+                "score": 0.80,
+                "summary": {"proposed_model": "base"},
                 "grain": {"keys_tested": ["id"]},
-                "tables": [{"table_name": "base_b"}],
+                "tables": [
+                    {
+                        "table_id": "T2",
+                        "table_name": "base_b",
+                        "kind": "entity",
+                        "grain": ["id"],
+                        "repeat_dimension_candidates": [],
+                        "column_counts": {"keys": 1, "attributes": 6, "measures": 0},
+                        "foreign_keys": [],
+                    }
+                ],
                 "coverage_summary": {"covered_by_layout_count": 6},
                 "column_placement": {"covered_by_layout": ["id", "q"]},
                 "ambiguities": [],
                 "debug_trace": {"score": 0.8},
             },
             {
-                "layout_id": "L3",
+                "layout_id": "L_overlap",
+                "score": 0.85,
                 "summary": {"proposed_model": "base_plus_dims"},
-                "grain": {"keys_tested": ["id"]},
+                "grain": {"keys_tested": ["id", "wave"]},
                 "tables": [{"table_name": "base_c"}],
                 "coverage_summary": {"covered_by_layout_count": 7},
                 "column_placement": {"covered_by_layout": ["id", "country"]},
                 "ambiguities": [],
-                "debug_trace": {"score": 0.7},
+                "debug_trace": {"score": 0.85},
             },
             {
-                "layout_id": "L4",
+                "layout_id": "L_low",
+                "score": 0.60,
                 "summary": {"proposed_model": "mixed"},
-                "grain": {"keys_tested": ["id"]},
+                "grain": {"keys_tested": ["legacy_id"]},
                 "tables": [{"table_name": "base_d"}],
                 "coverage_summary": {"covered_by_layout_count": 8},
                 "column_placement": {"covered_by_layout": ["id", "x"]},
@@ -9278,15 +9663,118 @@ def _run_pruning_smoke_checks() -> None:
         keep_keys=[],
         drop_keys=[],
         limits=None,
-        value_filter=None,
+        value_filter={"preferred_primary_grain_keys": ["id"]},
         debug=True,
         mode_config=table_layout_cfg,
     )
-    assert len(pruned_a12_table_layout.get("layout_candidates", [])) == 3
+    assert len(pruned_a12_table_layout.get("layout_candidates", [])) == 2
+    assert [row.get("layout_id") for row in pruned_a12_table_layout.get("layout_candidates", []) if isinstance(row, dict)] == [
+        "L_id",
+        "L_overlap",
+    ]
     assert "debug" not in pruned_a12_table_layout
     assert "inputs" not in pruned_a12_table_layout
     assert "evidence_primitives" not in pruned_a12_table_layout
     assert all("debug_trace" not in row for row in pruned_a12_table_layout.get("layout_candidates", []) if isinstance(row, dict))
+    first_layout = pruned_a12_table_layout.get("layout_candidates", [])[0]
+    assert first_layout.get("preferred_grain_match") == "exact"
+    assert "covered_by_role_only" not in ((first_layout.get("column_placement") or {}) if isinstance(first_layout, dict) else {})
+    assert "ambiguous" not in ((first_layout.get("column_placement") or {}) if isinstance(first_layout, dict) else {})
+    assert "covered_by_layout" not in ((first_layout.get("column_placement") or {}) if isinstance(first_layout, dict) else {})
+    assert len(((first_layout.get("column_placement") or {}).get("covered_by_layout_preview") or [])) <= 12
+    assert len(((first_layout.get("column_placement") or {}).get("unmapped_preview") or [])) <= 12
+    assert len(first_layout.get("ambiguities", [])) <= 8
+
+    pruned_a12_table_layout_fallback, _ = apply_llm_pruning(
+        payload=sample_a12_table_layout,
+        artifact_id="A12",
+        mode="table_layout_worker",
+        keep_keys=[],
+        drop_keys=[],
+        limits=None,
+        value_filter=None,
+        debug=True,
+        mode_config=table_layout_cfg,
+    )
+    assert [row.get("layout_id") for row in pruned_a12_table_layout_fallback.get("layout_candidates", []) if isinstance(row, dict)] == [
+        "L_wrong",
+        "L_overlap",
+    ]
+    fallback_first_layout = pruned_a12_table_layout_fallback.get("layout_candidates", [])[0]
+    fallback_first_table = ((fallback_first_layout.get("tables") or [])[0] if isinstance(fallback_first_layout, dict) else {})
+    assert "primary_role_assignments_preview" not in fallback_first_table
+    family_reference = fallback_first_table.get("family_reference") or {}
+    assert "columns" not in family_reference
+    assert "extracted_index_set" not in family_reference
+    assert "index_by_column" not in family_reference
+    assert set(family_reference.keys()) <= {
+        "family_id",
+        "detection_confidence",
+        "columns_count",
+        "columns_preview",
+        "recommended_repeat_dimension_name",
+        "flags",
+    }
+    fallback_first_ambiguity = (fallback_first_layout.get("ambiguities") or [])[0]
+    assert set(fallback_first_ambiguity.keys()) <= {"column", "primary_role", "alternate_roles"}
+
+    sample_a2_table_layout = [
+        {
+            "column": "id_col",
+            "top_candidate": {"type": "numeric"},
+            "unique_count": 100,
+            "missing_pct": 0.0,
+            "high_uniqueness_candidate": True,
+            "top_levels": ["1", "2"],
+            "missing_tokens_observed": {},
+            "is_one_hot_like": False,
+        },
+        {
+            "column": "country_code",
+            "top_candidate": {"type": "categorical"},
+            "unique_count": 3,
+            "missing_pct": 1.0,
+            "high_uniqueness_candidate": False,
+            "top_levels": ["CA", "US", "GB", "AU", "NZ"],
+            "missing_tokens_observed": {},
+            "is_one_hot_like": False,
+        },
+        {
+            "column": "screen_flag",
+            "top_candidate": {"type": "categorical"},
+            "unique_count": 2,
+            "missing_pct": 0.0,
+            "high_uniqueness_candidate": False,
+            "top_levels": ["0", "1", "2"],
+            "missing_tokens_observed": {"UNK": 1},
+            "is_one_hot_like": False,
+        },
+    ]
+    pruned_a2_table_layout, _ = apply_llm_pruning(
+        payload=sample_a2_table_layout,
+        artifact_id="A2",
+        mode="table_layout_worker",
+        keep_keys=[],
+        drop_keys=[],
+        limits=None,
+        value_filter={
+            "force_include_columns": ["id_col"],
+            "structural_columns": ["country_code"],
+            "skip_trigger_columns": ["screen_flag"],
+        },
+        debug=True,
+        mode_config=table_layout_cfg,
+    )
+    assert pruned_a2_table_layout.get("artifact") == "A2"
+    assert [row.get("column") for row in pruned_a2_table_layout.get("columns_index", []) if isinstance(row, dict)] == [
+        "id_col",
+        "country_code",
+        "screen_flag",
+    ]
+    assert [row.get("column") for row in pruned_a2_table_layout.get("low_cardinality_value_preview", []) if isinstance(row, dict)] == [
+        "screen_flag",
+        "country_code",
+    ]
 
     light_contract_override_rows = []
     for default in DEFAULT_OVERRIDE_FIELDS:

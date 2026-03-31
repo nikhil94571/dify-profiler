@@ -10,40 +10,15 @@
         "numeric_profile",
         "datetime_profile"
       ],
-      "policies": {
-        "root_scope_policy": {
-          "type": "column_scope_selector",
-          "target_array": "__root__",
-          "name_field": "column",
-          "include_from_filter_keys": [
-            "force_include_columns",
-            "review_columns",
-            "structural_columns"
-          ],
-          "include_bool_true_fields": [
-            "is_one_hot_like",
-            "high_missingness"
-          ],
-          "include_nonempty_fields": [
-            "missing_tokens_observed"
-          ],
-          "hard_cap_per_inferred_group": 8,
-          "hard_cap_total": 140
-        }
-      },
       "transforms": {
-        "compact_a2_samples": {
-          "type": "compact_keyed_string_arrays",
-          "target_array_path": "__root__",
-          "field": "a2_samples",
-          "max_items_per_key": 2,
-          "max_chars": 80
-        },
-        "drop_empty_a2_fields": {
-          "type": "drop_fields_when_empty",
-          "target_array_path": "__root__",
-          "fields": [
-            "missing_tokens_observed"
+        "project_a2_layout_grounding": {
+          "type": "project_a2_semantic_context_grounding",
+          "low_cardinality_max_unique_count": 12,
+          "low_cardinality_preview_cap": 20,
+          "top_levels_limit": 4,
+          "priority_filter_keys": [
+            "force_include_columns",
+            "skip_trigger_columns"
           ]
         }
       }
@@ -53,11 +28,24 @@
         "inputs",
         "pair_key_seed_candidates",
         "candidate_key_overlap_groups",
-        "audit_trace"
+        "audit_trace",
+        {
+          "key": "rows",
+          "scope": "recursive_key_drop",
+          "guards": {
+            "value_kind_any_of": ["list_of_objects"],
+            "path_hints_any_of": [
+              "candidate_key_stress_tests[].top_drifted_attributes[].example_conflicts[].rows"
+            ]
+          },
+          "note": "Drop nested example rows from key stress tests; keep only compact drift summaries."
+        }
       ],
       "limits": {
-        "single_column_key_seed_candidates": 20,
-        "candidate_key_stress_tests": 20
+        "single_column_key_seed_candidates": 8,
+        "candidate_key_stress_tests": 8,
+        "candidate_key_stress_tests[].top_drifted_attributes": 2,
+        "candidate_key_stress_tests[].top_drifted_attributes[].example_conflicts": 1
       }
     },
     "A9": {
@@ -104,39 +92,39 @@
           "include_roles_all": [
             {
               "role": "id_key",
-              "cap": 20
+              "cap": 12
             },
             {
               "role": "time_index",
-              "cap": 15
+              "cap": 8
             },
             {
               "role": "repeat_index",
-              "cap": 15
+              "cap": 8
             },
             {
               "role": "invariant_attr",
-              "cap": 20
+              "cap": 12
             },
             {
               "role": "coded_categorical",
-              "cap": 20
+              "cap": 10
             },
             {
               "role": "measure",
-              "cap": 20
+              "cap": 8
             },
             {
               "role": "measure_numeric",
-              "cap": 20
+              "cap": 6
             },
             {
               "role": "measure_item",
-              "cap": 20
+              "cap": 6
             }
           ],
-          "include_review_required_topk": 40,
-          "hard_cap_total": 120
+          "include_review_required_topk": 16,
+          "hard_cap_total": 64
         }
       }
     },
@@ -156,24 +144,21 @@
       }
     },
     "A12": {
+      "transforms": {
+        "project_a12_table_layout_grounding": {
+          "type": "project_a12_table_layout_grounding",
+          "preferred_grain_filter_key": "preferred_primary_grain_keys",
+          "layout_candidates_top_k": 2,
+          "column_placement_preview_cap": 12,
+          "ambiguities_cap": 8,
+          "family_columns_preview_cap": 8
+        }
+      },
       "drop": [
         "inputs",
         "evidence_primitives",
-        "debug",
-        {
-          "key": "debug_trace",
-          "scope": "recursive_key_drop",
-          "guards": {
-            "path_hints_any_of": [
-              "layout_candidates[].debug_trace"
-            ]
-          },
-          "note": "Drop nested scoring/debug traces from layout candidates; keep only the user-facing layout proposal fields."
-        }
-      ],
-      "limits": {
-        "layout_candidates": 3
-      }
+        "debug"
+      ]
     },
     "A14": {
       "drop": [
@@ -196,7 +181,7 @@
           "include_numeric_lte": {
             "global_quality_score": 0.85
           },
-          "hard_cap_total": 100
+          "hard_cap_total": 60
         }
       }
     }

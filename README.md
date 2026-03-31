@@ -90,6 +90,7 @@ For workers that need request-scoped pruning inputs, use `POST /artifact-bundles
 
 - `type_transform_worker`, `missingness_worker`, `semantic_context_worker`, `table_layout_worker`, and `analysis_layout_worker` can accept `global.value_filter.force_include_columns` so finalized grain, reference, and family linkage columns are always retained in a scoped bundle.
 - `family_worker` can additionally accept `global.value_filter.force_include_family_ids` so `A8` and `B1` are reduced to just the accepted families under review.
+- `table_layout_worker` can additionally accept `global.value_filter.preferred_primary_grain_keys` so `A12` layout candidates are re-ranked toward the accepted primary grain before projection.
 
 The post-light-contract worker path also applies server-side auto-scope buckets from stored artifacts:
 
@@ -153,7 +154,8 @@ Content-Type: application/json
   "mode": "table_layout_worker",
   "global": {
     "value_filter": {
-      "force_include_columns": ["respondent_id", "wave"]
+      "force_include_columns": ["respondent_id", "wave"],
+      "preferred_primary_grain_keys": ["respondent_id"]
     }
   }
 }
@@ -289,7 +291,9 @@ After semantic, type, and missingness workers have produced validated JSON outpu
 
 The intended next stage after family is a single-pass canonical table-layout proposal worker:
 
-1. request `POST /artifact-bundles/view` with `mode = "table_layout_worker"`
+1. request `POST /artifact-bundles/view` with `mode = "table_layout_worker"` and supply:
+   - `global.value_filter.force_include_columns` from finalized light-contract keys
+   - `global.value_filter.preferred_primary_grain_keys` from `light_contract_decisions.primary_grain_decision.keys`
 2. combine the returned bundle with:
    - `light_contract_decisions`
    - `semantic_context_json`
@@ -298,11 +302,33 @@ The intended next stage after family is a single-pass canonical table-layout pro
    - `family_worker_json`
 3. run [`prompts/table_layout_worker_system_prompt.md`](/Users/nikhil/Automations/dify-profiler/prompts/table_layout_worker_system_prompt.md)
 4. validate the returned JSON, repair once if needed, then resolve one canonical `table_layout_worker_json`
+   - when `column_table_assignments[].assignment_role` is `exclude_from_outputs` or `unresolved`, the canonical contract allows blank `assigned_table`
+   - in the repair branch, the repair validator must validate the repair LLM raw JSON text, not the original first-pass worker output
+   - the repair prompt should receive the original invalid table-layout JSON plus the first validator's `validation_errors_json`
+
+For Dify structured-output mode, use:
+- [`schemas/table_layout_worker.response.schema.json`](/Users/nikhil/Automations/dify-profiler/schemas/table_layout_worker.response.schema.json)
+  - paste this object directly into Dify's `json_schema` box
+  - it already includes the Dify/OpenAI `json_schema` wrapper fields: `name`, `strict`, and `schema`
+  - do not wrap it again in `response_format`
+
+For direct API / HTTP-node usage, use:
+- [`schemas/table_layout_worker.openai_response_format.example.json`](/Users/nikhil/Automations/dify-profiler/schemas/table_layout_worker.openai_response_format.example.json)
+  - this example includes the outer `response_format` wrapper
+  - do not paste this file into Dify's `json_schema` box
+
+For prompt regression checks, use:
+- [`prompts/table_layout_worker_regression_cases.md`](/Users/nikhil/Automations/dify-profiler/prompts/table_layout_worker_regression_cases.md)
+
+For a local validator smoke check of the exclude/unresolved assignment contract, run:
+- `python scripts/table_layout_validator_smoke.py`
+
 
 This canonical stage is intended to produce:
 - a final proposed table set
 - explicit source-column placement for every known column
 - parent-child/reference layout decisions for the canonical layer
+- compact family-table summaries in `table_suggestions`; use `column_table_assignments` as the exhaustive source-column map
 
 It is still a proposal-stage worker. It does not emit merged wave tables, score tables, or other analysis-ready outputs.
 

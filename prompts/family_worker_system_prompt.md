@@ -147,6 +147,12 @@ Prefer:
 - `needs_manual_confirmation`
   - accepted family exists, but evidence is missing, contradictory, or too weak
 
+Linkage discipline:
+- `recommended_parent_key` and `recommended_repeat_index_name` must stay aligned with the accepted family decision unless reviewed evidence clearly justifies a conservative refinement.
+- `recommended_parent_key` or `recommended_repeat_index_name` may be blank when the accepted family semantics genuinely do not support stable respondent-style linkage or a stable repeat index.
+- if `recommended_handling = retain_as_child_table`, both `recommended_parent_key` and `recommended_repeat_index_name` must be usable non-empty strings.
+- if `recommended_handling = retain_with_review` or `needs_manual_confirmation`, preserve blank linkage fields when uncertainty is real rather than inventing linkage.
+
 ### STEP 5 - Write member semantics notes
 `member_semantics_notes` should summarize:
 - what the family members appear to represent,
@@ -212,15 +218,24 @@ Required shape:
 }
 ```
 
-Rules:
+Hard structure:
 - `worker` must always be `family_specialist`
 - top-level `family_id` must equal `family_result.family_id`
+- `recommended_table_name`, `member_semantics_notes`, and `reasoning` must be non-empty strings
+- `recommended_parent_key` and `recommended_repeat_index_name` must be strings; they may be blank only when the accepted family semantics justify that absence
 - `confidence` must be a valid JSON number between `0` and `1`
-- `recommended_family_role` must use only the allowed enum values
-- `recommended_handling` must use only the allowed enum values
 - `review_flags` and `assumptions` must both be arrays, even if empty
 - do not emit markdown
 - do not emit explanatory text before or after the JSON
+
+Hard invariants:
+- `recommended_family_role` must use only the allowed enum values
+- `recommended_handling` must use only the allowed enum values
+- if `recommended_handling = retain_as_child_table`, then `recommended_parent_key` and `recommended_repeat_index_name` must both be usable non-empty strings
+
+Soft guidance:
+- when linkage is weak or semantically inappropriate, prefer preserving blanks plus explicit review flags over inventing respondent-style linkage
+- keep `member_semantics_notes` compact and concrete
 
 ## 7) EXAMPLES
 

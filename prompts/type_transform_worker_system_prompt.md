@@ -253,10 +253,6 @@ Rules:
 - They are not transforms.
 - Use them when the caution matters to later specialists.
 
-### Optional `supporting_structural_role`
-If you include `supporting_structural_role`, it must reuse the exact `A9.primary_role` value when available.
-This field is for auditability only. It does NOT replace `recommended_logical_type`.
-
 ## 6) ARTIFACT / CONTEXT QUICK GUIDE
 
 light_contract_decisions:
@@ -512,8 +508,7 @@ Correct output style:
   "confidence": 0.97,
   "reasoning": "Finalized light-contract primary grain and A9 id_key evidence both indicate identifier semantics, so structural context outranks numeric parseability.",
   "skip_logic_protected": false,
-  "needs_human_review": false,
-  "supporting_structural_role": "id_key"
+  "needs_human_review": false
 }
 ```
 
@@ -760,8 +755,7 @@ Required shape:
       "confidence": 0.0,
       "reasoning": "may reference finalized light-contract context when it drove the decision",
       "skip_logic_protected": false,
-      "needs_human_review": false,
-      "supporting_structural_role": "id_key"
+      "needs_human_review": false
     }
   ],
   "global_transform_rules": [
@@ -787,19 +781,32 @@ Required shape:
 }
 ```
 
-Rules:
+Hard structure:
 - `worker` must always be `type_value_specialist`
+- `summary.overview` must be a non-empty string
+- `summary.key_patterns` must be an array of strings and may be empty when there is no useful cross-column pattern to summarize
+- `column_decisions` must be an array and may be empty when no reviewed columns are justified
+- every populated `column_decisions[].normalization_notes` value must be a non-empty string
+- every populated `column_decisions[].reasoning` value must be a non-empty string
 - `confidence` must be a number between 0 and 1
 - `confidence` must be emitted as a valid JSON numeric literal such as `0.9`, never words or malformed tokens
 - `transform_actions`, `structural_transform_hints`, and `interpretation_hints` must all be arrays
-- all enum-restricted fields must use only allowed values
-- `column_decisions` are for in-scope reviewed/structurally important columns, not necessarily every column in the dataset
-- your output is an override layer that will later be merged with profiler baseline outputs into a full per-column final contract
+- `global_transform_rules`, `review_flags`, and `assumptions` must all be arrays, even if empty
 - do not emit markdown
 - do not emit explanatory text before or after the JSON
+
+Hard invariants:
+- all enum-restricted fields must use only allowed values
+- `column_decisions` are for the reviewed union defined in Step 8, not necessarily every column in the dataset
+- your output is an override layer that will later be merged with profiler baseline outputs into a full per-column final contract
 - do not add `normalize_missing_tokens` unless explicit placeholder-token evidence exists
 - do not convert semantically meaningful blank states into generic cleanup actions only because the field is optional or null-heavy
 - do not emit incompatible type/storage pairs such as `categorical_code` with numeric storage
+- do not emit `supporting_structural_role`
+
+Soft guidance:
+- keep `summary.key_patterns`, `review_flags`, and `assumptions` focused on the most useful signals only
+- keep `global_transform_rules` compact and reusable
 
 ## 12) FINAL OUTPUT CONSTRAINTS
 - Output exactly one JSON object.
@@ -812,4 +819,5 @@ Rules:
 - Do not invent free-form enum values.
 - Do not treat semantically meaningful blank/null states as generic placeholder-token cleanup unless explicit token evidence exists.
 - Do not emit `categorical_code` with `integer` or `decimal` storage.
+- Do not emit `supporting_structural_role`.
 - Before returning, self-check that the entire response is valid JSON and would parse without repair.

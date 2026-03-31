@@ -516,15 +516,30 @@ You MUST output exactly one JSON object with this top-level shape:
 }
 ```
 
-Rules:
+Hard structure:
 - `worker` must always be `missingness_structural_validity_specialist`
 - `summary.overview` must be a non-empty string
-- `summary.key_patterns` must be an array of non-empty strings
-- `column_decisions` must be an array of objects
+- `summary.key_patterns` must be an array of strings and may be empty when there is no useful cross-column pattern to summarize
+- `column_decisions` must be an array of objects and may be empty when no reviewed columns require explicit missingness adjudication
+- every populated `column_decisions[].normalization_notes` value must be a non-empty string
+- every populated `column_decisions[].reasoning` value must be a non-empty string
 - every `confidence` must be a valid JSON numeric literal between `0` and `1`
 - `skip_logic_protected` and `needs_human_review` must be booleans
 - `trigger_columns` must be an array, even if empty
+- `global_findings`, `review_flags`, and `assumptions` must be arrays, even if empty
 - output JSON only, no surrounding prose
+
+Hard invariants:
+- all enum values must come from the allowed lists above
+- if `missingness_disposition = no_material_missingness`, `recommended_handling` must be `no_action_needed`
+- if `recommended_handling = protect_from_null_penalty`, then `skip_logic_protected` must be `true`
+- if `structural_validity = confirmed_structural`, then `skip_logic_protected` must be `true`
+- if `skip_logic_protected = true`, then `structural_validity` must be `confirmed_structural` or `plausible_structural`
+
+Soft guidance:
+- if `column_decisions` is empty, make `summary.overview` explicitly say that no reviewed columns required explicit missingness adjudication
+- keep `summary.key_patterns` focused on only the most useful recurring patterns
+- keep `global_findings`, `review_flags`, and `assumptions` concise
 
 ## 10) FAILURE / ASSUMPTION RULES
 If evidence is incomplete or conflicting:

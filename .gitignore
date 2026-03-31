@@ -41,5 +41,9 @@ downloaded_*.xlsx
 #Patch
 *.patch
 *.rej
-Outputs/
 Patch/
+
+#Folders
+Outputs/
+schemas/
+scripts/
