@@ -26,6 +26,7 @@ Thumbs.db
 !*.schema.json
 !llm_pruning_ledger.json
 !profiles/*.json
+!JSON validators/canonical_contract_reviewer_validator.json
 
 sa-key.json
 *-key.json
@@ -46,4 +47,6 @@ Patch/
 #Folders
 Outputs/
 schemas/
-scripts/
+scripts/*
+!scripts/canonical_contract_reviewer_smoke.py
+scripts/__pycache__/

@@ -2688,6 +2688,17 @@ class LightContractFinalizeAcceptedRequest(BaseModel):
     run_id: str
 
 
+class CanonicalColumnContractRequest(BaseModel):
+    run_id: str
+    light_contract_decisions: Any
+    semantic_context_json: Any
+    type_transform_worker_json: Any
+    missingness_worker_json: Any
+    family_worker_json: Any
+    table_layout_worker_json: Any
+    debug: bool = False
+
+
 def _sanitize_export_filename(name: str, default_name: str) -> str:
     name = (name or "").strip().replace("\n", "").replace("\r", "")
     name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
@@ -3520,6 +3531,7 @@ ARTIFACT_SPECS: Dict[str, Dict[str, str]] = {
     "A13": {"filename": "semantic_anchors.json", "content_type": "application/json"},
     "A14": {"filename": "quality_heatmap.json", "content_type": "application/json"},
     "A16": {"filename": "conditional_missingness.json", "content_type": "application/json"},
+    "A17": {"filename": "baseline_column_resolution.json", "content_type": "application/json"},
     "B1": {"filename": "family_packets.jsonl", "content_type": "application/jsonl"},
 }
 
@@ -4661,6 +4673,7 @@ async def full_bundle(
         "A13": {"uses": ["A2", "dataset", "cols_profile"]},
         "A14": {"uses": ["dataset", "A2", "cols_profile"]},
         "A16": {"uses": ["dataset", "A4", "cols_profile", "column_signal_map"]},
+        "A17": {"uses": ["A2", "A3-T", "A3-V", "A4", "A9", "A13", "A14", "A16"]},
         "B1": {"uses": ["A8", "A2", "A6", "A11", "A13", "A14"]},
     }
 
@@ -6235,6 +6248,18 @@ async def full_bundle(
         "fields": ["unique_ratio", "top_candidate_type", "top_candidate_confidence", "parsed_as_numeric_pct", "parsed_as_datetime_pct"],
     }
 
+    baseline_column_resolution = _build_baseline_column_resolution_artifact(
+        a2_rows=column_dictionary_rows,
+        a3t_payload=transform_review_queue,
+        a3v_payload=variable_type_review_queue,
+        a4_payload=missing_catalog,
+        a9_payload=role_scores,
+        a13_payload=semantic_anchors,
+        a14_payload=quality_heatmap,
+        a16_payload=conditional_missingness,
+        artifact_inputs=artifact_inputs,
+    )
+
     run_id = uuid4().hex
     base_url = str(request.base_url).rstrip("/")
     bucket_name = os.getenv("EXPORT_BUCKET")
@@ -6260,6 +6285,7 @@ async def full_bundle(
         "A13": _json_bytes(semantic_anchors),
         "A14": _json_bytes(quality_heatmap),
         "A16": _json_bytes(conditional_missingness),
+        "A17": _json_bytes(baseline_column_resolution),
         "B1": _jsonl_bytes(family_packets),
     }
 
@@ -8886,6 +8912,11 @@ def _run_pruning_smoke_checks() -> None:
     assert analysis_layout_profile["artifacts"] == ["A2", "A8", "A10", "A14", "A16", "B1"]
     analysis_layout_cfg = analysis_layout_profile["mode_config"]
 
+    canonical_reviewer_profile, canonical_reviewer_source = _load_profile_local("canonical_contract_reviewer")
+    assert canonical_reviewer_source == "local"
+    assert canonical_reviewer_profile["artifacts"] == ["A2", "A3-T", "A3-V", "A4", "A9", "A13", "A14", "A16", "A17"]
+    canonical_reviewer_cfg = canonical_reviewer_profile["mode_config"]
+
     mode_cfg_missingness, mode_meta_missingness = _resolve_mode_config("missingness_worker")
     assert mode_meta_missingness["profile_artifacts"] == ["A2", "A4", "A13", "A14", "A16"]
     assert mode_cfg_missingness == missingness_cfg
@@ -8905,6 +8936,10 @@ def _run_pruning_smoke_checks() -> None:
     mode_cfg_analysis_layout, mode_meta_analysis_layout = _resolve_mode_config("analysis_layout_worker")
     assert mode_meta_analysis_layout["profile_artifacts"] == ["A2", "A8", "A10", "A14", "A16", "B1"]
     assert mode_cfg_analysis_layout == analysis_layout_cfg
+
+    mode_cfg_canonical_reviewer, mode_meta_canonical_reviewer = _resolve_mode_config("canonical_contract_reviewer")
+    assert mode_meta_canonical_reviewer["profile_artifacts"] == ["A2", "A3-T", "A3-V", "A4", "A9", "A13", "A14", "A16", "A17"]
+    assert mode_cfg_canonical_reviewer == canonical_reviewer_cfg
 
     sample_a2_type = [
         {
@@ -10007,7 +10042,7 @@ def _effective_value_filter_for_mode(
     mode: str,
     value_filter: Optional[Any],
 ) -> Optional[Any]:
-    if str(mode or "").strip() not in {"type_transform_worker", "missingness_worker", "semantic_context_worker", "table_layout_worker", "analysis_layout_worker"}:
+    if str(mode or "").strip() not in {"type_transform_worker", "missingness_worker", "semantic_context_worker", "table_layout_worker", "analysis_layout_worker", "canonical_contract_reviewer"}:
         return value_filter
     buckets = _build_post_contract_auto_scope_buckets(run_id)
     merged = value_filter
@@ -10265,3 +10300,2601 @@ def artifact_bundle_view_post(
     _=Depends(require_token),
 ) -> Dict[str, Any]:
     return _artifact_bundle_view(req=req, response=response)
+
+
+CANONICAL_MODELING_STATUSES = {
+    "base_field",
+    "child_repeat_member",
+    "reference_field",
+    "event_field",
+    "excluded_from_outputs",
+    "unresolved",
+}
+
+CANONICAL_TYPE_DECISION_SOURCES = {
+    "reviewed_type_worker",
+    "family_default",
+    "a17_baseline",
+    "unresolved_no_a2_evidence",
+}
+
+CANONICAL_STRUCTURE_DECISION_SOURCES = {
+    "table_layout_worker",
+    "light_contract_fallback",
+    "unresolved",
+}
+
+CANONICAL_MISSINGNESS_DECISION_SOURCES = {
+    "reviewed_missingness_worker",
+    "family_default",
+    "a17_baseline",
+    "unresolved_no_a2_evidence",
+}
+
+CANONICAL_SEMANTIC_DECISION_SOURCES = {
+    "semantic_context_worker",
+    "family_worker",
+    "unknown",
+}
+
+CANONICAL_ASSIGNMENT_ROLES = {
+    "base_key",
+    "base_attribute",
+    "reference_key",
+    "reference_attribute",
+    "repeat_parent_key",
+    "repeat_index",
+    "melt_member",
+    "reference_value",
+    "exclude_from_outputs",
+    "unresolved",
+}
+
+TYPE_LOGICAL_TYPES = {
+    "identifier",
+    "categorical_code",
+    "nominal_category",
+    "ordinal_category",
+    "boolean_flag",
+    "date",
+    "datetime",
+    "numeric_measure",
+    "free_text",
+    "mixed_or_ambiguous",
+}
+
+TYPE_STORAGE_TYPES = {
+    "string",
+    "integer",
+    "decimal",
+    "boolean",
+    "date",
+    "datetime",
+}
+
+TYPE_TRANSFORM_ACTIONS = {
+    "trim_whitespace",
+    "normalize_missing_tokens",
+    "normalize_boolean_tokens",
+    "cast_to_string",
+    "cast_to_integer",
+    "cast_to_decimal",
+    "cast_to_date",
+    "cast_to_datetime",
+    "strip_numeric_formatting",
+    "normalize_decimal_separator",
+    "lowercase_values",
+    "uppercase_values",
+    "titlecase_values",
+    "normalize_category_tokens",
+    "extract_numeric_component",
+    "strip_unit_suffix",
+    "standardize_percent_scale",
+}
+
+TYPE_STRUCTURAL_HINTS = {
+    "split_multiselect_tokens",
+    "requires_multiselect_modeling_decision",
+    "split_range_into_start_end",
+    "requires_range_semantics_review",
+    "requires_unit_normalization_review",
+    "requires_wide_to_long_review",
+    "requires_child_table_review",
+    "requires_multi_column_derivation",
+    "requires_start_end_pair_review",
+    "requires_codebook_or_label_mapping_review",
+}
+
+TYPE_INTERPRETATION_HINTS = {
+    "leading_zero_risk",
+    "identifier_not_measure",
+    "code_not_quantity",
+    "time_index_not_identifier",
+    "repeat_context_do_not_use_as_base_key",
+    "skip_logic_protected",
+    "mixed_content_high_risk",
+    "free_text_high_cardinality",
+    "numeric_parse_is_misleading",
+    "light_contract_override_applied",
+}
+
+MISSINGNESS_DISPOSITIONS = {
+    "no_material_missingness",
+    "token_missingness_present",
+    "structurally_valid_missingness",
+    "partially_structural_missingness",
+    "unexplained_high_missingness",
+    "mixed_missingness_risk",
+}
+
+MISSINGNESS_HANDLING = {
+    "no_action_needed",
+    "protect_from_null_penalty",
+    "retain_with_caution",
+    "review_before_drop",
+    "candidate_drop_review",
+}
+
+BOOL_TRUE_TOKENS = {"1", "y", "yes", "true", "t"}
+BOOL_FALSE_TOKENS = {"0", "n", "no", "false", "f"}
+LIKERT_TOKENS = {
+    "strongly agree",
+    "agree",
+    "neutral",
+    "disagree",
+    "strongly disagree",
+    "never",
+    "rarely",
+    "sometimes",
+    "often",
+    "always",
+    "very satisfied",
+    "satisfied",
+    "unsatisfied",
+    "very unsatisfied",
+}
+
+A13_ANCHOR_MEANINGS = {
+    "US_ZIP_CODE": "Likely US ZIP or postal code.",
+    "PII_LOCATION": "Likely location-sensitive identifier.",
+    "EMAIL": "Likely email address.",
+    "URL": "Likely URL or resource locator.",
+    "PHONE": "Likely phone number.",
+    "ISO_COUNTRY": "Likely country code or country label.",
+    "STATE_CODE": "Likely state or province code.",
+    "CURRENCY": "Likely currency-bearing value.",
+    "ICD10_CODE": "Likely ICD-10 diagnosis or medical code.",
+    "FISCAL_QUARTER": "Likely fiscal quarter or reporting period.",
+}
+
+
+def _coerce_json_input(value: Any, field_name: str, allow_list: bool = False) -> Any:
+    if isinstance(value, str):
+        text = value.strip()
+        if text == "":
+            raise HTTPException(status_code=422, detail=f"{field_name} must not be blank")
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=422, detail=f"{field_name} is not valid JSON: {exc}") from exc
+        value = parsed
+
+    if isinstance(value, dict):
+        return value
+    if allow_list and isinstance(value, list):
+        return value
+    expected = "JSON object or array" if allow_list else "JSON object"
+    raise HTTPException(status_code=422, detail=f"{field_name} must be a {expected}")
+
+
+def _load_optional_decoded_payload(run_id: str, artifact_id: str) -> Tuple[Optional[str], Any, Optional[Dict[str, Any]], Optional[str]]:
+    try:
+        kind, payload, meta = _get_decoded_payload(run_id=run_id, artifact_id=artifact_id)
+        return kind, payload, meta, None
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            return None, None, None, artifact_id
+        raise
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _dedupe_preserve_order(values: Iterable[Any]) -> List[str]:
+    result: List[str] = []
+    seen: Set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def _merge_notes(*notes: Any) -> str:
+    cleaned = _dedupe_preserve_order(notes)
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0]
+    return " ".join(cleaned)
+
+
+def _pick_higher_confidence(existing: Optional[Dict[str, Any]], candidate: Dict[str, Any]) -> Dict[str, Any]:
+    if existing is None:
+        return candidate
+    if _safe_float(candidate.get("confidence"), 0.0) > _safe_float(existing.get("confidence"), 0.0):
+        return candidate
+    return existing
+
+
+def _looks_integer_like(values: Iterable[Any]) -> bool:
+    cleaned = [str(value).strip() for value in values if str(value).strip()]
+    if not cleaned:
+        return False
+    return all(re.fullmatch(r"[+-]?\d+", value) for value in cleaned)
+
+
+def _looks_numeric_like(values: Iterable[Any]) -> bool:
+    cleaned = [str(value).strip() for value in values if str(value).strip()]
+    if not cleaned:
+        return False
+    return all(re.fullmatch(r"[+-]?\d+(?:\.\d+)?", value) for value in cleaned)
+
+
+def _has_leading_zero_risk(values: Iterable[Any]) -> bool:
+    return any(re.fullmatch(r"0\d+", str(value).strip() or "") for value in values)
+
+
+def _boolean_like(top_levels: Iterable[Any]) -> bool:
+    normalized = {str(value).strip().lower() for value in top_levels if str(value).strip()}
+    if len(normalized) < 2 or len(normalized) > 3:
+        return False
+    return normalized <= (BOOL_TRUE_TOKENS | BOOL_FALSE_TOKENS)
+
+
+def _ordinal_like(top_levels: Iterable[Any], encoding_type: str) -> bool:
+    if encoding_type == "ordinal":
+        return True
+    normalized = {str(value).strip().lower() for value in top_levels if str(value).strip()}
+    if not normalized:
+        return False
+    return any(any(token in level for token in LIKERT_TOKENS) for level in normalized)
+
+
+def _anchor_fallback_semantics(a13_row: Dict[str, Any]) -> Tuple[str, str]:
+    anchors = _coerce_list_of_dicts(a13_row.get("detected_anchors"))
+    if not anchors:
+        return "", ""
+    ranked = sorted(anchors, key=lambda item: (-_safe_float(item.get("confidence"), 0.0), str(item.get("anchor") or "")))
+    top_anchor = str(ranked[0].get("anchor") or "").strip()
+    if not top_anchor:
+        return "", ""
+    return A13_ANCHOR_MEANINGS.get(top_anchor, f"Likely semantic anchor: {top_anchor}."), top_anchor
+
+
+def _column_name_tokens(column: str) -> Set[str]:
+    return {token for token in re.split(r"[^a-z0-9]+", str(column or "").lower()) if token}
+
+
+def _column_name_has_free_text_hint(column: str) -> bool:
+    tokens = _column_name_tokens(column)
+    compact = re.sub(r"[^a-z0-9]+", "", str(column or "").lower())
+    if not tokens:
+        return any(
+            marker in compact
+            for marker in ("freetext", "openended", "comment", "feedback", "verbatim", "describe", "description", "explain", "specify")
+        )
+    if "freetext" in tokens or "freetext" in compact or {"free", "text"} <= tokens:
+        return True
+    if "openended" in tokens or "openended" in compact or {"open", "ended"} <= tokens or {"open", "text"} <= tokens:
+        return True
+    if {"please", "specify"} <= tokens or {"other", "specify"} <= tokens:
+        return True
+    if compact and any(marker in compact for marker in ("comment", "comments", "feedback", "verbatim", "describe", "description", "explain", "specify")):
+        return True
+    return bool(tokens & {"comment", "comments", "feedback", "verbatim", "narrative", "describe", "description", "explain", "note", "notes", "specify"})
+
+
+def _values_look_textual(values: Iterable[Any]) -> bool:
+    cleaned = [str(value).strip() for value in values if str(value).strip()]
+    if not cleaned:
+        return False
+    return any(
+        len(value) >= 12
+        or " " in value
+        or bool(re.search(r"[A-Za-z]{4,}", value))
+        for value in cleaned
+    )
+
+
+def _semantic_text_blob(semantic: Dict[str, Any], family_result: Dict[str, Any]) -> str:
+    return " ".join(
+        part.strip().lower()
+        for part in [
+            str(semantic.get("semantic_meaning") or ""),
+            str(semantic.get("codebook_note") or ""),
+            str(family_result.get("member_semantics_notes") or ""),
+            str(family_result.get("recommended_family_role") or ""),
+        ]
+        if str(part or "").strip()
+    )
+
+
+def _family_semantics_imply_categorical_repeat(
+    structure: Dict[str, Any],
+    semantic: Dict[str, Any],
+    family_result: Dict[str, Any],
+) -> bool:
+    if structure.get("canonical_modeling_status") != "child_repeat_member":
+        return False
+
+    family_role = str(family_result.get("recommended_family_role") or "").strip()
+    if family_role == "repeated_measure_set":
+        return False
+    if family_role == "repeated_survey_block":
+        return True
+
+    semantic_blob = _semantic_text_blob(semantic, family_result)
+    if not semantic_blob:
+        return False
+
+    positive_tokens = (
+        "likert",
+        "ordinal",
+        "survey",
+        "questionnaire",
+        "categorical",
+        "category",
+        "rating",
+        "familiarity",
+        "agreement",
+        "frequency",
+        "response set",
+        "response scale",
+        "row-level ordinal",
+        "row level ordinal",
+    )
+    negative_tokens = (
+        "continuous",
+        "measure set",
+        "amount",
+        "quantity",
+        "duration",
+        "concentration",
+        "temperature",
+        "weight",
+        "height",
+    )
+    return any(token in semantic_blob for token in positive_tokens) and not any(token in semantic_blob for token in negative_tokens)
+
+
+def _structural_validity_rank(validity: str) -> int:
+    return {
+        "not_applicable": 0,
+        "plausible_structural": 1,
+        "confirmed_structural": 2,
+    }.get(str(validity or "").strip(), 0)
+
+
+def _build_a16_column_context(a16_payload: Any) -> Dict[str, Dict[str, Any]]:
+    if not isinstance(a16_payload, dict):
+        return {}
+
+    context: Dict[str, Dict[str, Any]] = {}
+
+    def _ensure(col: str) -> Dict[str, Any]:
+        row = context.setdefault(
+            col,
+            {
+                "trigger_columns": [],
+                "structural_validity": "not_applicable",
+                "sample_based": True,
+            },
+        )
+        return row
+
+    for rule in _coerce_list_of_dicts(a16_payload.get("detected_skip_logic")):
+        trigger = str(rule.get("trigger_column") or "").strip()
+        explained_pct = _safe_float(rule.get("missing_explained_pct"), 0.0)
+        directionality = str(rule.get("directionality") or "").strip().lower()
+        validity = "confirmed_structural" if (explained_pct >= 95.0 or directionality == "bidirectional") else "plausible_structural"
+        for col in rule.get("sample_affected_columns") or []:
+            col_name = str(col or "").strip()
+            if not col_name:
+                continue
+            row = _ensure(col_name)
+            row["trigger_columns"] = _dedupe_preserve_order(list(row["trigger_columns"]) + ([trigger] if trigger else []))
+            if row["structural_validity"] != "confirmed_structural":
+                row["structural_validity"] = validity
+
+    for candidate in _coerce_list_of_dicts(a16_payload.get("master_switch_candidates")):
+        trigger = str(candidate.get("trigger_column") or "").strip()
+        for col in candidate.get("sample_affected_columns") or []:
+            col_name = str(col or "").strip()
+            if not col_name:
+                continue
+            row = _ensure(col_name)
+            row["trigger_columns"] = _dedupe_preserve_order(list(row["trigger_columns"]) + ([trigger] if trigger else []))
+            if row["structural_validity"] == "not_applicable":
+                row["structural_validity"] = "plausible_structural"
+
+    return context
+
+
+def _build_family_missingness_context(
+    column_family_map: Dict[str, str],
+    reviewed_missingness_by_col: Dict[str, Dict[str, Any]],
+    a16_by_col: Dict[str, Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    context: Dict[str, Dict[str, Any]] = {}
+
+    def _ensure(family_id: str) -> Dict[str, Any]:
+        return context.setdefault(
+            family_id,
+            {
+                "structural_validity": "not_applicable",
+                "trigger_columns": [],
+                "reviewed_structural_columns": [],
+                "evidence_columns": [],
+            },
+        )
+
+    def _apply(family_id: str, validity: str, trigger_columns: Iterable[Any], evidence_column: str, *, reviewed: bool) -> None:
+        if not family_id:
+            return
+        row = _ensure(family_id)
+        if _structural_validity_rank(validity) > _structural_validity_rank(row["structural_validity"]):
+            row["structural_validity"] = validity
+        row["trigger_columns"] = _dedupe_preserve_order(
+            list(row["trigger_columns"]) + [str(trigger).strip() for trigger in trigger_columns if str(trigger or "").strip()]
+        )
+        if evidence_column:
+            row["evidence_columns"] = _dedupe_preserve_order(list(row["evidence_columns"]) + [evidence_column])
+            if reviewed:
+                row["reviewed_structural_columns"] = _dedupe_preserve_order(list(row["reviewed_structural_columns"]) + [evidence_column])
+
+    for column, a16_row in a16_by_col.items():
+        family_id = str(column_family_map.get(column) or "").strip()
+        validity = str(a16_row.get("structural_validity") or "not_applicable").strip()
+        if family_id and validity in {"plausible_structural", "confirmed_structural"}:
+            _apply(
+                family_id,
+                validity,
+                a16_row.get("trigger_columns") or [],
+                str(column),
+                reviewed=False,
+            )
+
+    for column, reviewed_row in reviewed_missingness_by_col.items():
+        family_id = str(column_family_map.get(column) or "").strip()
+        if not family_id:
+            continue
+        disposition = str(reviewed_row.get("missingness_disposition") or "").strip()
+        validity = "not_applicable"
+        if bool(reviewed_row.get("skip_logic_protected", False)) or disposition == "structurally_valid_missingness":
+            validity = "confirmed_structural"
+        elif disposition == "partially_structural_missingness":
+            validity = "plausible_structural"
+        if validity != "not_applicable":
+            _apply(
+                family_id,
+                validity,
+                reviewed_row.get("trigger_columns") or [],
+                str(column),
+                reviewed=True,
+            )
+
+    return context
+
+
+def _normalize_transform_review_output(payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    decisions: Dict[str, Dict[str, Any]] = {}
+    for item in _coerce_list_of_dicts(payload.get("items")):
+        col = str(item.get("column") or "").strip()
+        if col:
+            decisions[col] = item
+    return decisions
+
+
+def _normalize_variable_type_review_output(payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    decisions: Dict[str, Dict[str, Any]] = {}
+    for item in _coerce_list_of_dicts(payload.get("items")):
+        col = str(item.get("column") or "").strip()
+        if col:
+            decisions[col] = item
+    return decisions
+
+
+def _normalize_missing_catalog_output(payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    decisions: Dict[str, Dict[str, Any]] = {}
+    for item in _coerce_list_of_dicts(payload.get("per_column")):
+        col = str(item.get("column") or "").strip()
+        if col:
+            decisions[col] = item
+    return decisions
+
+
+def _baseline_type_decision(
+    column: str,
+    a2_row: Optional[Dict[str, Any]],
+    a3t_row: Optional[Dict[str, Any]],
+    a3v_row: Optional[Dict[str, Any]],
+    a4_row: Optional[Dict[str, Any]],
+    a9_row: Optional[Dict[str, Any]],
+    a13_row: Optional[Dict[str, Any]],
+    a14_row: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not a2_row:
+        return {
+            "recommended_logical_type": "mixed_or_ambiguous",
+            "recommended_storage_type": "string",
+            "transform_actions": [],
+            "structural_transform_hints": [],
+            "interpretation_hints": ["mixed_content_high_risk"],
+            "normalization_notes": "",
+            "type_decision_source": "unresolved_no_a2_evidence",
+            "type_review_required": True,
+            "confidence": 0.5,
+            "applied_sources": [],
+        }
+
+    top_candidate = a2_row.get("top_candidate") or {}
+    top_type = str(top_candidate.get("type") or "").strip()
+    top_parse = str(top_candidate.get("parse") or "").strip()
+    a2_conf = _safe_float(top_candidate.get("confidence"), _safe_float(a2_row.get("confidence"), 0.6))
+    unique_ratio = _safe_float(a2_row.get("unique_ratio"), 0.0)
+    unique_count = int(a2_row.get("unique_count") or 0)
+    numeric_pct = _safe_float((a2_row.get("numeric_profile") or {}).get("parseable_pct"), 0.0)
+    datetime_pct = _safe_float((a2_row.get("datetime_profile") or {}).get("parseable_pct"), 0.0)
+    top_levels = [str(value).strip() for value in (a2_row.get("top_levels") or []) if str(value).strip()]
+    samples = [str(value).strip() for value in (((a2_row.get("a2_samples") or {}).get("random") or [])[:8]) if str(value).strip()]
+    role = str((a9_row or {}).get("primary_role") or "").strip()
+    encoding_type = str((a9_row or {}).get("encoding_type") or "").strip()
+    a3t_top_candidate = (a3t_row or {}).get("top_candidate") or {}
+    transform_type = str(a3t_top_candidate.get("type") or top_type).strip()
+    transform_parse = str(a3t_top_candidate.get("parse") or top_parse).strip()
+    transform_risk = str((a3t_row or {}).get("risk_level") or "").strip().lower()
+    transform_required = bool((a3t_row or {}).get("requires_transform", False))
+    ambiguity_gap = _safe_float((a3v_row or {}).get("confidence_gap"), 1.0)
+    ambiguity_reason = str((a3v_row or {}).get("ambiguity_reason") or "").strip()
+    missing_tokens_present = bool((a4_row or {}).get("token_breakdown") or a2_row.get("missing_tokens_observed"))
+    anchor_names = {
+        str(item.get("anchor") or "").strip()
+        for item in _coerce_list_of_dicts((a13_row or {}).get("detected_anchors"))
+        if str(item.get("anchor") or "").strip()
+    }
+    code_like_anchor = bool(anchor_names & {"US_ZIP_CODE", "ISO_COUNTRY", "STATE_CODE", "ICD10_CODE", "FISCAL_QUARTER"})
+    string_like_anchor = bool(anchor_names & {"EMAIL", "URL", "PHONE"})
+    free_text_name_hint = _column_name_has_free_text_hint(column)
+    textual_value_hint = _values_look_textual(top_levels + samples)
+    quality_score = _safe_float((a14_row or {}).get("global_quality_score"), 1.0)
+    drift_detected = bool((a14_row or {}).get("drift_detected", False))
+
+    applied_sources: List[str] = ["A2"]
+    if a3t_row:
+        applied_sources.append("A3-T")
+    if a3v_row:
+        applied_sources.append("A3-V")
+    if a4_row and missing_tokens_present:
+        applied_sources.append("A4")
+    if a9_row:
+        applied_sources.append("A9")
+    if a13_row and anchor_names:
+        applied_sources.append("A13")
+    if a14_row:
+        applied_sources.append("A14")
+
+    transform_actions: List[str] = ["trim_whitespace"]
+    structural_hints: List[str] = []
+    interpretation_hints: List[str] = []
+    logical_type = "mixed_or_ambiguous"
+    storage_type = "string"
+    normalization_notes = ""
+
+    if role == "id_key":
+        logical_type = "identifier"
+        storage_type = "string"
+        transform_actions = ["trim_whitespace", "cast_to_string"]
+        interpretation_hints = ["identifier_not_measure"]
+        if numeric_pct >= 80.0:
+            interpretation_hints.append("numeric_parse_is_misleading")
+        if _has_leading_zero_risk(top_levels + samples):
+            interpretation_hints.append("leading_zero_risk")
+        normalization_notes = "Baseline typing preserves identifier semantics as string storage."
+    elif role == "time_index" or top_type in {"date", "datetime"} or datetime_pct >= 80.0:
+        logical_type = "datetime" if top_type == "datetime" or "time" in column.lower() or "timestamp" in column.lower() else "date"
+        storage_type = logical_type
+        transform_actions = ["trim_whitespace", "cast_to_datetime" if logical_type == "datetime" else "cast_to_date"]
+        interpretation_hints = ["time_index_not_identifier"]
+        normalization_notes = "Baseline typing preserves temporal semantics from parse evidence and role signals."
+    elif role == "repeat_index":
+        logical_type = "ordinal_category" if (_looks_integer_like(top_levels + samples) or encoding_type == "ordinal") else "categorical_code"
+        storage_type = "string"
+        transform_actions = ["trim_whitespace", "cast_to_string"] if _looks_numeric_like(top_levels + samples) else ["trim_whitespace", "normalize_category_tokens"]
+        interpretation_hints = ["repeat_context_do_not_use_as_base_key"]
+        if _looks_numeric_like(top_levels + samples):
+            interpretation_hints.append("numeric_parse_is_misleading")
+        normalization_notes = "Baseline typing preserves repeat-index semantics without promoting the field to a base identifier."
+    elif transform_type in {"numeric_range", "range_like"}:
+        logical_type = "mixed_or_ambiguous"
+        storage_type = "string"
+        transform_actions = ["trim_whitespace", "cast_to_string"]
+        structural_hints = ["split_range_into_start_end", "requires_range_semantics_review"]
+        interpretation_hints = ["mixed_content_high_risk"]
+        normalization_notes = "Range-like values need structural follow-up before safe numeric modeling."
+    elif transform_type == "numeric_with_unit" or transform_parse == "currency+suffix_possible":
+        logical_type = "numeric_measure"
+        storage_type = "decimal"
+        transform_actions = ["trim_whitespace", "extract_numeric_component", "strip_unit_suffix", "cast_to_decimal"]
+        structural_hints = ["requires_unit_normalization_review"]
+        normalization_notes = "Baseline typing keeps unit-bearing values numeric while preserving later unit-normalization review."
+    elif transform_type == "percent" or transform_parse == "percent_possible":
+        logical_type = "numeric_measure"
+        storage_type = "decimal"
+        transform_actions = ["trim_whitespace", "strip_numeric_formatting", "standardize_percent_scale", "cast_to_decimal"]
+        normalization_notes = "Baseline typing standardizes percentage-like values into decimal numeric storage."
+    elif transform_type == "categorical_multi":
+        logical_type = "categorical_code" if (code_like_anchor or role == "coded_categorical") else "nominal_category"
+        storage_type = "string"
+        transform_actions = ["trim_whitespace", "normalize_category_tokens"]
+        structural_hints = ["split_multiselect_tokens", "requires_multiselect_modeling_decision"]
+        if code_like_anchor or role == "coded_categorical":
+            structural_hints.append("requires_codebook_or_label_mapping_review")
+            interpretation_hints.append("code_not_quantity")
+        normalization_notes = "Baseline typing keeps multi-value cells as string-backed categories pending structural token-splitting."
+    elif _boolean_like(top_levels):
+        logical_type = "boolean_flag"
+        storage_type = "boolean"
+        transform_actions = ["trim_whitespace", "normalize_boolean_tokens"]
+        normalization_notes = "Baseline typing treats the column as boolean-like based on observed value vocabulary."
+    elif role == "measure_item" and (_ordinal_like(top_levels, encoding_type) or encoding_type == "ordinal" or unique_count <= 7):
+        logical_type = "ordinal_category"
+        storage_type = "string"
+        if _looks_numeric_like(top_levels + samples):
+            transform_actions = ["trim_whitespace", "strip_numeric_formatting", "cast_to_string"]
+            interpretation_hints = ["numeric_parse_is_misleading"]
+        else:
+            transform_actions = ["trim_whitespace", "normalize_category_tokens"]
+        normalization_notes = "Baseline typing preserves item-style response values as ordered categories."
+    elif code_like_anchor or role == "coded_categorical":
+        logical_type = "categorical_code"
+        storage_type = "string"
+        transform_actions = ["trim_whitespace", "cast_to_string"]
+        structural_hints = ["requires_codebook_or_label_mapping_review"]
+        interpretation_hints = ["code_not_quantity"]
+        if _looks_numeric_like(top_levels + samples):
+            transform_actions.insert(1, "strip_numeric_formatting")
+            interpretation_hints.append("numeric_parse_is_misleading")
+        normalization_notes = "Baseline typing preserves code-like values as strings rather than quantities."
+    elif string_like_anchor:
+        logical_type = "free_text"
+        storage_type = "string"
+        transform_actions = ["trim_whitespace", "cast_to_string"]
+        interpretation_hints = ["free_text_high_cardinality"]
+        normalization_notes = "Anchor evidence indicates structured string content that should be preserved as text."
+    elif free_text_name_hint and (textual_value_hint or top_type in {"text", "mixed"} or unique_ratio >= 0.35 or unique_count >= 20):
+        logical_type = "free_text"
+        storage_type = "string"
+        transform_actions = ["trim_whitespace", "cast_to_string"]
+        interpretation_hints = ["free_text_high_cardinality"]
+        if numeric_pct >= 80.0:
+            interpretation_hints.append("numeric_parse_is_misleading")
+        normalization_notes = "Column naming and observed samples indicate open-response text, so baseline typing preserves string content even when parser signals are noisy."
+    elif top_type in {"numeric"} or (numeric_pct >= 80.0 and role not in {"coded_categorical", "measure_item", "repeat_index"}):
+        logical_type = "numeric_measure"
+        storage_type = "integer" if _looks_integer_like(top_levels + samples) else "decimal"
+        transform_actions = ["trim_whitespace", "strip_numeric_formatting", "cast_to_integer" if storage_type == "integer" else "cast_to_decimal"]
+        normalization_notes = "Baseline typing keeps numeric parse evidence as measure semantics."
+    elif _ordinal_like(top_levels, encoding_type):
+        logical_type = "ordinal_category"
+        storage_type = "string"
+        transform_actions = ["trim_whitespace", "normalize_category_tokens"]
+        normalization_notes = "Baseline typing uses ordinal category semantics from value vocabulary and role evidence."
+    elif top_type in {"text"} and (unique_ratio >= 0.5 or unique_count >= 50 or textual_value_hint):
+        logical_type = "free_text"
+        storage_type = "string"
+        transform_actions = ["trim_whitespace", "cast_to_string"]
+        interpretation_hints = ["free_text_high_cardinality"]
+        normalization_notes = "Baseline typing preserves high-cardinality text as free-form string content."
+    elif top_type in {"categorical", "mixed", "text"} or role in {"invariant_attr", "measure_item"}:
+        logical_type = "nominal_category"
+        storage_type = "string"
+        transform_actions = ["trim_whitespace", "normalize_category_tokens"]
+        normalization_notes = "Baseline typing keeps low-cardinality values as string-backed categories."
+    else:
+        logical_type = "mixed_or_ambiguous"
+        storage_type = "string"
+        transform_actions = ["trim_whitespace", "cast_to_string"]
+        interpretation_hints = ["mixed_content_high_risk"]
+        normalization_notes = "Baseline typing remains conservative because the profiler evidence is mixed."
+
+    if missing_tokens_present and "normalize_missing_tokens" not in transform_actions:
+        transform_actions.append("normalize_missing_tokens")
+
+    if ambiguity_reason:
+        interpretation_hints.append("mixed_content_high_risk")
+        if logical_type not in {"identifier", "date", "datetime"} and ambiguity_gap <= 0.08 and a2_conf < 0.78:
+            logical_type = "mixed_or_ambiguous"
+            storage_type = "string"
+            transform_actions = ["trim_whitespace", "cast_to_string"]
+            structural_hints = []
+            normalization_notes = "A3-V shows unresolved semantic ambiguity, so the deterministic baseline remains conservative."
+
+    type_review_required = bool(
+        logical_type == "mixed_or_ambiguous"
+        or a2_conf < 0.75
+        or ambiguity_reason
+        or transform_risk in {"high", "medium"}
+        or (drift_detected and quality_score < 0.85)
+    )
+
+    confidence = min(0.84, max(0.55, a2_conf))
+    if ambiguity_reason:
+        confidence = min(confidence, 0.68)
+    if transform_risk == "high":
+        confidence = min(confidence, 0.7)
+    elif transform_risk == "medium":
+        confidence = min(confidence, 0.74)
+    if drift_detected:
+        confidence = min(confidence, 0.76)
+    if logical_type == "mixed_or_ambiguous":
+        confidence = min(confidence, 0.58)
+
+    return {
+        "recommended_logical_type": logical_type,
+        "recommended_storage_type": storage_type,
+        "transform_actions": _dedupe_preserve_order(action for action in transform_actions if action in TYPE_TRANSFORM_ACTIONS),
+        "structural_transform_hints": _dedupe_preserve_order(hint for hint in structural_hints if hint in TYPE_STRUCTURAL_HINTS),
+        "interpretation_hints": _dedupe_preserve_order(hint for hint in interpretation_hints if hint in TYPE_INTERPRETATION_HINTS),
+        "normalization_notes": normalization_notes,
+        "type_decision_source": "a17_baseline",
+        "type_review_required": type_review_required,
+        "confidence": round(max(0.0, min(1.0, confidence)), 6),
+        "applied_sources": _dedupe_preserve_order(applied_sources),
+    }
+
+
+def _baseline_missingness_decision(
+    column: str,
+    a2_row: Optional[Dict[str, Any]],
+    a4_row: Optional[Dict[str, Any]],
+    a16_row: Optional[Dict[str, Any]],
+    a14_row: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if not a2_row and not a4_row:
+        return {
+            "missingness_disposition": "mixed_missingness_risk",
+            "missingness_handling": "review_before_drop",
+            "skip_logic_protected": False,
+            "normalization_notes": "",
+            "missingness_decision_source": "unresolved_no_a2_evidence",
+            "missingness_review_required": True,
+            "confidence": 0.5,
+            "applied_sources": [],
+        }
+
+    missing_pct = _safe_float((a4_row or {}).get("missing_pct"), _safe_float((a2_row or {}).get("missing_pct"), 0.0))
+    token_breakdown = (a4_row or {}).get("token_breakdown") or (a2_row or {}).get("missing_tokens_observed") or {}
+    token_missing = bool(token_breakdown)
+    structural_validity = str((a16_row or {}).get("structural_validity") or "not_applicable").strip()
+    drift_detected = bool((a14_row or {}).get("drift_detected", False))
+
+    applied_sources: List[str] = ["A4" if a4_row else "A2"]
+    if a16_row:
+        applied_sources.append("A16")
+    if a14_row and drift_detected:
+        applied_sources.append("A14")
+
+    if structural_validity == "confirmed_structural":
+        disposition = "structurally_valid_missingness"
+        handling = "protect_from_null_penalty"
+        skip_logic_protected = True
+        notes = "A16 surfaced direct skip-logic evidence for this field."
+        review_required = False
+        confidence = 0.84
+    elif structural_validity == "plausible_structural":
+        disposition = "partially_structural_missingness"
+        handling = "retain_with_caution"
+        skip_logic_protected = False
+        notes = "A16 surfaced plausible but not definitive structural missingness evidence."
+        review_required = True
+        confidence = 0.72
+    elif missing_pct < 5.0 and not token_missing:
+        disposition = "no_material_missingness"
+        handling = "no_action_needed"
+        skip_logic_protected = False
+        notes = "Missingness is low and no explicit token-based cleanup signal is present."
+        review_required = False
+        confidence = 0.76
+    elif token_missing and missing_pct < 40.0:
+        disposition = "token_missingness_present"
+        handling = "retain_with_caution"
+        skip_logic_protected = False
+        notes = "A4 shows explicit missing-like tokens that should be standardized cautiously."
+        review_required = False
+        confidence = 0.7
+    elif missing_pct >= 80.0:
+        disposition = "unexplained_high_missingness"
+        handling = "candidate_drop_review"
+        skip_logic_protected = False
+        notes = "Missingness is very high and not structurally explained by available A16 evidence."
+        review_required = True
+        confidence = 0.62
+    elif missing_pct >= 50.0:
+        disposition = "mixed_missingness_risk"
+        handling = "review_before_drop"
+        skip_logic_protected = False
+        notes = "Missingness is materially high without direct structural proof."
+        review_required = True
+        confidence = 0.64
+    elif token_missing or missing_pct >= 20.0:
+        disposition = "mixed_missingness_risk"
+        handling = "retain_with_caution"
+        skip_logic_protected = False
+        notes = "Missingness is present but not strongly structural in deterministic baseline evidence."
+        review_required = False
+        confidence = 0.68
+    else:
+        disposition = "no_material_missingness"
+        handling = "no_action_needed"
+        skip_logic_protected = False
+        notes = ""
+        review_required = False
+        confidence = 0.72
+
+    if drift_detected and missing_pct >= 20.0:
+        confidence = min(confidence, 0.7)
+        review_required = True
+
+    return {
+        "missingness_disposition": disposition,
+        "missingness_handling": handling,
+        "skip_logic_protected": skip_logic_protected,
+        "normalization_notes": notes,
+        "missingness_decision_source": "a17_baseline",
+        "missingness_review_required": review_required,
+        "confidence": round(max(0.0, min(1.0, confidence)), 6),
+        "applied_sources": _dedupe_preserve_order(applied_sources),
+    }
+
+
+def _build_baseline_column_resolution_artifact(
+    a2_rows: List[Dict[str, Any]],
+    a3t_payload: Optional[Dict[str, Any]],
+    a3v_payload: Optional[Dict[str, Any]],
+    a4_payload: Optional[Dict[str, Any]],
+    a9_payload: Optional[Dict[str, Any]],
+    a13_payload: Optional[Dict[str, Any]],
+    a14_payload: Optional[Dict[str, Any]],
+    a16_payload: Optional[Dict[str, Any]],
+    artifact_inputs: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    a3t_by_col = _normalize_transform_review_output(a3t_payload or {})
+    a3v_by_col = _normalize_variable_type_review_output(a3v_payload or {})
+    a4_by_col = _normalize_missing_catalog_output(a4_payload or {})
+    a9_by_col = {
+        str(item.get("column") or "").strip(): item
+        for item in _coerce_list_of_dicts((a9_payload or {}).get("columns"))
+        if str(item.get("column") or "").strip()
+    }
+    a13_by_col = {
+        str(item.get("column") or "").strip(): item
+        for item in _coerce_list_of_dicts((a13_payload or {}).get("columns"))
+        if str(item.get("column") or "").strip()
+    }
+    a14_by_col = {
+        str(item.get("column") or "").strip(): item
+        for item in _coerce_list_of_dicts((a14_payload or {}).get("columns"))
+        if str(item.get("column") or "").strip()
+    }
+    a16_by_col = _build_a16_column_context(a16_payload or {})
+
+    rows: List[Dict[str, Any]] = []
+    for a2_row in a2_rows:
+        column = str(a2_row.get("column") or "").strip()
+        if not column:
+            continue
+        a3t_row = a3t_by_col.get(column)
+        a3v_row = a3v_by_col.get(column)
+        a4_row = a4_by_col.get(column)
+        a9_row = a9_by_col.get(column)
+        a13_row = a13_by_col.get(column)
+        a14_row = a14_by_col.get(column)
+        a16_row = a16_by_col.get(column)
+
+        type_decision = _baseline_type_decision(
+            column=column,
+            a2_row=a2_row,
+            a3t_row=a3t_row,
+            a3v_row=a3v_row,
+            a4_row=a4_row,
+            a9_row=a9_row,
+            a13_row=a13_row,
+            a14_row=a14_row,
+        )
+        missingness_decision = _baseline_missingness_decision(
+            column=column,
+            a2_row=a2_row,
+            a4_row=a4_row,
+            a16_row=a16_row,
+            a14_row=a14_row,
+        )
+
+        row_needs_review = bool(
+            type_decision["type_review_required"]
+            or missingness_decision["missingness_review_required"]
+            or (
+                bool((a14_row or {}).get("drift_detected", False))
+                and type_decision["recommended_logical_type"] in {"date", "datetime", "mixed_or_ambiguous"}
+            )
+        )
+
+        rows.append(
+            {
+                "column": column,
+                "a9_primary_role": str((a9_row or {}).get("primary_role") or ""),
+                "recommended_logical_type": str(type_decision["recommended_logical_type"]),
+                "recommended_storage_type": str(type_decision["recommended_storage_type"]),
+                "transform_actions": list(type_decision["transform_actions"]),
+                "structural_transform_hints": list(type_decision["structural_transform_hints"]),
+                "interpretation_hints": list(type_decision["interpretation_hints"]),
+                "missingness_disposition": str(missingness_decision["missingness_disposition"]),
+                "missingness_handling": str(missingness_decision["missingness_handling"]),
+                "skip_logic_protected": bool(missingness_decision["skip_logic_protected"]),
+                "type_normalization_notes": str(type_decision.get("normalization_notes") or ""),
+                "missingness_normalization_notes": str(missingness_decision.get("normalization_notes") or ""),
+                "quality_score": round(_safe_float((a14_row or {}).get("global_quality_score")), 6) if isinstance((a14_row or {}).get("global_quality_score"), (int, float)) else None,
+                "drift_detected": bool((a14_row or {}).get("drift_detected", False)) if isinstance((a14_row or {}).get("drift_detected"), bool) else None,
+                "type_decision_source": str(type_decision["type_decision_source"]),
+                "missingness_decision_source": str(missingness_decision["missingness_decision_source"]),
+                "type_confidence": round(_safe_float(type_decision.get("confidence"), 0.0), 6),
+                "missingness_confidence": round(_safe_float(missingness_decision.get("confidence"), 0.0), 6),
+                "type_review_required": bool(type_decision["type_review_required"]),
+                "missingness_review_required": bool(missingness_decision["missingness_review_required"]),
+                "needs_human_review": row_needs_review,
+                "confidence": _resolve_contract_confidence(
+                    a2_row=a2_row,
+                    type_confidence=_safe_float(type_decision.get("confidence"), 0.0),
+                    missingness_confidence=_safe_float(missingness_decision.get("confidence"), 0.0),
+                    needs_human_review=row_needs_review,
+                    conflict_count=0,
+                    unresolved=False,
+                    drift_detected=(a14_row or {}).get("drift_detected") if isinstance((a14_row or {}).get("drift_detected"), bool) else None,
+                ),
+                "applied_sources": _dedupe_preserve_order(
+                    list(type_decision.get("applied_sources") or []) + list(missingness_decision.get("applied_sources") or [])
+                ),
+            }
+        )
+
+    return {
+        "artifact": "A17",
+        "purpose": "baseline_column_resolution",
+        "inputs": ((artifact_inputs or {}).get("A17") or {"uses": ["A2", "A3-T", "A3-V", "A4", "A9", "A13", "A14", "A16"]}),
+        "summary": {
+            "total_columns": len(rows),
+            "type_review_candidate_count": sum(1 for row in rows if row.get("type_review_required")),
+            "missingness_review_candidate_count": sum(1 for row in rows if row.get("missingness_review_required")),
+            "skip_logic_protected_count": sum(1 for row in rows if row.get("skip_logic_protected")),
+        },
+        "columns": rows,
+    }
+
+
+def _normalize_existing_baseline_resolution(payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    rows: Dict[str, Dict[str, Any]] = {}
+    for item in _coerce_list_of_dicts(payload.get("columns")):
+        col = str(item.get("column") or "").strip()
+        if col:
+            rows[col] = item
+    return rows
+
+
+def _load_canonical_support_artifacts(run_id: str) -> Dict[str, Any]:
+    kind, a2_payload, _ = _get_decoded_payload(run_id=run_id, artifact_id="A2")
+    if kind != "jsonl" or not isinstance(a2_payload, list):
+        raise HTTPException(status_code=422, detail="A2 must decode to a JSONL array for canonical contract synthesis")
+
+    a2_rows = [row for row in a2_payload if isinstance(row, dict) and str(row.get("column") or "").strip()]
+    if not a2_rows:
+        raise HTTPException(status_code=422, detail="A2 does not contain any usable source columns")
+
+    missing_artifacts: List[str] = []
+
+    a3t_kind, a3t_payload, _, missing = _load_optional_decoded_payload(run_id, "A3-T")
+    if missing:
+        missing_artifacts.append(missing)
+    a3v_kind, a3v_payload, _, missing = _load_optional_decoded_payload(run_id, "A3-V")
+    if missing:
+        missing_artifacts.append(missing)
+    a4_kind, a4_payload, _, missing = _load_optional_decoded_payload(run_id, "A4")
+    if missing:
+        missing_artifacts.append(missing)
+    a9_kind, a9_payload, _, missing = _load_optional_decoded_payload(run_id, "A9")
+    if missing:
+        missing_artifacts.append(missing)
+    a13_kind, a13_payload, _, missing = _load_optional_decoded_payload(run_id, "A13")
+    if missing:
+        missing_artifacts.append(missing)
+    a14_kind, a14_payload, _, missing = _load_optional_decoded_payload(run_id, "A14")
+    if missing:
+        missing_artifacts.append(missing)
+    a16_kind, a16_payload, _, missing = _load_optional_decoded_payload(run_id, "A16")
+    if missing:
+        missing_artifacts.append(missing)
+    a17_kind, a17_payload, _, _ = _load_optional_decoded_payload(run_id, "A17")
+
+    a9_rows = _coerce_list_of_dicts((a9_payload or {}).get("columns")) if a9_kind == "json" and isinstance(a9_payload, dict) else []
+    a13_rows = _coerce_list_of_dicts((a13_payload or {}).get("columns")) if a13_kind == "json" and isinstance(a13_payload, dict) else []
+    a14_rows = _coerce_list_of_dicts((a14_payload or {}).get("columns")) if a14_kind == "json" and isinstance(a14_payload, dict) else []
+    a16_payload_obj = a16_payload if a16_kind == "json" and isinstance(a16_payload, dict) else {}
+    a16_context = _build_a16_column_context(a16_payload_obj)
+
+    a17_by_col = _normalize_existing_baseline_resolution(a17_payload if a17_kind == "json" and isinstance(a17_payload, dict) else {})
+    a17_backfilled = False
+    if not a17_by_col:
+        a17_backfilled = True
+        synthesized_a17 = _build_baseline_column_resolution_artifact(
+            a2_rows=a2_rows,
+            a3t_payload=a3t_payload if a3t_kind == "json" and isinstance(a3t_payload, dict) else {},
+            a3v_payload=a3v_payload if a3v_kind == "json" and isinstance(a3v_payload, dict) else {},
+            a4_payload=a4_payload if a4_kind == "json" and isinstance(a4_payload, dict) else {},
+            a9_payload=a9_payload if a9_kind == "json" and isinstance(a9_payload, dict) else {},
+            a13_payload=a13_payload if a13_kind == "json" and isinstance(a13_payload, dict) else {},
+            a14_payload=a14_payload if a14_kind == "json" and isinstance(a14_payload, dict) else {},
+            a16_payload=a16_payload_obj,
+        )
+        a17_by_col = _normalize_existing_baseline_resolution(synthesized_a17)
+
+    return {
+        "a2_rows": a2_rows,
+        "a2_by_col": {str(row.get("column")).strip(): row for row in a2_rows},
+        "a2_order": [str(row.get("column")).strip() for row in a2_rows],
+        "a9_by_col": {
+            str(row.get("column")).strip(): row
+            for row in a9_rows
+            if str(row.get("column") or "").strip()
+        },
+        "a13_by_col": {
+            str(row.get("column")).strip(): row
+            for row in a13_rows
+            if str(row.get("column") or "").strip()
+        },
+        "a14_by_col": {
+            str(row.get("column")).strip(): row
+            for row in a14_rows
+            if str(row.get("column") or "").strip()
+        },
+        "a16_by_col": a16_context,
+        "a17_by_col": a17_by_col,
+        "family_by_column": _family_column_map(run_id),
+        "missing_artifacts": missing_artifacts,
+        "a17_backfilled": a17_backfilled,
+    }
+
+
+def _normalize_light_contract_maps(decisions: Dict[str, Any]) -> Dict[str, Any]:
+    primary_keys = _dedupe_preserve_order((decisions.get("primary_grain_decision") or {}).get("keys") or [])
+
+    reference_table_by_key: Dict[str, str] = {}
+    for ref in _coerce_list_of_dicts(decisions.get("reference_decisions") or decisions.get("dimension_decisions")):
+        table_name = str(ref.get("table_name") or "").strip()
+        for key in ref.get("keys") or []:
+            col = str(key or "").strip()
+            if col and table_name and col not in reference_table_by_key:
+                reference_table_by_key[col] = table_name
+
+    family_by_id: Dict[str, Dict[str, Any]] = {}
+    for family in _coerce_list_of_dicts(decisions.get("family_decisions")):
+        family_id = str(family.get("family_id") or "").strip()
+        if family_id:
+            family_by_id[family_id] = family
+
+    return {
+        "primary_keys": primary_keys,
+        "reference_table_by_key": reference_table_by_key,
+        "family_by_id": family_by_id,
+    }
+
+
+def _normalize_type_output(payload: Dict[str, Any]) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
+    decisions: Dict[str, Dict[str, Any]] = {}
+    for item in _coerce_list_of_dicts(payload.get("column_decisions")):
+        col = str(item.get("column") or "").strip()
+        if col:
+            decisions[col] = item
+
+    deduped_rules: List[Dict[str, Any]] = []
+    seen_rule_names: Set[str] = set()
+    for item in _coerce_list_of_dicts(payload.get("global_transform_rules")):
+        rule_name = str(item.get("rule_name") or "").strip()
+        applies_when = str(item.get("applies_when") or "").strip()
+        description = str(item.get("rule_description") or "").strip()
+        if not (rule_name and applies_when and description) or rule_name in seen_rule_names:
+            continue
+        seen_rule_names.add(rule_name)
+        deduped_rules.append(
+            {
+                "rule_name": rule_name,
+                "applies_when": applies_when,
+                "rule_description": description,
+            }
+        )
+
+    return decisions, deduped_rules
+
+
+def _normalize_missingness_output(payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    decisions: Dict[str, Dict[str, Any]] = {}
+    for item in _coerce_list_of_dicts(payload.get("column_decisions")):
+        col = str(item.get("column") or "").strip()
+        if col:
+            decisions[col] = item
+    return decisions
+
+
+def _extract_family_results(payload: Any) -> Dict[str, Dict[str, Any]]:
+    results: Dict[str, Dict[str, Any]] = {}
+
+    def _maybe_add(item: Any) -> None:
+        if not isinstance(item, dict):
+            return
+        candidate = item.get("family_result") if isinstance(item.get("family_result"), dict) else item
+        family_id = str(candidate.get("family_id") or "").strip()
+        if family_id and family_id not in results:
+            results[family_id] = candidate
+
+    if isinstance(payload, dict):
+        if isinstance(payload.get("family_results"), list):
+            for item in payload.get("family_results") or []:
+                _maybe_add(item)
+        else:
+            _maybe_add(payload)
+        for key in ("items", "results"):
+            if isinstance(payload.get(key), list):
+                for item in payload.get(key) or []:
+                    _maybe_add(item)
+    elif isinstance(payload, list):
+        for item in payload:
+            _maybe_add(item)
+
+    return results
+
+
+def _normalize_family_member_defaults(payload: Any) -> Dict[str, Dict[str, Any]]:
+    results: Dict[str, Dict[str, Any]] = {}
+
+    def _maybe_add(item: Any) -> None:
+        if not isinstance(item, dict):
+            return
+        candidate = item.get("family_result") if isinstance(item.get("family_result"), dict) else item
+        family_id = str(candidate.get("family_id") or item.get("family_id") or "").strip()
+        raw_defaults = item.get("member_defaults")
+        if not isinstance(raw_defaults, dict) and isinstance(candidate.get("member_defaults"), dict):
+            raw_defaults = candidate.get("member_defaults")
+        if not family_id or not isinstance(raw_defaults, dict):
+            return
+
+        provided_fields: List[str] = []
+        normalized: Dict[str, Any] = {}
+
+        if str(raw_defaults.get("recommended_logical_type") or "").strip() in TYPE_LOGICAL_TYPES:
+            normalized["recommended_logical_type"] = str(raw_defaults.get("recommended_logical_type")).strip()
+            provided_fields.append("recommended_logical_type")
+        if str(raw_defaults.get("recommended_storage_type") or "").strip() in TYPE_STORAGE_TYPES:
+            normalized["recommended_storage_type"] = str(raw_defaults.get("recommended_storage_type")).strip()
+            provided_fields.append("recommended_storage_type")
+        if "transform_actions" in raw_defaults and isinstance(raw_defaults.get("transform_actions"), list):
+            normalized["transform_actions"] = _dedupe_preserve_order(
+                action for action in raw_defaults.get("transform_actions") or [] if str(action or "").strip() in TYPE_TRANSFORM_ACTIONS
+            )
+            provided_fields.append("transform_actions")
+        if "structural_transform_hints" in raw_defaults and isinstance(raw_defaults.get("structural_transform_hints"), list):
+            normalized["structural_transform_hints"] = _dedupe_preserve_order(
+                hint for hint in raw_defaults.get("structural_transform_hints") or [] if str(hint or "").strip() in TYPE_STRUCTURAL_HINTS
+            )
+            provided_fields.append("structural_transform_hints")
+        if "interpretation_hints" in raw_defaults and isinstance(raw_defaults.get("interpretation_hints"), list):
+            normalized["interpretation_hints"] = _dedupe_preserve_order(
+                hint for hint in raw_defaults.get("interpretation_hints") or [] if str(hint or "").strip() in TYPE_INTERPRETATION_HINTS
+            )
+            provided_fields.append("interpretation_hints")
+        if str(raw_defaults.get("missingness_disposition") or "").strip() in MISSINGNESS_DISPOSITIONS:
+            normalized["missingness_disposition"] = str(raw_defaults.get("missingness_disposition")).strip()
+            provided_fields.append("missingness_disposition")
+        if str(raw_defaults.get("missingness_handling") or "").strip() in MISSINGNESS_HANDLING:
+            normalized["missingness_handling"] = str(raw_defaults.get("missingness_handling")).strip()
+            provided_fields.append("missingness_handling")
+        if "skip_logic_protected" in raw_defaults and isinstance(raw_defaults.get("skip_logic_protected"), bool):
+            normalized["skip_logic_protected"] = bool(raw_defaults.get("skip_logic_protected"))
+            provided_fields.append("skip_logic_protected")
+        if "normalization_notes" in raw_defaults:
+            normalized["normalization_notes"] = str(raw_defaults.get("normalization_notes") or "").strip()
+            provided_fields.append("normalization_notes")
+
+        normalized["confidence"] = round(max(0.0, min(1.0, _safe_float(raw_defaults.get("confidence"), 0.74))), 6)
+        normalized["needs_human_review"] = bool(raw_defaults.get("needs_human_review", False))
+        normalized["applied_sources"] = ["family_worker.member_defaults"]
+        normalized["provided_fields"] = provided_fields
+
+        if provided_fields:
+            results[family_id] = normalized
+
+    if isinstance(payload, dict):
+        if isinstance(payload.get("family_results"), list):
+            for item in payload.get("family_results") or []:
+                _maybe_add(item)
+        else:
+            _maybe_add(payload)
+        for key in ("items", "results"):
+            if isinstance(payload.get(key), list):
+                for item in payload.get(key) or []:
+                    _maybe_add(item)
+    elif isinstance(payload, list):
+        for item in payload:
+            _maybe_add(item)
+
+    return results
+
+
+def _normalize_table_layout_output(payload: Dict[str, Any]) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    assignments_by_col: Dict[str, Dict[str, Any]] = {}
+    for row in _coerce_list_of_dicts(payload.get("column_table_assignments")):
+        col = str(row.get("column") or "").strip()
+        if col:
+            assignments_by_col[col] = row
+
+    tables_by_name: Dict[str, Dict[str, Any]] = {}
+    for table in _coerce_list_of_dicts(payload.get("table_suggestions")):
+        name = str(table.get("table_name") or "").strip()
+        if name:
+            tables_by_name[name] = table
+
+    return assignments_by_col, tables_by_name
+
+
+def _normalize_semantic_context(
+    payload: Dict[str, Any],
+    known_columns: Set[str],
+    known_family_ids: Set[str],
+) -> Dict[str, Any]:
+    if payload.get("status") == "skipped":
+        return {
+            "skip": True,
+            "skip_reason": str(payload.get("reason") or "").strip(),
+            "important_by_column": {},
+            "important_by_family": {},
+            "codebook_by_column": {},
+            "extra_columns": set(),
+        }
+
+    important_by_column: Dict[str, Dict[str, Any]] = {}
+    important_by_family: Dict[str, Dict[str, Any]] = {}
+    codebook_by_column: Dict[str, Dict[str, Any]] = {}
+    extra_columns: Set[str] = set()
+
+    for item in _coerce_list_of_dicts(payload.get("important_variables")):
+        target = str(item.get("column_or_family") or "").strip()
+        kind = str(item.get("kind") or "").strip()
+        if not target:
+            continue
+        if kind == "family_context" or (target in known_family_ids and target not in known_columns):
+            important_by_family[target] = _pick_higher_confidence(important_by_family.get(target), item)
+        elif target in known_columns:
+            important_by_column[target] = _pick_higher_confidence(important_by_column.get(target), item)
+        else:
+            extra_columns.add(target)
+
+    for item in _coerce_list_of_dicts(payload.get("codebook_hints")):
+        target = str(item.get("column") or "").strip()
+        if not target:
+            continue
+        if target in known_columns:
+            codebook_by_column[target] = _pick_higher_confidence(codebook_by_column.get(target), item)
+        else:
+            extra_columns.add(target)
+
+    return {
+        "skip": False,
+        "skip_reason": "",
+        "important_by_column": important_by_column,
+        "important_by_family": important_by_family,
+        "codebook_by_column": codebook_by_column,
+        "extra_columns": extra_columns,
+    }
+
+
+def _resolve_structure_for_column(
+    column: str,
+    assignments_by_col: Dict[str, Dict[str, Any]],
+    tables_by_name: Dict[str, Dict[str, Any]],
+    light_contract_maps: Dict[str, Any],
+    family_by_column: Dict[str, str],
+) -> Dict[str, Any]:
+    assignment = assignments_by_col.get(column)
+    if assignment:
+        assigned_table = str(assignment.get("assigned_table") or "").strip()
+        assignment_role = str(assignment.get("assignment_role") or "unresolved").strip() or "unresolved"
+        source_family_id = str(assignment.get("source_family_id") or "").strip() or family_by_column.get(column, "")
+        table_kind = str((tables_by_name.get(assigned_table) or {}).get("kind") or "").strip()
+        modeling_status = "base_field"
+        if assignment_role == "exclude_from_outputs":
+            modeling_status = "excluded_from_outputs"
+            assigned_table = ""
+        elif assignment_role == "unresolved":
+            modeling_status = "unresolved"
+            assigned_table = ""
+        elif table_kind == "event_table":
+            modeling_status = "event_field"
+        elif assignment_role in {"reference_key", "reference_attribute", "reference_value"} or table_kind == "reference_lookup":
+            modeling_status = "reference_field"
+        elif assignment_role in {"repeat_parent_key", "repeat_index", "melt_member"} or table_kind == "child_repeat":
+            modeling_status = "child_repeat_member"
+        return {
+            "canonical_modeling_status": modeling_status,
+            "canonical_table_name": assigned_table,
+            "canonical_assignment_role": assignment_role if assignment_role in CANONICAL_ASSIGNMENT_ROLES else "unresolved",
+            "source_family_id": source_family_id,
+            "structure_decision_source": "table_layout_worker",
+            "table_kind": table_kind,
+        }
+
+    reference_table = str((light_contract_maps.get("reference_table_by_key") or {}).get(column) or "").strip()
+    if reference_table:
+        return {
+            "canonical_modeling_status": "reference_field",
+            "canonical_table_name": reference_table,
+            "canonical_assignment_role": "reference_key",
+            "source_family_id": "",
+            "structure_decision_source": "light_contract_fallback",
+            "table_kind": "reference_lookup",
+        }
+
+    family_id = family_by_column.get(column, "")
+    family_decision = (light_contract_maps.get("family_by_id") or {}).get(family_id) or {}
+    family_table_name = str(family_decision.get("table_name") or "").strip()
+    if family_id and family_table_name:
+        return {
+            "canonical_modeling_status": "child_repeat_member",
+            "canonical_table_name": family_table_name,
+            "canonical_assignment_role": "melt_member",
+            "source_family_id": family_id,
+            "structure_decision_source": "light_contract_fallback",
+            "table_kind": "child_repeat",
+        }
+
+    return {
+        "canonical_modeling_status": "unresolved",
+        "canonical_table_name": "",
+        "canonical_assignment_role": "unresolved",
+        "source_family_id": family_id,
+        "structure_decision_source": "unresolved",
+        "table_kind": "",
+    }
+
+
+def _resolve_semantic_enrichment(
+    column: str,
+    source_family_id: str,
+    semantic_index: Dict[str, Any],
+    family_results_by_id: Dict[str, Dict[str, Any]],
+    a13_row: Dict[str, Any],
+) -> Dict[str, Any]:
+    codebook_hint = semantic_index["codebook_by_column"].get(column)
+    if codebook_hint:
+        return {
+            "semantic_meaning": str(codebook_hint.get("meaning") or "").strip(),
+            "codebook_note": str(codebook_hint.get("codes_or_labels_note") or "").strip(),
+            "semantic_decision_source": "semantic_context_worker",
+            "semantic_kind": "codebook_hint",
+        }
+
+    important = semantic_index["important_by_column"].get(column)
+    if important:
+        return {
+            "semantic_meaning": str(important.get("meaning") or "").strip(),
+            "codebook_note": "",
+            "semantic_decision_source": "semantic_context_worker",
+            "semantic_kind": str(important.get("kind") or "").strip(),
+        }
+
+    if source_family_id:
+        family_important = semantic_index["important_by_family"].get(source_family_id)
+        if family_important:
+            return {
+                "semantic_meaning": str(family_important.get("meaning") or "").strip(),
+                "codebook_note": "",
+                "semantic_decision_source": "semantic_context_worker",
+                "semantic_kind": str(family_important.get("kind") or "").strip(),
+            }
+        family_result = family_results_by_id.get(source_family_id) or {}
+        family_note = str(family_result.get("member_semantics_notes") or "").strip()
+        if family_note:
+            return {
+                "semantic_meaning": family_note,
+                "codebook_note": "",
+            "semantic_decision_source": "family_worker",
+            "semantic_kind": "family_result",
+        }
+
+    return {
+        "semantic_meaning": "",
+        "codebook_note": "",
+        "semantic_decision_source": "unknown",
+        "semantic_kind": "",
+    }
+
+
+def _baseline_row_to_type_decision(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not row:
+        return {
+            "recommended_logical_type": "mixed_or_ambiguous",
+            "recommended_storage_type": "string",
+            "transform_actions": [],
+            "structural_transform_hints": [],
+            "interpretation_hints": ["mixed_content_high_risk"],
+            "normalization_notes": "",
+            "type_decision_source": "unresolved_no_a2_evidence",
+            "type_review_required": True,
+            "confidence": 0.5,
+            "applied_sources": [],
+        }
+
+    return {
+        "recommended_logical_type": str(row.get("recommended_logical_type") or "mixed_or_ambiguous"),
+        "recommended_storage_type": str(row.get("recommended_storage_type") or "string"),
+        "transform_actions": list(row.get("transform_actions") or []),
+        "structural_transform_hints": list(row.get("structural_transform_hints") or []),
+        "interpretation_hints": list(row.get("interpretation_hints") or []),
+        "normalization_notes": str(row.get("type_normalization_notes") or ""),
+        "type_decision_source": str(row.get("type_decision_source") or "a17_baseline"),
+        "type_review_required": bool(row.get("type_review_required", False)),
+        "confidence": _safe_float(row.get("type_confidence"), _safe_float(row.get("confidence"), 0.0)),
+        "applied_sources": list(row.get("applied_sources") or []),
+    }
+
+
+def _baseline_row_to_missingness_decision(row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not row:
+        return {
+            "missingness_disposition": "mixed_missingness_risk",
+            "missingness_handling": "review_before_drop",
+            "skip_logic_protected": False,
+            "normalization_notes": "",
+            "missingness_decision_source": "unresolved_no_a2_evidence",
+            "missingness_review_required": True,
+            "confidence": 0.5,
+            "applied_sources": [],
+        }
+
+    return {
+        "missingness_disposition": str(row.get("missingness_disposition") or "mixed_missingness_risk"),
+        "missingness_handling": str(row.get("missingness_handling") or "review_before_drop"),
+        "skip_logic_protected": bool(row.get("skip_logic_protected", False)),
+        "normalization_notes": str(row.get("missingness_normalization_notes") or ""),
+        "missingness_decision_source": str(row.get("missingness_decision_source") or "a17_baseline"),
+        "missingness_review_required": bool(row.get("missingness_review_required", False)),
+        "confidence": _safe_float(row.get("missingness_confidence"), _safe_float(row.get("confidence"), 0.0)),
+        "applied_sources": list(row.get("applied_sources") or []),
+    }
+
+
+def _apply_family_type_defaults(base_decision: Dict[str, Any], family_defaults: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+    if not family_defaults:
+        return dict(base_decision), False
+
+    provided = set(family_defaults.get("provided_fields") or [])
+    type_fields = {
+        "recommended_logical_type",
+        "recommended_storage_type",
+        "transform_actions",
+        "structural_transform_hints",
+        "interpretation_hints",
+        "normalization_notes",
+    }
+    if not (provided & type_fields):
+        return dict(base_decision), False
+
+    merged = dict(base_decision)
+    if "recommended_logical_type" in provided:
+        merged["recommended_logical_type"] = str(family_defaults.get("recommended_logical_type") or merged["recommended_logical_type"])
+    if "recommended_storage_type" in provided:
+        merged["recommended_storage_type"] = str(family_defaults.get("recommended_storage_type") or merged["recommended_storage_type"])
+    if "transform_actions" in provided:
+        merged["transform_actions"] = list(family_defaults.get("transform_actions") or [])
+    if "structural_transform_hints" in provided:
+        merged["structural_transform_hints"] = list(family_defaults.get("structural_transform_hints") or [])
+    if "interpretation_hints" in provided:
+        merged["interpretation_hints"] = list(family_defaults.get("interpretation_hints") or [])
+    if "normalization_notes" in provided:
+        merged["normalization_notes"] = str(family_defaults.get("normalization_notes") or "")
+
+    merged["type_decision_source"] = "family_default"
+    merged["type_review_required"] = bool(family_defaults.get("needs_human_review", merged.get("type_review_required", False)))
+    merged["confidence"] = round(max(_safe_float(merged.get("confidence"), 0.0), _safe_float(family_defaults.get("confidence"), 0.74)), 6)
+    merged["applied_sources"] = list(family_defaults.get("applied_sources") or ["family_worker.member_defaults"])
+    return merged, True
+
+
+def _apply_family_missingness_defaults(base_decision: Dict[str, Any], family_defaults: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+    if not family_defaults:
+        return dict(base_decision), False
+
+    provided = set(family_defaults.get("provided_fields") or [])
+    missingness_fields = {
+        "missingness_disposition",
+        "missingness_handling",
+        "skip_logic_protected",
+        "normalization_notes",
+    }
+    if not (provided & missingness_fields):
+        return dict(base_decision), False
+
+    merged = dict(base_decision)
+    if "missingness_disposition" in provided:
+        merged["missingness_disposition"] = str(family_defaults.get("missingness_disposition") or merged["missingness_disposition"])
+    if "missingness_handling" in provided:
+        merged["missingness_handling"] = str(family_defaults.get("missingness_handling") or merged["missingness_handling"])
+    if "skip_logic_protected" in provided:
+        merged["skip_logic_protected"] = bool(family_defaults.get("skip_logic_protected", merged["skip_logic_protected"]))
+    if "normalization_notes" in provided:
+        merged["normalization_notes"] = str(family_defaults.get("normalization_notes") or "")
+
+    merged["missingness_decision_source"] = "family_default"
+    merged["missingness_review_required"] = bool(family_defaults.get("needs_human_review", merged.get("missingness_review_required", False)))
+    merged["confidence"] = round(max(_safe_float(merged.get("confidence"), 0.0), _safe_float(family_defaults.get("confidence"), 0.74)), 6)
+    merged["applied_sources"] = list(family_defaults.get("applied_sources") or ["family_worker.member_defaults"])
+    return merged, True
+
+
+def _fallback_type_decision(
+    column: str,
+    a2_row: Dict[str, Any],
+    a9_row: Dict[str, Any],
+    structure: Dict[str, Any],
+    semantic: Dict[str, Any],
+    family_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    top_candidate = a2_row.get("top_candidate") or {}
+    top_type = str(top_candidate.get("type") or "").strip()
+    unique_ratio = _safe_float(a2_row.get("unique_ratio"), 0.0)
+    unique_count = int(a2_row.get("unique_count") or 0)
+    numeric_pct = _safe_float((a2_row.get("numeric_profile") or {}).get("parseable_pct"), 0.0)
+    datetime_pct = _safe_float((a2_row.get("datetime_profile") or {}).get("parseable_pct"), 0.0)
+    top_levels = [str(value).strip() for value in (a2_row.get("top_levels") or []) if str(value).strip()]
+    samples = ((a2_row.get("a2_samples") or {}).get("random") or [])[:8]
+    role = str(a9_row.get("primary_role") or "").strip()
+    encoding_type = str(a9_row.get("encoding_type") or "").strip()
+    code_semantics = bool(semantic.get("codebook_note") or semantic.get("semantic_kind") in {"codebook_hint", "code_column"})
+    placeholder_context = semantic.get("semantic_kind") == "placeholder_value_context"
+    explicit_missing_tokens = bool(a2_row.get("missing_tokens_observed")) and not placeholder_context
+    semantic_blob = _semantic_text_blob(semantic, family_result)
+    free_text_name_hint = _column_name_has_free_text_hint(column)
+    textual_value_hint = _values_look_textual(top_levels + [str(value) for value in samples])
+    repeat_survey_semantics = _family_semantics_imply_categorical_repeat(structure, semantic, family_result)
+
+    transform_actions: List[str] = ["trim_whitespace"]
+    structural_hints: List[str] = []
+    interpretation_hints: List[str] = []
+    normalization_notes = ""
+    logical_type = "mixed_or_ambiguous"
+    storage_type = "string"
+
+    if structure.get("canonical_assignment_role") in {"base_key", "reference_key", "repeat_parent_key"} or role == "id_key":
+        logical_type = "identifier"
+        storage_type = "string"
+        transform_actions = ["trim_whitespace", "cast_to_string"]
+        interpretation_hints = ["identifier_not_measure"]
+        if numeric_pct >= 80.0:
+            interpretation_hints.append("numeric_parse_is_misleading")
+        if _has_leading_zero_risk(top_levels + [str(value) for value in samples]):
+            interpretation_hints.append("leading_zero_risk")
+        normalization_notes = "Fallback typing preserves identifier semantics as string storage."
+    elif structure.get("canonical_assignment_role") == "repeat_index" or role == "repeat_index":
+        logical_type = "ordinal_category" if _looks_integer_like(top_levels) else "categorical_code"
+        storage_type = "string"
+        transform_actions = ["trim_whitespace", "cast_to_string"] if _looks_numeric_like(top_levels) else ["trim_whitespace", "normalize_category_tokens"]
+        interpretation_hints = ["repeat_context_do_not_use_as_base_key"]
+        if _looks_numeric_like(top_levels):
+            interpretation_hints.append("numeric_parse_is_misleading")
+        normalization_notes = "Fallback typing preserves repeat-index semantics without promoting the field to a base identifier."
+    elif role == "time_index" or top_type in {"date", "datetime"} or datetime_pct >= 80.0:
+        logical_type = "datetime" if top_type == "datetime" or "time" in column.lower() or "timestamp" in column.lower() else "date"
+        storage_type = logical_type
+        transform_actions = ["trim_whitespace", "cast_to_datetime" if logical_type == "datetime" else "cast_to_date"]
+        interpretation_hints = ["time_index_not_identifier"]
+        normalization_notes = "Fallback typing preserves temporal semantics from parse evidence and role signals."
+    elif top_type in {"numeric_range", "range_like"}:
+        logical_type = "mixed_or_ambiguous"
+        storage_type = "string"
+        transform_actions = ["trim_whitespace", "cast_to_string"]
+        structural_hints = ["split_range_into_start_end", "requires_range_semantics_review"]
+        interpretation_hints = ["mixed_content_high_risk"]
+        normalization_notes = "Range-like values need structural follow-up before safe numeric modeling."
+    elif top_type == "numeric_with_unit":
+        logical_type = "numeric_measure"
+        storage_type = "decimal"
+        transform_actions = ["trim_whitespace", "extract_numeric_component", "strip_unit_suffix", "cast_to_decimal"]
+        structural_hints = ["requires_unit_normalization_review"]
+        normalization_notes = "Fallback typing keeps unit-bearing values numeric while preserving later unit-normalization review."
+    elif top_type == "percent":
+        logical_type = "numeric_measure"
+        storage_type = "decimal"
+        transform_actions = ["trim_whitespace", "strip_numeric_formatting", "standardize_percent_scale", "cast_to_decimal"]
+        normalization_notes = "Fallback typing standardizes percentage-like values into decimal numeric storage."
+    elif free_text_name_hint and (
+        textual_value_hint
+        or top_type in {"text", "mixed"}
+        or unique_ratio >= 0.35
+        or unique_count >= 20
+    ):
+        logical_type = "free_text"
+        storage_type = "string"
+        transform_actions = ["trim_whitespace", "cast_to_string"]
+        interpretation_hints = ["free_text_high_cardinality"]
+        if numeric_pct >= 80.0:
+            interpretation_hints.append("numeric_parse_is_misleading")
+        normalization_notes = "Column naming and observed samples indicate open-response text, so fallback typing preserves string content even when parser signals are noisy."
+    elif repeat_survey_semantics:
+        semantic_suggests_ordinal = (
+            _ordinal_like(top_levels, encoding_type)
+            or "likert" in semantic_blob
+            or "ordinal" in semantic_blob
+            or "rating" in semantic_blob
+            or "familiarity" in semantic_blob
+            or "frequency" in semantic_blob
+            or "agreement" in semantic_blob
+        )
+        logical_type = "ordinal_category" if semantic_suggests_ordinal else "nominal_category"
+        storage_type = "string"
+        if _looks_numeric_like(top_levels):
+            transform_actions = ["trim_whitespace", "strip_numeric_formatting", "cast_to_string"]
+            interpretation_hints = ["numeric_parse_is_misleading"]
+        else:
+            transform_actions = ["trim_whitespace", "normalize_category_tokens"]
+        normalization_notes = "Family semantics indicate a repeated survey-response block, so numeric-looking codes are preserved as categories rather than promoted to measures."
+    elif top_type == "categorical_multi":
+        logical_type = "categorical_code" if code_semantics else "nominal_category"
+        storage_type = "string"
+        transform_actions = ["trim_whitespace", "normalize_category_tokens"]
+        structural_hints = ["split_multiselect_tokens", "requires_multiselect_modeling_decision"]
+        if code_semantics:
+            structural_hints.append("requires_codebook_or_label_mapping_review")
+            interpretation_hints.append("code_not_quantity")
+        normalization_notes = "Fallback typing keeps multi-value cells as string-backed categories pending structural token-splitting."
+    elif code_semantics:
+        logical_type = "categorical_code"
+        storage_type = "string"
+        transform_actions = ["trim_whitespace", "cast_to_string"]
+        structural_hints = ["requires_codebook_or_label_mapping_review"]
+        interpretation_hints = ["code_not_quantity"]
+        if _looks_numeric_like(top_levels):
+            transform_actions.insert(1, "strip_numeric_formatting")
+            interpretation_hints.append("numeric_parse_is_misleading")
+        normalization_notes = "Structured semantic evidence indicates code semantics, so numeric-looking values are preserved as strings."
+    elif _boolean_like(top_levels):
+        logical_type = "boolean_flag"
+        storage_type = "boolean"
+        transform_actions = ["trim_whitespace", "normalize_boolean_tokens"]
+        normalization_notes = "Fallback typing treats the column as boolean-like based on observed value vocabulary."
+    elif top_type in {"numeric"} or numeric_pct >= 80.0 or role in {"measure", "measure_numeric"}:
+        logical_type = "numeric_measure"
+        storage_type = "integer" if _looks_integer_like(top_levels + [str(value) for value in samples]) else "decimal"
+        transform_actions = ["trim_whitespace", "strip_numeric_formatting", "cast_to_integer" if storage_type == "integer" else "cast_to_decimal"]
+        normalization_notes = "Fallback typing keeps numeric parse evidence as measure semantics."
+    elif _ordinal_like(top_levels, encoding_type):
+        logical_type = "ordinal_category"
+        storage_type = "string"
+        transform_actions = ["trim_whitespace", "normalize_category_tokens"]
+        normalization_notes = "Fallback typing uses ordinal category semantics from value vocabulary and role evidence."
+    elif unique_ratio >= 0.5 or unique_count >= 50 or top_type == "text":
+        logical_type = "free_text"
+        storage_type = "string"
+        transform_actions = ["trim_whitespace", "cast_to_string"]
+        interpretation_hints = ["free_text_high_cardinality"]
+        normalization_notes = "Fallback typing preserves high-cardinality text as free-form string content."
+    elif top_type in {"categorical", "mixed", "text"} or role in {"coded_categorical", "invariant_attr", "measure_item"}:
+        logical_type = "nominal_category"
+        storage_type = "string"
+        transform_actions = ["trim_whitespace", "normalize_category_tokens"]
+        normalization_notes = "Fallback typing keeps low-cardinality values as string-backed nominal categories."
+    else:
+        logical_type = "mixed_or_ambiguous"
+        storage_type = "string"
+        transform_actions = ["trim_whitespace", "cast_to_string"]
+        interpretation_hints = ["mixed_content_high_risk"]
+        normalization_notes = "Fallback typing remains conservative because the baseline evidence is mixed."
+
+    if explicit_missing_tokens and "normalize_missing_tokens" not in transform_actions:
+        transform_actions.append("normalize_missing_tokens")
+
+    if structure.get("source_family_id") and structure.get("canonical_modeling_status") != "child_repeat_member":
+        structural_hints.append("requires_child_table_review")
+
+    return {
+        "recommended_logical_type": logical_type,
+        "recommended_storage_type": storage_type,
+        "transform_actions": _dedupe_preserve_order(action for action in transform_actions if action in TYPE_TRANSFORM_ACTIONS),
+        "structural_transform_hints": _dedupe_preserve_order(hint for hint in structural_hints if hint in TYPE_STRUCTURAL_HINTS),
+        "interpretation_hints": _dedupe_preserve_order(hint for hint in interpretation_hints if hint in TYPE_INTERPRETATION_HINTS),
+        "normalization_notes": normalization_notes,
+        "type_decision_source": "a2_fallback",
+        "type_review_required": (
+            logical_type == "mixed_or_ambiguous"
+            or _safe_float(a2_row.get("confidence"), 0.0) < 0.75
+            or bool((a2_row.get("high_missingness") or False) and logical_type in {"free_text", "mixed_or_ambiguous"})
+        ),
+        "confidence": min(0.7, _safe_float(a2_row.get("confidence"), 0.6)),
+    }
+
+
+def _fallback_missingness_decision(
+    column: str,
+    a2_row: Optional[Dict[str, Any]],
+    a16_context: Dict[str, Any],
+    family_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if not a2_row:
+        return {
+            "missingness_disposition": "mixed_missingness_risk",
+            "missingness_handling": "review_before_drop",
+            "skip_logic_protected": False,
+            "normalization_notes": "",
+            "missingness_decision_source": "unresolved_no_a2_evidence",
+            "missingness_review_required": True,
+            "confidence": 0.5,
+        }
+
+    missing_pct = _safe_float(a2_row.get("missing_pct"), 0.0)
+    token_missing = bool(a2_row.get("missing_tokens_observed"))
+    a16_row = a16_context.get(column) or {}
+    structural_validity = str(a16_row.get("structural_validity") or "not_applicable")
+    family_context = family_context or {}
+    family_structural_validity = str(family_context.get("structural_validity") or "not_applicable")
+    family_trigger_columns = [
+        str(trigger).strip()
+        for trigger in (family_context.get("trigger_columns") or [])
+        if str(trigger or "").strip()
+    ]
+    family_reviewed_columns = [
+        str(value).strip()
+        for value in (family_context.get("reviewed_structural_columns") or [])
+        if str(value or "").strip()
+    ]
+
+    if structural_validity == "confirmed_structural":
+        return {
+            "missingness_disposition": "structurally_valid_missingness",
+            "missingness_handling": "protect_from_null_penalty",
+            "skip_logic_protected": True,
+            "normalization_notes": "A16 surfaced direct skip-logic evidence for this field in sampled affected columns.",
+            "missingness_decision_source": "a2_a16_fallback",
+            "missingness_review_required": False,
+            "confidence": 0.78,
+        }
+
+    if structural_validity == "plausible_structural":
+        return {
+            "missingness_disposition": "partially_structural_missingness",
+            "missingness_handling": "retain_with_caution",
+            "skip_logic_protected": False,
+            "normalization_notes": "A16 surfaced sample-based gating evidence, but fallback handling remains conservative without reviewed adjudication.",
+            "missingness_decision_source": "a2_a16_fallback",
+            "missingness_review_required": True,
+            "confidence": 0.68,
+        }
+
+    if family_structural_validity == "confirmed_structural" and missing_pct >= 20.0:
+        evidence_note = "Sibling columns in the same family show reviewed or sampled structural missingness evidence."
+        if family_trigger_columns:
+            evidence_note = f"{evidence_note} Trigger context: {', '.join(family_trigger_columns[:3])}."
+        if family_reviewed_columns:
+            evidence_note = f"{evidence_note} Reviewed sibling evidence was present for {', '.join(family_reviewed_columns[:3])}."
+        return {
+            "missingness_disposition": "structurally_valid_missingness",
+            "missingness_handling": "protect_from_null_penalty",
+            "skip_logic_protected": True,
+            "normalization_notes": evidence_note,
+            "missingness_decision_source": "a2_a16_fallback",
+            "missingness_review_required": False,
+            "confidence": 0.76,
+        }
+
+    if family_structural_validity == "plausible_structural" and missing_pct >= 20.0:
+        evidence_note = "Sibling columns in the same family show plausible structural missingness evidence, so fallback handling propagates that family-level caution."
+        if family_trigger_columns:
+            evidence_note = f"{evidence_note} Trigger context: {', '.join(family_trigger_columns[:3])}."
+        return {
+            "missingness_disposition": "partially_structural_missingness",
+            "missingness_handling": "retain_with_caution",
+            "skip_logic_protected": False,
+            "normalization_notes": evidence_note,
+            "missingness_decision_source": "a2_a16_fallback",
+            "missingness_review_required": True,
+            "confidence": 0.7,
+        }
+
+    if missing_pct < 5.0 and not token_missing:
+        return {
+            "missingness_disposition": "no_material_missingness",
+            "missingness_handling": "no_action_needed",
+            "skip_logic_protected": False,
+            "normalization_notes": "Missingness is low and no explicit token-based cleanup signal is present.",
+            "missingness_decision_source": "a2_a16_fallback",
+            "missingness_review_required": False,
+            "confidence": 0.72,
+        }
+
+    if token_missing and missing_pct < 40.0:
+        return {
+            "missingness_disposition": "token_missingness_present",
+            "missingness_handling": "retain_with_caution",
+            "skip_logic_protected": False,
+            "normalization_notes": "A2 shows explicit missing-like tokens that should be standardized cautiously.",
+            "missingness_decision_source": "a2_a16_fallback",
+            "missingness_review_required": False,
+            "confidence": 0.69,
+        }
+
+    if missing_pct >= 80.0:
+        return {
+            "missingness_disposition": "unexplained_high_missingness",
+            "missingness_handling": "candidate_drop_review",
+            "skip_logic_protected": False,
+            "normalization_notes": "Missingness is very high and not structurally explained by the sampled A16 evidence.",
+            "missingness_decision_source": "a2_a16_fallback",
+            "missingness_review_required": True,
+            "confidence": 0.62,
+        }
+
+    if missing_pct >= 50.0:
+        return {
+            "missingness_disposition": "mixed_missingness_risk",
+            "missingness_handling": "review_before_drop",
+            "skip_logic_protected": False,
+            "normalization_notes": "Missingness is materially high without direct structural proof.",
+            "missingness_decision_source": "a2_a16_fallback",
+            "missingness_review_required": True,
+            "confidence": 0.64,
+        }
+
+    if token_missing or missing_pct >= 20.0:
+        return {
+            "missingness_disposition": "mixed_missingness_risk",
+            "missingness_handling": "retain_with_caution",
+            "skip_logic_protected": False,
+            "normalization_notes": "Missingness is present but not strongly structural in fallback evidence.",
+            "missingness_decision_source": "a2_a16_fallback",
+            "missingness_review_required": False,
+            "confidence": 0.67,
+        }
+
+    return {
+        "missingness_disposition": "no_material_missingness",
+        "missingness_handling": "no_action_needed",
+        "skip_logic_protected": False,
+        "normalization_notes": "",
+        "missingness_decision_source": "a2_a16_fallback",
+        "missingness_review_required": False,
+        "confidence": 0.7,
+    }
+
+
+def _add_review_flag(flags: List[Dict[str, Any]], item: str, issue: str, why: str) -> None:
+    candidate = {
+        "item": str(item or "").strip(),
+        "issue": str(issue or "").strip(),
+        "why": str(why or "").strip(),
+    }
+    if not candidate["item"] or not candidate["issue"] or not candidate["why"]:
+        return
+    if candidate not in flags:
+        flags.append(candidate)
+
+
+def _review_reason_summary(rows: List[Dict[str, Any]]) -> str:
+    reasons: List[str] = []
+    if any(row.get("canonical_modeling_status") == "unresolved" for row in rows):
+        reasons.append("unresolved placement")
+    if any(row.get("type_decision_source") == "family_default" for row in rows):
+        reasons.append("family-default typing")
+    elif any(row.get("type_decision_source") == "a17_baseline" for row in rows):
+        reasons.append("deterministic baseline typing")
+    if any(
+        row.get("missingness_decision_source") == "family_default"
+        and row.get("missingness_disposition") in {"mixed_missingness_risk", "unexplained_high_missingness", "partially_structural_missingness", "structurally_valid_missingness"}
+        for row in rows
+    ):
+        reasons.append("family-default missingness adjudication")
+    elif any(
+        row.get("missingness_decision_source") == "a17_baseline"
+        and row.get("missingness_disposition") in {"mixed_missingness_risk", "unexplained_high_missingness", "partially_structural_missingness", "structurally_valid_missingness"}
+        for row in rows
+    ):
+        reasons.append("deterministic baseline missingness adjudication")
+    if any(row.get("drift_detected") is True for row in rows):
+        reasons.append("drift follow-up")
+    if not reasons:
+        reasons.append("manual adjudication")
+    if len(reasons) == 1:
+        return reasons[0]
+    if len(reasons) == 2:
+        return f"{reasons[0]} and {reasons[1]}"
+    return ", ".join(reasons[:-1]) + f", and {reasons[-1]}"
+
+
+def _append_review_summary_flags(flags: List[Dict[str, Any]], column_contracts: List[Dict[str, Any]]) -> None:
+    review_rows = [row for row in column_contracts if row.get("needs_human_review")]
+    if review_rows:
+        family_hotspots = len({str(row.get("source_family_id") or "").strip() for row in review_rows if str(row.get("source_family_id") or "").strip()})
+        singleton_hotspots = sum(1 for row in review_rows if not str(row.get("source_family_id") or "").strip())
+        _add_review_flag(
+            flags,
+            "contract_summary",
+            "review_required_columns_present",
+            f"{len(review_rows)} column contracts require human review across {family_hotspots + singleton_hotspots} hotspots.",
+        )
+
+    baseline_count = sum(1 for row in column_contracts if row.get("type_decision_source") == "a17_baseline")
+    if column_contracts and (baseline_count / len(column_contracts)) >= 0.5:
+        _add_review_flag(
+            flags,
+            "contract_summary",
+            "high_deterministic_baseline_share",
+            f"{baseline_count} of {len(column_contracts)} columns relied on A17 baseline typing; downstream automation should treat unresolved semantics as provisional until reviewed coverage improves.",
+        )
+
+    family_groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    standalone_rows: List[Dict[str, Any]] = []
+    for row in review_rows:
+        family_id = str(row.get("source_family_id") or "").strip()
+        if family_id:
+            family_groups[family_id].append(row)
+        else:
+            standalone_rows.append(row)
+
+    for family_id, rows in sorted(family_groups.items(), key=lambda item: (-len(item[1]), item[0])):
+        if len(rows) == 1:
+            standalone_rows.extend(rows)
+            continue
+        _add_review_flag(
+            flags,
+            family_id,
+            "family_columns_need_review",
+            f"{len(rows)} columns in family '{family_id}' require review due to {_review_reason_summary(rows)}.",
+        )
+
+    for row in sorted(standalone_rows, key=lambda item: str(item.get("column") or ""))[:12]:
+        column = str(row.get("column") or "").strip()
+        if not column:
+            continue
+        _add_review_flag(
+            flags,
+            column,
+            "column_needs_review",
+            f"Column '{column}' requires review due to {_review_reason_summary([row])}.",
+        )
+
+
+def _cleanup_structural_hints(hints: Iterable[Any], canonical_modeling_status: str) -> List[str]:
+    cleaned = _dedupe_preserve_order(hint for hint in hints if str(hint or "").strip() in TYPE_STRUCTURAL_HINTS)
+    if canonical_modeling_status == "child_repeat_member":
+        cleaned = [
+            hint
+            for hint in cleaned
+            if hint not in {"requires_child_table_review", "requires_wide_to_long_review"}
+        ]
+    return cleaned
+
+
+def _build_conflict_flags(
+    column: str,
+    row: Dict[str, Any],
+    light_contract_maps: Dict[str, Any],
+    family_results_by_id: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    flags: List[Dict[str, Any]] = []
+
+    if column in set(light_contract_maps.get("primary_keys") or []) and row["canonical_assignment_role"] in {"exclude_from_outputs", "unresolved"}:
+        flags.append(
+            {
+                "item": column,
+                "issue": "light_contract_primary_key_unplaced",
+                "why": "The finalized light contract marks this column as a primary-grain key, but the canonical structure does not place it in a resolved table role.",
+            }
+        )
+
+    expected_reference_table = str((light_contract_maps.get("reference_table_by_key") or {}).get(column) or "").strip()
+    if expected_reference_table and row["canonical_assignment_role"] in {"exclude_from_outputs", "unresolved", "base_key", "base_attribute"}:
+        flags.append(
+            {
+                "item": column,
+                "issue": "light_contract_reference_conflict",
+                "why": f"The finalized light contract associates this key with reference table '{expected_reference_table}', but the canonical structure did not preserve that placement.",
+            }
+        )
+
+    family_id = row.get("source_family_id") or ""
+    family_result = family_results_by_id.get(family_id) or {}
+    family_role = str(family_result.get("recommended_family_role") or "").strip()
+    if family_role == "answer_key_or_reference_block" and row["canonical_modeling_status"] == "child_repeat_member":
+        flags.append(
+            {
+                "item": column,
+                "issue": "family_semantics_vs_layout_conflict",
+                "why": "Reviewed family semantics suggest a reference-style block, but canonical layout still models this column as a child-repeat member.",
+            }
+        )
+
+    if row["recommended_logical_type"] == "identifier" and row["canonical_assignment_role"] == "melt_member":
+        flags.append(
+            {
+                "item": column,
+                "issue": "identifier_vs_repeat_member_conflict",
+                "why": "Identifier semantics conflict with a melt-member placement and should be reviewed.",
+            }
+        )
+
+    if row["recommended_logical_type"] == "numeric_measure" and row["canonical_assignment_role"] in {"base_key", "reference_key", "repeat_parent_key", "repeat_index"}:
+        flags.append(
+            {
+                "item": column,
+                "issue": "measure_vs_key_conflict",
+                "why": "Numeric-measure semantics conflict with a key-like structural assignment.",
+            }
+        )
+
+    return flags
+
+
+def _resolve_contract_confidence(
+    a2_row: Optional[Dict[str, Any]],
+    type_confidence: float,
+    missingness_confidence: float,
+    needs_human_review: bool,
+    conflict_count: int,
+    unresolved: bool,
+    drift_detected: Optional[bool],
+) -> float:
+    base_candidates = [type_confidence, missingness_confidence]
+    if a2_row:
+        base_candidates.append(min(0.7, _safe_float(a2_row.get("confidence"), 0.0)))
+    base = max(base_candidates) if any(base_candidates) else 0.5
+
+    if drift_detected and not a2_row is None:
+        base = min(base, 0.78)
+    if needs_human_review:
+        base = min(base, 0.75)
+    if conflict_count:
+        base = min(base, 0.6)
+    if unresolved:
+        base = min(base, 0.5)
+
+    return round(max(0.0, min(1.0, base)), 6)
+
+
+def _validate_canonical_column_contract_output(payload: Dict[str, Any], expected_source_columns: List[str]) -> List[str]:
+    errors: List[str] = []
+    required_top_level = [
+        "worker",
+        "summary",
+        "column_contracts",
+        "global_value_rules",
+        "review_flags",
+        "assumptions",
+    ]
+    for key in required_top_level:
+        if key not in payload:
+            errors.append(f"Missing required top-level key: {key}")
+
+    if payload.get("worker") != "canonical_column_contract_builder":
+        errors.append("worker must be 'canonical_column_contract_builder'")
+
+    summary = payload.get("summary")
+    if not isinstance(summary, dict):
+        errors.append("summary must be an object")
+    else:
+        for key in [
+            "overview",
+            "total_source_columns",
+            "included_column_count",
+            "excluded_column_count",
+            "unresolved_column_count",
+            "reviewed_type_count",
+            "fallback_type_count",
+            "key_contract_principles",
+        ]:
+            if key not in summary:
+                errors.append(f"summary.{key} is required")
+        if not isinstance(summary.get("overview"), str) or not summary.get("overview", "").strip():
+            errors.append("summary.overview must be a non-empty string")
+        if not isinstance(summary.get("key_contract_principles"), list):
+            errors.append("summary.key_contract_principles must be an array")
+        for key in ["reviewed_override_count", "family_default_count", "deterministic_baseline_count"]:
+            if key not in summary:
+                errors.append(f"summary.{key} is required")
+            elif not isinstance(summary.get(key), int):
+                errors.append(f"summary.{key} must be an integer")
+
+    rows = payload.get("column_contracts")
+    if not isinstance(rows, list) or not rows:
+        errors.append("column_contracts must be a non-empty array")
+        return errors
+
+    seen_columns: Set[str] = set()
+    expected_set = set(expected_source_columns)
+    seen_expected: Set[str] = set()
+
+    for idx, row in enumerate(rows):
+        path = f"column_contracts[{idx}]"
+        if not isinstance(row, dict):
+            errors.append(f"{path} must be an object")
+            continue
+
+        required_row_fields = [
+            "column",
+            "canonical_modeling_status",
+            "canonical_table_name",
+            "canonical_assignment_role",
+            "source_family_id",
+            "a9_primary_role",
+            "recommended_logical_type",
+            "recommended_storage_type",
+            "transform_actions",
+            "structural_transform_hints",
+            "interpretation_hints",
+            "missingness_disposition",
+            "missingness_handling",
+            "skip_logic_protected",
+            "confidence",
+            "needs_human_review",
+            "type_decision_source",
+            "structure_decision_source",
+            "missingness_decision_source",
+            "semantic_decision_source",
+            "applied_sources",
+        ]
+        for key in required_row_fields:
+            if key not in row:
+                errors.append(f"{path}.{key} is required")
+
+        column = str(row.get("column") or "").strip()
+        if not column:
+            errors.append(f"{path}.column must be a non-empty string")
+        elif column in seen_columns:
+            errors.append(f"Duplicate column_contracts entry for column: {column}")
+        else:
+            seen_columns.add(column)
+            if column in expected_set:
+                seen_expected.add(column)
+
+        if row.get("canonical_modeling_status") not in CANONICAL_MODELING_STATUSES:
+            errors.append(f"{path}.canonical_modeling_status is invalid")
+        if row.get("canonical_assignment_role") not in CANONICAL_ASSIGNMENT_ROLES:
+            errors.append(f"{path}.canonical_assignment_role is invalid")
+        if row.get("recommended_logical_type") not in TYPE_LOGICAL_TYPES:
+            errors.append(f"{path}.recommended_logical_type is invalid")
+        if row.get("recommended_storage_type") not in TYPE_STORAGE_TYPES:
+            errors.append(f"{path}.recommended_storage_type is invalid")
+        if row.get("missingness_disposition") not in MISSINGNESS_DISPOSITIONS:
+            errors.append(f"{path}.missingness_disposition is invalid")
+        if row.get("missingness_handling") not in MISSINGNESS_HANDLING:
+            errors.append(f"{path}.missingness_handling is invalid")
+        if row.get("type_decision_source") not in CANONICAL_TYPE_DECISION_SOURCES:
+            errors.append(f"{path}.type_decision_source is invalid")
+        if row.get("structure_decision_source") not in CANONICAL_STRUCTURE_DECISION_SOURCES:
+            errors.append(f"{path}.structure_decision_source is invalid")
+        if row.get("missingness_decision_source") not in CANONICAL_MISSINGNESS_DECISION_SOURCES:
+            errors.append(f"{path}.missingness_decision_source is invalid")
+        if row.get("semantic_decision_source") not in CANONICAL_SEMANTIC_DECISION_SOURCES:
+            errors.append(f"{path}.semantic_decision_source is invalid")
+
+        if row.get("canonical_assignment_role") in {"exclude_from_outputs", "unresolved"}:
+            if str(row.get("canonical_table_name") or "").strip():
+                errors.append(f"{path}.canonical_table_name must be blank for excluded or unresolved assignments")
+        elif not str(row.get("canonical_table_name") or "").strip():
+            errors.append(f"{path}.canonical_table_name must be non-blank for resolved assignments")
+
+        if not isinstance(row.get("transform_actions"), list):
+            errors.append(f"{path}.transform_actions must be an array")
+        else:
+            for item in row.get("transform_actions") or []:
+                if item not in TYPE_TRANSFORM_ACTIONS:
+                    errors.append(f"{path}.transform_actions contains invalid value: {item}")
+
+        if not isinstance(row.get("structural_transform_hints"), list):
+            errors.append(f"{path}.structural_transform_hints must be an array")
+        else:
+            for item in row.get("structural_transform_hints") or []:
+                if item not in TYPE_STRUCTURAL_HINTS:
+                    errors.append(f"{path}.structural_transform_hints contains invalid value: {item}")
+
+        if not isinstance(row.get("interpretation_hints"), list):
+            errors.append(f"{path}.interpretation_hints must be an array")
+        else:
+            for item in row.get("interpretation_hints") or []:
+                if item not in TYPE_INTERPRETATION_HINTS:
+                    errors.append(f"{path}.interpretation_hints contains invalid value: {item}")
+
+        if not isinstance(row.get("applied_sources"), list):
+            errors.append(f"{path}.applied_sources must be an array")
+        else:
+            for item in row.get("applied_sources") or []:
+                if not isinstance(item, str) or not item.strip():
+                    errors.append(f"{path}.applied_sources contains an invalid value")
+
+        if not isinstance(row.get("skip_logic_protected"), bool):
+            errors.append(f"{path}.skip_logic_protected must be boolean")
+        if not isinstance(row.get("needs_human_review"), bool):
+            errors.append(f"{path}.needs_human_review must be boolean")
+        if not isinstance(row.get("confidence"), (int, float)) or isinstance(row.get("confidence"), bool):
+            errors.append(f"{path}.confidence must be numeric")
+        elif not (0.0 <= float(row["confidence"]) <= 1.0):
+            errors.append(f"{path}.confidence must be between 0 and 1")
+
+        for key in ["semantic_meaning", "codebook_note", "normalization_notes", "a9_primary_role", "source_family_id", "canonical_table_name"]:
+            if key in row and row[key] is not None and not isinstance(row[key], str):
+                errors.append(f"{path}.{key} must be a string or null")
+        if "quality_score" in row and row["quality_score"] is not None:
+            if not isinstance(row["quality_score"], (int, float)) or isinstance(row["quality_score"], bool):
+                errors.append(f"{path}.quality_score must be numeric or null")
+        if "drift_detected" in row and row["drift_detected"] is not None and not isinstance(row["drift_detected"], bool):
+            errors.append(f"{path}.drift_detected must be boolean or null")
+
+    missing_expected = sorted(expected_set - seen_expected)
+    if missing_expected:
+        errors.append(f"column_contracts is missing A2 source columns: {', '.join(missing_expected)}")
+
+    for key in ["global_value_rules", "review_flags", "assumptions"]:
+        if not isinstance(payload.get(key), list):
+            errors.append(f"{key} must be an array")
+
+    return errors
+
+
+def _synthesize_canonical_column_contract(
+    run_id: str,
+    light_contract_decisions: Dict[str, Any],
+    semantic_context_json: Dict[str, Any],
+    type_transform_worker_json: Dict[str, Any],
+    missingness_worker_json: Dict[str, Any],
+    family_worker_json: Any,
+    table_layout_worker_json: Dict[str, Any],
+    support: Dict[str, Any],
+) -> Dict[str, Any]:
+    a2_by_col = support["a2_by_col"]
+    a2_order = support["a2_order"]
+    a17_by_col = support["a17_by_col"]
+    family_by_column = support["family_by_column"]
+
+    light_contract_maps = _normalize_light_contract_maps(light_contract_decisions)
+    type_by_col, global_rules = _normalize_type_output(type_transform_worker_json)
+    missingness_by_col = _normalize_missingness_output(missingness_worker_json)
+    family_results_by_id = _extract_family_results(family_worker_json)
+    family_defaults_by_id = _normalize_family_member_defaults(family_worker_json)
+    assignments_by_col, tables_by_name = _normalize_table_layout_output(table_layout_worker_json)
+    column_family_map = dict(family_by_column)
+    for col, assignment in assignments_by_col.items():
+        family_id = str(assignment.get("source_family_id") or "").strip()
+        if family_id:
+            column_family_map[col] = family_id
+
+    known_family_ids = set(column_family_map.values()) | set(family_results_by_id.keys()) | set((light_contract_maps.get("family_by_id") or {}).keys())
+    for row in assignments_by_col.values():
+        family_id = str(row.get("source_family_id") or "").strip()
+        if family_id:
+            known_family_ids.add(family_id)
+
+    semantic_index = _normalize_semantic_context(
+        semantic_context_json,
+        known_columns=set(a2_by_col.keys()),
+        known_family_ids=known_family_ids,
+    )
+
+    extra_columns = set(type_by_col.keys()) | set(missingness_by_col.keys()) | set(assignments_by_col.keys()) | set(semantic_index["extra_columns"])
+    extra_columns.update(light_contract_maps.get("primary_keys") or [])
+    extra_columns.update((light_contract_maps.get("reference_table_by_key") or {}).keys())
+    extra_columns = {col for col in extra_columns if col and col not in a2_by_col}
+
+    top_level_review_flags: List[Dict[str, Any]] = []
+    for extra in sorted(extra_columns):
+        _add_review_flag(
+            top_level_review_flags,
+            extra,
+            "reviewed_column_not_in_a2",
+            "A reviewed or structural input referenced this column, but it does not exist in the baseline A2 column dictionary for the run.",
+        )
+
+    column_contracts: List[Dict[str, Any]] = []
+    all_columns = list(a2_order) + sorted(extra_columns)
+
+    for column in all_columns:
+        a2_row = a2_by_col.get(column)
+        baseline_row = a17_by_col.get(column) or {}
+
+        structure = _resolve_structure_for_column(
+            column=column,
+            assignments_by_col=assignments_by_col,
+            tables_by_name=tables_by_name,
+            light_contract_maps=light_contract_maps,
+            family_by_column=column_family_map,
+        )
+        family_id = str(structure.get("source_family_id") or "")
+        family_result = family_results_by_id.get(family_id) or {}
+        family_defaults = family_defaults_by_id.get(family_id) or {}
+        semantic = _resolve_semantic_enrichment(
+            column=column,
+            source_family_id=family_id,
+            semantic_index=semantic_index,
+            family_results_by_id=family_results_by_id,
+            a13_row={},
+        )
+
+        type_decision = _baseline_row_to_type_decision(baseline_row)
+        type_decision, family_type_used = _apply_family_type_defaults(type_decision, family_defaults)
+        reviewed_type = type_by_col.get(column)
+        if reviewed_type:
+            type_decision = {
+                "recommended_logical_type": str(reviewed_type.get("recommended_logical_type") or "mixed_or_ambiguous"),
+                "recommended_storage_type": str(reviewed_type.get("recommended_storage_type") or "string"),
+                "transform_actions": _dedupe_preserve_order(
+                    item for item in (reviewed_type.get("transform_actions") or []) if str(item or "").strip() in TYPE_TRANSFORM_ACTIONS
+                ),
+                "structural_transform_hints": _dedupe_preserve_order(
+                    item for item in (reviewed_type.get("structural_transform_hints") or []) if str(item or "").strip() in TYPE_STRUCTURAL_HINTS
+                ),
+                "interpretation_hints": _dedupe_preserve_order(
+                    item for item in (reviewed_type.get("interpretation_hints") or []) if str(item or "").strip() in TYPE_INTERPRETATION_HINTS
+                ),
+                "normalization_notes": str(reviewed_type.get("normalization_notes") or "").strip(),
+                "type_decision_source": "reviewed_type_worker",
+                "type_review_required": bool(reviewed_type.get("needs_human_review", False)),
+                "confidence": _safe_float(reviewed_type.get("confidence"), 0.0),
+                "applied_sources": ["type_transform_worker"],
+            }
+
+        missingness_decision = _baseline_row_to_missingness_decision(baseline_row)
+        missingness_decision, family_missingness_used = _apply_family_missingness_defaults(missingness_decision, family_defaults)
+        reviewed_missingness = missingness_by_col.get(column)
+        if reviewed_missingness:
+            missingness_decision = {
+                "missingness_disposition": str(reviewed_missingness.get("missingness_disposition") or "mixed_missingness_risk"),
+                "missingness_handling": str(reviewed_missingness.get("recommended_handling") or "retain_with_caution"),
+                "skip_logic_protected": bool(reviewed_missingness.get("skip_logic_protected", False)),
+                "normalization_notes": str(reviewed_missingness.get("normalization_notes") or "").strip(),
+                "missingness_decision_source": "reviewed_missingness_worker",
+                "missingness_review_required": bool(reviewed_missingness.get("needs_human_review", False)),
+                "confidence": _safe_float(reviewed_missingness.get("confidence"), 0.0),
+                "applied_sources": ["missingness_worker"],
+            }
+
+        interpretation_hints = list(type_decision["interpretation_hints"])
+        if missingness_decision["skip_logic_protected"]:
+            interpretation_hints = _dedupe_preserve_order(interpretation_hints + ["skip_logic_protected"])
+
+        structural_transform_hints = _cleanup_structural_hints(
+            type_decision["structural_transform_hints"],
+            str(structure.get("canonical_modeling_status") or "unresolved"),
+        )
+
+        quality_score = baseline_row.get("quality_score") if isinstance(baseline_row, dict) else None
+        drift_detected = baseline_row.get("drift_detected") if isinstance(baseline_row, dict) else None
+
+        applied_sources: List[str] = []
+        structure_source = str(structure.get("structure_decision_source") or "unresolved")
+        if structure_source == "table_layout_worker":
+            applied_sources.append("table_layout_worker")
+        elif structure_source == "light_contract_fallback":
+            applied_sources.append("light_contract_decisions")
+        if baseline_row:
+            applied_sources.append("A17")
+        if semantic.get("semantic_decision_source") == "semantic_context_worker":
+            applied_sources.append("semantic_context_worker")
+        elif semantic.get("semantic_decision_source") == "family_worker":
+            applied_sources.append("family_worker.family_result")
+        if family_type_used or family_missingness_used:
+            applied_sources.append("family_worker.member_defaults")
+        applied_sources.extend(type_decision.get("applied_sources") or [])
+        applied_sources.extend(missingness_decision.get("applied_sources") or [])
+
+        row = {
+            "column": column,
+            "canonical_modeling_status": str(structure.get("canonical_modeling_status") or "unresolved"),
+            "canonical_table_name": str(structure.get("canonical_table_name") or ""),
+            "canonical_assignment_role": str(structure.get("canonical_assignment_role") or "unresolved"),
+            "source_family_id": str(structure.get("source_family_id") or ""),
+            "a9_primary_role": str((baseline_row or {}).get("a9_primary_role") or ""),
+            "recommended_logical_type": str(type_decision["recommended_logical_type"]),
+            "recommended_storage_type": str(type_decision["recommended_storage_type"]),
+            "transform_actions": list(type_decision["transform_actions"]),
+            "structural_transform_hints": structural_transform_hints,
+            "interpretation_hints": interpretation_hints,
+            "missingness_disposition": str(missingness_decision["missingness_disposition"]),
+            "missingness_handling": str(missingness_decision["missingness_handling"]),
+            "skip_logic_protected": bool(missingness_decision["skip_logic_protected"]),
+            "semantic_meaning": str(semantic.get("semantic_meaning") or ""),
+            "codebook_note": str(semantic.get("codebook_note") or ""),
+            "normalization_notes": _merge_notes(type_decision.get("normalization_notes"), missingness_decision.get("normalization_notes")),
+            "quality_score": round(_safe_float(quality_score), 6) if isinstance(quality_score, (int, float)) else None,
+            "drift_detected": bool(drift_detected) if isinstance(drift_detected, bool) else None,
+            "type_decision_source": str(type_decision["type_decision_source"]),
+            "structure_decision_source": str(structure.get("structure_decision_source") or "unresolved"),
+            "missingness_decision_source": str(missingness_decision["missingness_decision_source"]),
+            "semantic_decision_source": str(semantic.get("semantic_decision_source") or "unknown"),
+            "applied_sources": _dedupe_preserve_order(applied_sources),
+            "confidence": 0.0,
+            "needs_human_review": False,
+        }
+
+        row_conflicts = _build_conflict_flags(
+            column=column,
+            row=row,
+            light_contract_maps=light_contract_maps,
+            family_results_by_id=family_results_by_id,
+        )
+        for flag in row_conflicts:
+            _add_review_flag(
+                top_level_review_flags,
+                str(flag.get("item") or ""),
+                str(flag.get("issue") or ""),
+                str(flag.get("why") or ""),
+            )
+
+        needs_review = bool(
+            type_decision["type_review_required"]
+            or missingness_decision["missingness_review_required"]
+            or row["canonical_modeling_status"] == "unresolved"
+            or row_conflicts
+            or (
+                row["drift_detected"] is True
+                and row["type_decision_source"] != "reviewed_type_worker"
+                and row["recommended_logical_type"] in {"date", "datetime", "mixed_or_ambiguous"}
+            )
+        )
+
+        row["needs_human_review"] = needs_review
+        row["confidence"] = _resolve_contract_confidence(
+            a2_row=a2_row,
+            type_confidence=_safe_float(type_decision.get("confidence"), 0.0),
+            missingness_confidence=_safe_float(missingness_decision.get("confidence"), 0.0),
+            needs_human_review=needs_review,
+            conflict_count=len(row_conflicts),
+            unresolved=row["canonical_modeling_status"] == "unresolved",
+            drift_detected=row["drift_detected"],
+        )
+
+        column_contracts.append(row)
+
+    _append_review_summary_flags(top_level_review_flags, column_contracts)
+
+    summary = {
+        "overview": (
+            f"Synthesized a deterministic canonical column contract for {len(column_contracts)} columns by "
+            f"merging structure decisions, semantic context, reviewed overrides, family defaults, and the A17 baseline layer."
+        ),
+        "total_source_columns": len(column_contracts),
+        "included_column_count": sum(1 for row in column_contracts if row["canonical_modeling_status"] not in {"excluded_from_outputs", "unresolved"}),
+        "excluded_column_count": sum(1 for row in column_contracts if row["canonical_modeling_status"] == "excluded_from_outputs"),
+        "unresolved_column_count": sum(1 for row in column_contracts if row["canonical_modeling_status"] == "unresolved"),
+        "reviewed_override_count": sum(
+            1
+            for row in column_contracts
+            if row["type_decision_source"] == "reviewed_type_worker" or row["missingness_decision_source"] == "reviewed_missingness_worker"
+        ),
+        "family_default_count": sum(
+            1
+            for row in column_contracts
+            if row["type_decision_source"] == "family_default" or row["missingness_decision_source"] == "family_default"
+        ),
+        "deterministic_baseline_count": sum(
+            1
+            for row in column_contracts
+            if row["type_decision_source"] == "a17_baseline" and row["missingness_decision_source"] == "a17_baseline"
+        ),
+        "reviewed_type_count": sum(1 for row in column_contracts if row["type_decision_source"] == "reviewed_type_worker"),
+        "fallback_type_count": sum(1 for row in column_contracts if row["type_decision_source"] != "reviewed_type_worker"),
+        "key_contract_principles": [
+            "Control fields are complete for every contract row; semantic enrichment stays blank unless evidence exists.",
+            "Reviewed table layout, semantic context, reviewed specialist outputs, and family defaults outrank the A17 deterministic baseline.",
+            "Raw prose is not allowed to directly override structured contract fields in v1.",
+        ],
+    }
+
+    assumptions: List[Dict[str, Any]] = []
+    if semantic_index["skip"]:
+        assumptions.append(
+            {
+                "assumption": "semantic_context_skipped",
+                "explanation": f"semantic_context_json used the skip sentinel ({semantic_index['skip_reason'] or 'unspecified reason'}), so semantic enrichment remains blank unless reviewed family semantics exist.",
+            }
+        )
+    if support.get("a17_backfilled"):
+        assumptions.append(
+            {
+                "assumption": "a17_backfilled_during_contract_build",
+                "explanation": "A17 was not present for this run, so the service deterministically rebuilt the baseline column-resolution layer before merging the final contract.",
+            }
+        )
+    if any(artifact in {"A3-T", "A3-V", "A4", "A9", "A13", "A14", "A16"} for artifact in support["missing_artifacts"]):
+        assumptions.append(
+            {
+                "assumption": "optional_artifact_fallback_applied",
+                "explanation": f"Some optional artifacts were unavailable ({', '.join(sorted(support['missing_artifacts']))}), so the A17 baseline used conservative fallback behavior for the affected dimensions.",
+            }
+        )
+    if any(row["type_decision_source"] == "a17_baseline" or row["missingness_decision_source"] == "a17_baseline" for row in column_contracts):
+        assumptions.append(
+            {
+                "assumption": "a17_baseline_applied_for_unreviewed_columns",
+                "explanation": "Columns not covered by reviewed specialist outputs or family defaults inherited deterministic baseline decisions from A17 rather than ad hoc endpoint heuristics.",
+            }
+        )
+    if any(row["type_decision_source"] == "family_default" or row["missingness_decision_source"] == "family_default" for row in column_contracts):
+        assumptions.append(
+            {
+                "assumption": "family_defaults_propagated",
+                "explanation": "Reviewed family defaults were propagated to sibling columns where explicit per-column reviewed overrides were absent.",
+            }
+        )
+
+    output = {
+        "worker": "canonical_column_contract_builder",
+        "summary": summary,
+        "column_contracts": column_contracts,
+        "global_value_rules": global_rules,
+        "review_flags": top_level_review_flags,
+        "assumptions": assumptions,
+    }
+
+    validation_errors = _validate_canonical_column_contract_output(output, expected_source_columns=a2_order)
+    if validation_errors:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "canonical column contract synthesis produced an invalid payload",
+                "errors": validation_errors,
+            },
+        )
+
+    return output
+
+
+@app.post("/contracts/canonical-columns")
+def build_canonical_column_contract(
+    req: CanonicalColumnContractRequest,
+    _=Depends(require_token),
+) -> Dict[str, Any]:
+    light_contract_decisions = _coerce_json_input(req.light_contract_decisions, "light_contract_decisions")
+    semantic_context_json = _coerce_json_input(req.semantic_context_json, "semantic_context_json")
+    type_transform_worker_json = _coerce_json_input(req.type_transform_worker_json, "type_transform_worker_json")
+    missingness_worker_json = _coerce_json_input(req.missingness_worker_json, "missingness_worker_json")
+    family_worker_json = _coerce_json_input(req.family_worker_json, "family_worker_json", allow_list=True)
+    table_layout_worker_json = _coerce_json_input(req.table_layout_worker_json, "table_layout_worker_json")
+
+    if not isinstance(light_contract_decisions.get("primary_grain_decision"), dict):
+        raise HTTPException(status_code=422, detail="light_contract_decisions.primary_grain_decision is required")
+    if not isinstance(table_layout_worker_json.get("column_table_assignments"), list):
+        raise HTTPException(status_code=422, detail="table_layout_worker_json.column_table_assignments must be an array")
+    if not isinstance(table_layout_worker_json.get("table_suggestions"), list):
+        raise HTTPException(status_code=422, detail="table_layout_worker_json.table_suggestions must be an array")
+
+    support = _load_canonical_support_artifacts(req.run_id)
+
+    return _synthesize_canonical_column_contract(
+        run_id=req.run_id,
+        light_contract_decisions=light_contract_decisions,
+        semantic_context_json=semantic_context_json,
+        type_transform_worker_json=type_transform_worker_json,
+        missingness_worker_json=missingness_worker_json,
+        family_worker_json=family_worker_json,
+        table_layout_worker_json=table_layout_worker_json,
+        support=support,
+    )

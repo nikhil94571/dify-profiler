@@ -19,12 +19,16 @@ Required top-level keys:
 - `review_flags`
 - `assumptions`
 
+Optional top-level key:
+- `member_defaults`
+
 Hard structure:
 - `worker` must be `family_specialist`
 - top-level `family_id` must equal `family_result.family_id`
 - `recommended_table_name`, `member_semantics_notes`, and `reasoning` must be non-empty strings
 - `recommended_parent_key` and `recommended_repeat_index_name` must be strings and may be blank
 - `confidence` must be numeric and between 0 and 1
+- if present, `member_defaults` must stay an object and must only contain family-shared non-structural defaults
 - `review_flags` and `assumptions` must be arrays
 - `needs_human_review` must be boolean
 
@@ -53,3 +57,4 @@ Repair strategy:
 - do not invent respondent-style linkage for reference-like or unresolved families just to make the row look more complete
 - if `recommended_handling = retain_as_child_table` and linkage is blank, first try to recover linkage from the existing invalid JSON; only relax handling if the validation error or the original content clearly requires it
 - preserve accepted family identity and table naming unless a listed validation error requires a change
+- preserve `member_defaults` when present unless a listed validation error requires repairing or removing a specific invalid field

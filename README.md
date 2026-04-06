@@ -86,9 +86,9 @@ Current view surfaces:
 
 `GET /artifact-bundles` is the simplest Dify-facing interface for workers that only need profile-default pruning.
 
-For workers that need request-scoped pruning inputs, use `POST /artifact-bundles/view`. This now matters for `type_transform_worker`, `missingness_worker`, `semantic_context_worker`, `family_worker`, `table_layout_worker`, and `analysis_layout_worker`.
+For workers that need request-scoped pruning inputs, use `POST /artifact-bundles/view`. This now matters for `type_transform_worker`, `missingness_worker`, `semantic_context_worker`, `family_worker`, `table_layout_worker`, `analysis_layout_worker`, and `canonical_contract_reviewer`.
 
-- `type_transform_worker`, `missingness_worker`, `semantic_context_worker`, `table_layout_worker`, and `analysis_layout_worker` can accept `global.value_filter.force_include_columns` so finalized grain, reference, and family linkage columns are always retained in a scoped bundle.
+- `type_transform_worker`, `missingness_worker`, `semantic_context_worker`, `table_layout_worker`, `analysis_layout_worker`, and `canonical_contract_reviewer` can accept `global.value_filter.force_include_columns` so finalized grain, reference, and family linkage columns are always retained in a scoped bundle.
 - `family_worker` can additionally accept `global.value_filter.force_include_family_ids` so `A8` and `B1` are reduced to just the accepted families under review.
 - `table_layout_worker` can additionally accept `global.value_filter.preferred_primary_grain_keys` so `A12` layout candidates are re-ranked toward the accepted primary grain before projection.
 
@@ -199,6 +199,7 @@ The current artifact registry defined in [`app.py`](/Users/nikhil/Automations/di
 - `A13` semantic anchors
 - `A14` quality heatmap
 - `A16` conditional missingness / skip-logic proofs
+- `A17` baseline column resolution
 - `B1` family packets
 
 These artifacts are intended to form an evidence graph for downstream workers rather than a single flat profiling report.
@@ -263,6 +264,7 @@ The repository also contains a local profile example:
 - [`profiles/family_worker.json`](/Users/nikhil/Automations/dify-profiler/profiles/family_worker.json)
 - [`profiles/table_layout_worker.json`](/Users/nikhil/Automations/dify-profiler/profiles/table_layout_worker.json)
 - [`profiles/analysis_layout_worker.json`](/Users/nikhil/Automations/dify-profiler/profiles/analysis_layout_worker.json)
+- [`profiles/canonical_contract_reviewer.json`](/Users/nikhil/Automations/dify-profiler/profiles/canonical_contract_reviewer.json)
 
 ## Current Dify Integration Model
 
@@ -288,6 +290,7 @@ After semantic, type, and missingness workers have produced validated JSON outpu
    - matched `A8` and `B1` family evidence
 4. run [`prompts/family_worker_system_prompt.md`](/Users/nikhil/Automations/dify-profiler/prompts/family_worker_system_prompt.md) once per family
 5. validate each family JSON item, repair once if needed, then aggregate into one `family_worker_json`
+   - each family item may optionally include `member_defaults` for safe family-wide type or missingness defaults that should propagate to sibling columns later
 
 The intended next stage after family is a single-pass canonical table-layout proposal worker:
 
@@ -332,7 +335,84 @@ This canonical stage is intended to produce:
 
 It is still a proposal-stage worker. It does not emit merged wave tables, score tables, or other analysis-ready outputs.
 
-The intended next stage after canonical layout is an analysis-layout worker:
+The intended next stage after canonical layout is a deterministic canonical-column-contract synthesis node:
+
+1. call `POST /contracts/canonical-columns`
+2. send:
+   - `run_id`
+   - `light_contract_decisions`
+   - `semantic_context_json`
+   - `type_transform_worker_json`
+   - `missingness_worker_json`
+   - `family_worker_json`
+   - `table_layout_worker_json`
+3. let the backend load `A17` directly for the same `run_id`
+   - if `A17` is missing, the backend deterministically rebuilds it from `A2`, `A3-T`, `A3-V`, `A4`, `A9`, `A13`, `A14`, and `A16`
+4. consume one canonical contract object with:
+   - `summary`
+   - `column_contracts`
+   - `global_value_rules`
+   - `review_flags`
+   - `assumptions`
+
+This node is deterministic by design. It does not reinterpret free-form prose from light-contract comments or semantic notes. It only consumes structured reviewed outputs plus profiler artifacts.
+
+Its job is to:
+- emit one per-column contract row for every A2 source column
+- preserve reviewed overrides where they exist
+- propagate optional `family_worker_json.member_defaults` where a shared family default is safe
+- fill remaining non-structural control fields from the deterministic `A17` baseline layer
+- leave semantic enrichment blank when no structured evidence exists
+- expose provenance for type, structure, missingness, and semantic decisions
+
+The canonical merge order is:
+1. structure from `table_layout_worker_json` plus light-contract fallbacks
+2. semantic enrichment from `semantic_context_json`
+3. family-shared defaults from `family_worker_json.member_defaults`
+4. reviewed column overrides from `type_transform_worker_json`
+5. reviewed missingness overrides from `missingness_worker_json`
+6. `A17` for all remaining non-structural gaps
+
+For Dify structured-output or contract documentation, use:
+- [`schemas/canonical_column_contract.response.schema.json`](/Users/nikhil/Automations/dify-profiler/schemas/canonical_column_contract.response.schema.json)
+
+For validator-node use, use:
+- [`JSON validators/canonical_column_contract_validator.json`](/Users/nikhil/Automations/dify-profiler/JSON%20validators/canonical_column_contract_validator.json)
+
+For a local synthesis + validator smoke check, run:
+- `python scripts/canonical_column_contract_smoke.py`
+
+The intended next stage after the canonical-column contract is a canonical-contract reviewer:
+
+1. request `POST /artifact-bundles/view` with `mode = "canonical_contract_reviewer"`
+2. combine the returned bundle with:
+   - `canonical_column_contract_json`
+   - `light_contract_decisions`
+   - `semantic_context_json`
+   - `type_transform_worker_json`
+   - `missingness_worker_json`
+   - `family_worker_json`
+   - `table_layout_worker_json`
+3. run [`prompts/canonical_contract_reviewer_system_prompt.md`](/Users/nikhil/Automations/dify-profiler/prompts/canonical_contract_reviewer_system_prompt.md)
+4. validate the returned JSON, repair once if needed, then resolve one authoritative reviewer envelope containing:
+   - `review_summary`
+   - `reviewed_contract`
+   - `change_log`
+   - `review_flags`
+   - `assumptions`
+
+This reviewer is intentionally not a patch-only node. It returns the full edited contract plus an exhaustive change ledger, and the validator enforces that every substantive diff from the draft contract is logged.
+
+For validator-node use, use:
+- [`JSON validators/canonical_contract_reviewer_validator.json`](/Users/nikhil/Automations/dify-profiler/JSON%20validators/canonical_contract_reviewer_validator.json)
+
+For repair-node use, use:
+- [`prompts/REPAIR_canonical_contract_reviewer.md`](/Users/nikhil/Automations/dify-profiler/prompts/REPAIR_canonical_contract_reviewer.md)
+
+For a local reviewer-validator smoke check, run:
+- `python scripts/canonical_contract_reviewer_smoke.py`
+
+The intended next stage after the canonical-contract reviewer remains an analysis-layout worker:
 
 1. request `POST /artifact-bundles/view` with `mode = "analysis_layout_worker"`
 2. combine the returned bundle with:

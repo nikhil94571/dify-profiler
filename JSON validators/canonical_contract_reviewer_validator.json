@@ -1,0 +1,884 @@
+import json
+
+REQUIRED_TOP_LEVEL = [
+    "worker",
+    "review_summary",
+    "reviewed_contract",
+    "change_log",
+    "review_flags",
+    "assumptions",
+]
+
+REVIEW_SUMMARY_REQUIRED = [
+    "overview",
+    "change_count",
+    "changed_column_count",
+    "review_principles",
+]
+
+CANONICAL_REQUIRED_TOP_LEVEL = [
+    "worker",
+    "summary",
+    "column_contracts",
+    "global_value_rules",
+    "review_flags",
+    "assumptions",
+]
+
+CANONICAL_MODELING_STATUSES = {
+    "base_field",
+    "child_repeat_member",
+    "reference_field",
+    "event_field",
+    "excluded_from_outputs",
+    "unresolved",
+}
+
+CANONICAL_ASSIGNMENT_ROLES = {
+    "base_key",
+    "base_attribute",
+    "reference_key",
+    "reference_attribute",
+    "repeat_parent_key",
+    "repeat_index",
+    "melt_member",
+    "reference_value",
+    "exclude_from_outputs",
+    "unresolved",
+}
+
+TYPE_LOGICAL_TYPES = {
+    "identifier",
+    "categorical_code",
+    "nominal_category",
+    "ordinal_category",
+    "boolean_flag",
+    "date",
+    "datetime",
+    "numeric_measure",
+    "free_text",
+    "mixed_or_ambiguous",
+}
+
+TYPE_STORAGE_TYPES = {
+    "string",
+    "integer",
+    "decimal",
+    "boolean",
+    "date",
+    "datetime",
+}
+
+TYPE_TRANSFORM_ACTIONS = {
+    "trim_whitespace",
+    "normalize_missing_tokens",
+    "normalize_boolean_tokens",
+    "cast_to_string",
+    "cast_to_integer",
+    "cast_to_decimal",
+    "cast_to_date",
+    "cast_to_datetime",
+    "strip_numeric_formatting",
+    "normalize_decimal_separator",
+    "lowercase_values",
+    "uppercase_values",
+    "titlecase_values",
+    "normalize_category_tokens",
+    "extract_numeric_component",
+    "strip_unit_suffix",
+    "standardize_percent_scale",
+}
+
+TYPE_STRUCTURAL_HINTS = {
+    "split_multiselect_tokens",
+    "requires_multiselect_modeling_decision",
+    "split_range_into_start_end",
+    "requires_range_semantics_review",
+    "requires_unit_normalization_review",
+    "requires_wide_to_long_review",
+    "requires_child_table_review",
+    "requires_multi_column_derivation",
+    "requires_start_end_pair_review",
+    "requires_codebook_or_label_mapping_review",
+}
+
+TYPE_INTERPRETATION_HINTS = {
+    "leading_zero_risk",
+    "identifier_not_measure",
+    "code_not_quantity",
+    "time_index_not_identifier",
+    "repeat_context_do_not_use_as_base_key",
+    "skip_logic_protected",
+    "mixed_content_high_risk",
+    "free_text_high_cardinality",
+    "numeric_parse_is_misleading",
+    "light_contract_override_applied",
+}
+
+MISSINGNESS_DISPOSITIONS = {
+    "no_material_missingness",
+    "token_missingness_present",
+    "structurally_valid_missingness",
+    "partially_structural_missingness",
+    "unexplained_high_missingness",
+    "mixed_missingness_risk",
+}
+
+MISSINGNESS_HANDLING = {
+    "no_action_needed",
+    "protect_from_null_penalty",
+    "retain_with_caution",
+    "review_before_drop",
+    "candidate_drop_review",
+}
+
+TYPE_DECISION_SOURCES = {
+    "reviewed_type_worker",
+    "family_default",
+    "a17_baseline",
+    "unresolved_no_a2_evidence",
+}
+
+STRUCTURE_DECISION_SOURCES = {
+    "table_layout_worker",
+    "light_contract_fallback",
+    "unresolved",
+}
+
+MISSINGNESS_DECISION_SOURCES = {
+    "reviewed_missingness_worker",
+    "family_default",
+    "a17_baseline",
+    "unresolved_no_a2_evidence",
+}
+
+SEMANTIC_DECISION_SOURCES = {
+    "semantic_context_worker",
+    "family_worker",
+    "unknown",
+}
+
+_MISSING = object()
+
+
+def _add_error(errors, message):
+    if message not in errors:
+        errors.append(message)
+
+
+def _qualify(path_prefix, suffix):
+    return f"{path_prefix}.{suffix}" if path_prefix else suffix
+
+
+def _require_obj(value, field_name, errors):
+    if not isinstance(value, dict):
+        _add_error(errors, f"{field_name} must be an object.")
+        return False
+    return True
+
+
+def _require_list(value, field_name, errors):
+    if not isinstance(value, list):
+        _add_error(errors, f"{field_name} must be an array.")
+        return False
+    return True
+
+
+def _require_str(value, field_name, errors, allow_blank=False):
+    if not isinstance(value, str):
+        _add_error(errors, f"{field_name} must be a string.")
+        return False
+    if not allow_blank and value.strip() == "":
+        _add_error(errors, f"{field_name} must not be blank.")
+        return False
+    return True
+
+
+def _require_bool(value, field_name, errors):
+    if not isinstance(value, bool):
+        _add_error(errors, f"{field_name} must be a boolean.")
+        return False
+    return True
+
+
+def _require_string_list(value, field_name, errors, allow_empty=True, allow_blank_items=False):
+    if not _require_list(value, field_name, errors):
+        return False
+    ok = True
+    if not allow_empty and len(value) == 0:
+        _add_error(errors, f"{field_name} must not be empty.")
+        ok = False
+    for i, item in enumerate(value):
+        if not _require_str(item, f"{field_name}[{i}]", errors, allow_blank=allow_blank_items):
+            ok = False
+    return ok
+
+
+def _is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _parse_json_object(raw_value, field_name):
+    if not isinstance(raw_value, str):
+        return None, [f"{field_name} must be a string."]
+    if raw_value.strip() == "":
+        return None, [f"{field_name} is empty."]
+    try:
+        parsed = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        return None, [f"{field_name} is not valid JSON: {exc}"]
+    if not isinstance(parsed, dict):
+        return None, [f"{field_name} root must be an object."]
+    return parsed, []
+
+
+def _validate_summary(summary, errors, path_prefix):
+    if not _require_obj(summary, path_prefix, errors):
+        return
+
+    required = [
+        "overview",
+        "total_source_columns",
+        "included_column_count",
+        "excluded_column_count",
+        "unresolved_column_count",
+        "reviewed_override_count",
+        "family_default_count",
+        "deterministic_baseline_count",
+        "reviewed_type_count",
+        "fallback_type_count",
+        "key_contract_principles",
+    ]
+    for key in required:
+        if key not in summary:
+            _add_error(errors, f"{path_prefix}.{key} is required.")
+
+    if "overview" in summary:
+        _require_str(summary["overview"], f"{path_prefix}.overview", errors)
+
+    for key in [
+        "total_source_columns",
+        "included_column_count",
+        "excluded_column_count",
+        "unresolved_column_count",
+        "reviewed_override_count",
+        "family_default_count",
+        "deterministic_baseline_count",
+        "reviewed_type_count",
+        "fallback_type_count",
+    ]:
+        if key in summary and not isinstance(summary[key], int):
+            _add_error(errors, f"{path_prefix}.{key} must be an integer.")
+
+    if "key_contract_principles" in summary and _require_list(summary["key_contract_principles"], f"{path_prefix}.key_contract_principles", errors):
+        for i, item in enumerate(summary["key_contract_principles"]):
+            _require_str(item, f"{path_prefix}.key_contract_principles[{i}]", errors)
+
+
+def _validate_column_contracts(rows, errors, rows_path, expected_source_columns=None):
+    if not _require_list(rows, rows_path, errors):
+        return
+    if len(rows) == 0:
+        _add_error(errors, f"{rows_path} must not be empty.")
+        return
+
+    seen_columns = set()
+    expected_set = set(expected_source_columns or [])
+    seen_expected = set()
+
+    required = [
+        "column",
+        "canonical_modeling_status",
+        "canonical_table_name",
+        "canonical_assignment_role",
+        "source_family_id",
+        "a9_primary_role",
+        "recommended_logical_type",
+        "recommended_storage_type",
+        "transform_actions",
+        "structural_transform_hints",
+        "interpretation_hints",
+        "missingness_disposition",
+        "missingness_handling",
+        "skip_logic_protected",
+        "confidence",
+        "needs_human_review",
+        "type_decision_source",
+        "structure_decision_source",
+        "missingness_decision_source",
+        "semantic_decision_source",
+        "applied_sources",
+    ]
+
+    for i, row in enumerate(rows):
+        path = f"{rows_path}[{i}]"
+        if not _require_obj(row, path, errors):
+            continue
+        for key in required:
+            if key not in row:
+                _add_error(errors, f"{path}.{key} is required.")
+
+        column_valid = "column" in row and _require_str(row["column"], f"{path}.column", errors)
+        if column_valid:
+            if row["column"] in seen_columns:
+                _add_error(errors, f"Duplicate column contract entry for column: {row['column']}")
+            else:
+                seen_columns.add(row["column"])
+                if row["column"] in expected_set:
+                    seen_expected.add(row["column"])
+
+        if "canonical_modeling_status" in row and _require_str(row["canonical_modeling_status"], f"{path}.canonical_modeling_status", errors):
+            if row["canonical_modeling_status"] not in CANONICAL_MODELING_STATUSES:
+                _add_error(errors, f"{path}.canonical_modeling_status is invalid.")
+
+        if "canonical_assignment_role" in row and _require_str(row["canonical_assignment_role"], f"{path}.canonical_assignment_role", errors):
+            if row["canonical_assignment_role"] not in CANONICAL_ASSIGNMENT_ROLES:
+                _add_error(errors, f"{path}.canonical_assignment_role is invalid.")
+
+        if "canonical_table_name" in row:
+            _require_str(row["canonical_table_name"], f"{path}.canonical_table_name", errors, allow_blank=True)
+            if row.get("canonical_assignment_role") in {"exclude_from_outputs", "unresolved"} and str(row["canonical_table_name"]).strip() != "":
+                _add_error(errors, f"{path}.canonical_table_name must be blank for excluded or unresolved columns.")
+            if row.get("canonical_assignment_role") not in {"exclude_from_outputs", "unresolved"} and str(row["canonical_table_name"]).strip() == "":
+                _add_error(errors, f"{path}.canonical_table_name must not be blank for resolved columns.")
+
+        for key in ["source_family_id", "a9_primary_role"]:
+            if key in row:
+                _require_str(row[key], f"{path}.{key}", errors, allow_blank=True)
+
+        if "recommended_logical_type" in row and _require_str(row["recommended_logical_type"], f"{path}.recommended_logical_type", errors):
+            if row["recommended_logical_type"] not in TYPE_LOGICAL_TYPES:
+                _add_error(errors, f"{path}.recommended_logical_type is invalid.")
+
+        if "recommended_storage_type" in row and _require_str(row["recommended_storage_type"], f"{path}.recommended_storage_type", errors):
+            if row["recommended_storage_type"] not in TYPE_STORAGE_TYPES:
+                _add_error(errors, f"{path}.recommended_storage_type is invalid.")
+
+        for list_key, allowed in [
+            ("transform_actions", TYPE_TRANSFORM_ACTIONS),
+            ("structural_transform_hints", TYPE_STRUCTURAL_HINTS),
+            ("interpretation_hints", TYPE_INTERPRETATION_HINTS),
+        ]:
+            if list_key in row and _require_list(row[list_key], f"{path}.{list_key}", errors):
+                for j, item in enumerate(row[list_key]):
+                    if not _require_str(item, f"{path}.{list_key}[{j}]", errors):
+                        continue
+                    if item not in allowed:
+                        _add_error(errors, f"{path}.{list_key}[{j}] is invalid.")
+
+        if "missingness_disposition" in row and _require_str(row["missingness_disposition"], f"{path}.missingness_disposition", errors):
+            if row["missingness_disposition"] not in MISSINGNESS_DISPOSITIONS:
+                _add_error(errors, f"{path}.missingness_disposition is invalid.")
+
+        if "missingness_handling" in row and _require_str(row["missingness_handling"], f"{path}.missingness_handling", errors):
+            if row["missingness_handling"] not in MISSINGNESS_HANDLING:
+                _add_error(errors, f"{path}.missingness_handling is invalid.")
+
+        if "skip_logic_protected" in row:
+            _require_bool(row["skip_logic_protected"], f"{path}.skip_logic_protected", errors)
+
+        if "needs_human_review" in row:
+            _require_bool(row["needs_human_review"], f"{path}.needs_human_review", errors)
+
+        for key, allowed in [
+            ("type_decision_source", TYPE_DECISION_SOURCES),
+            ("structure_decision_source", STRUCTURE_DECISION_SOURCES),
+            ("missingness_decision_source", MISSINGNESS_DECISION_SOURCES),
+            ("semantic_decision_source", SEMANTIC_DECISION_SOURCES),
+        ]:
+            if key in row and _require_str(row[key], f"{path}.{key}", errors):
+                if row[key] not in allowed:
+                    _add_error(errors, f"{path}.{key} is invalid.")
+
+        if "applied_sources" in row and _require_list(row["applied_sources"], f"{path}.applied_sources", errors):
+            for j, item in enumerate(row["applied_sources"]):
+                _require_str(item, f"{path}.applied_sources[{j}]", errors)
+
+        if "confidence" in row:
+            if not _is_number(row["confidence"]):
+                _add_error(errors, f"{path}.confidence must be numeric.")
+            elif not (0 <= float(row["confidence"]) <= 1):
+                _add_error(errors, f"{path}.confidence must be between 0 and 1.")
+
+        for key in ["semantic_meaning", "codebook_note", "normalization_notes"]:
+            if key in row and row[key] is not None:
+                _require_str(row[key], f"{path}.{key}", errors, allow_blank=True)
+
+        if "quality_score" in row and row["quality_score"] is not None:
+            if not _is_number(row["quality_score"]):
+                _add_error(errors, f"{path}.quality_score must be numeric when provided.")
+            elif not (0 <= float(row["quality_score"]) <= 1):
+                _add_error(errors, f"{path}.quality_score must be between 0 and 1 when provided.")
+
+        if "drift_detected" in row and row["drift_detected"] is not None:
+            _require_bool(row["drift_detected"], f"{path}.drift_detected", errors)
+
+    if expected_source_columns is not None:
+        missing_columns = sorted(expected_set - seen_expected)
+        if missing_columns:
+            _add_error(errors, f"{rows_path} is missing source columns: {', '.join(missing_columns)}")
+
+
+def _validate_global_value_rules(rules, errors, path_prefix):
+    if not _require_list(rules, path_prefix, errors):
+        return
+    for i, item in enumerate(rules):
+        path = f"{path_prefix}[{i}]"
+        if not _require_obj(item, path, errors):
+            continue
+        for key in ["rule_name", "applies_when", "rule_description"]:
+            if key not in item:
+                _add_error(errors, f"{path}.{key} is required.")
+            else:
+                _require_str(item[key], f"{path}.{key}", errors)
+
+
+def _validate_review_flags(review_flags, errors, path_prefix):
+    if not _require_list(review_flags, path_prefix, errors):
+        return
+    for i, item in enumerate(review_flags):
+        path = f"{path_prefix}[{i}]"
+        if not _require_obj(item, path, errors):
+            continue
+        for key in ["item", "issue", "why"]:
+            if key not in item:
+                _add_error(errors, f"{path}.{key} is required.")
+            else:
+                _require_str(item[key], f"{path}.{key}", errors)
+
+
+def _validate_assumptions(assumptions, errors, path_prefix):
+    if not _require_list(assumptions, path_prefix, errors):
+        return
+    for i, item in enumerate(assumptions):
+        path = f"{path_prefix}[{i}]"
+        if not _require_obj(item, path, errors):
+            continue
+        for key in ["assumption", "explanation"]:
+            if key not in item:
+                _add_error(errors, f"{path}.{key} is required.")
+            else:
+                _require_str(item[key], f"{path}.{key}", errors)
+
+
+def _validate_canonical_contract_dict(parsed, errors, expected_source_columns=None, path_prefix="", enforce_worker=True):
+    if not _require_obj(parsed, path_prefix or "contract", errors):
+        return
+
+    for key in CANONICAL_REQUIRED_TOP_LEVEL:
+        if key not in parsed:
+            _add_error(errors, f"Missing required top-level key: {_qualify(path_prefix, key)}")
+
+    worker_path = _qualify(path_prefix, "worker")
+    if "worker" in parsed and _require_str(parsed["worker"], worker_path, errors):
+        if enforce_worker and parsed["worker"] != "canonical_column_contract_builder":
+            _add_error(errors, f"{worker_path} must be 'canonical_column_contract_builder'.")
+
+    if "summary" in parsed:
+        _validate_summary(parsed["summary"], errors, _qualify(path_prefix, "summary"))
+    if "column_contracts" in parsed:
+        _validate_column_contracts(
+            parsed["column_contracts"],
+            errors,
+            _qualify(path_prefix, "column_contracts"),
+            expected_source_columns=expected_source_columns,
+        )
+    if "global_value_rules" in parsed:
+        _validate_global_value_rules(parsed["global_value_rules"], errors, _qualify(path_prefix, "global_value_rules"))
+    if "review_flags" in parsed:
+        _validate_review_flags(parsed["review_flags"], errors, _qualify(path_prefix, "review_flags"))
+    if "assumptions" in parsed:
+        _validate_assumptions(parsed["assumptions"], errors, _qualify(path_prefix, "assumptions"))
+
+
+def _validate_reviewed_contract_summary_counts(reviewed_contract, errors):
+    if not isinstance(reviewed_contract, dict):
+        return
+    summary = reviewed_contract.get("summary")
+    rows = reviewed_contract.get("column_contracts")
+    if not isinstance(summary, dict) or not isinstance(rows, list):
+        return
+
+    expected_counts = {
+        "total_source_columns": len(rows),
+        "included_column_count": sum(
+            1 for row in rows
+            if isinstance(row, dict) and row.get("canonical_modeling_status") not in {"excluded_from_outputs", "unresolved"}
+        ),
+        "excluded_column_count": sum(
+            1 for row in rows
+            if isinstance(row, dict) and row.get("canonical_modeling_status") == "excluded_from_outputs"
+        ),
+        "unresolved_column_count": sum(
+            1 for row in rows
+            if isinstance(row, dict) and row.get("canonical_modeling_status") == "unresolved"
+        ),
+        "reviewed_override_count": sum(
+            1 for row in rows
+            if isinstance(row, dict) and (
+                row.get("type_decision_source") == "reviewed_type_worker"
+                or row.get("missingness_decision_source") == "reviewed_missingness_worker"
+            )
+        ),
+        "family_default_count": sum(
+            1 for row in rows
+            if isinstance(row, dict) and (
+                row.get("type_decision_source") == "family_default"
+                or row.get("missingness_decision_source") == "family_default"
+            )
+        ),
+        "deterministic_baseline_count": sum(
+            1 for row in rows
+            if isinstance(row, dict)
+            and row.get("type_decision_source") == "a17_baseline"
+            and row.get("missingness_decision_source") == "a17_baseline"
+        ),
+        "reviewed_type_count": sum(
+            1 for row in rows
+            if isinstance(row, dict) and row.get("type_decision_source") == "reviewed_type_worker"
+        ),
+        "fallback_type_count": sum(
+            1 for row in rows
+            if isinstance(row, dict) and row.get("type_decision_source") != "reviewed_type_worker"
+        ),
+    }
+
+    for key, expected in expected_counts.items():
+        if isinstance(summary.get(key), int) and summary.get(key) != expected:
+            _add_error(errors, f"reviewed_contract.summary.{key} must equal {expected} for the reviewed contract rows.")
+
+
+def _validate_review_summary(review_summary, errors):
+    if not _require_obj(review_summary, "review_summary", errors):
+        return
+    for key in REVIEW_SUMMARY_REQUIRED:
+        if key not in review_summary:
+            _add_error(errors, f"review_summary.{key} is required.")
+
+    if "overview" in review_summary:
+        _require_str(review_summary["overview"], "review_summary.overview", errors)
+    for key in ["change_count", "changed_column_count"]:
+        if key in review_summary and not isinstance(review_summary[key], int):
+            _add_error(errors, f"review_summary.{key} must be an integer.")
+    if "review_principles" in review_summary:
+        _require_string_list(
+            review_summary["review_principles"],
+            "review_summary.review_principles",
+            errors,
+            allow_empty=True,
+            allow_blank_items=False,
+        )
+
+
+def _escape_pointer_segment(value):
+    return str(value).replace("~", "~0").replace("/", "~1")
+
+
+def _pointer_append(base, segment):
+    return f"{base}/{_escape_pointer_segment(segment)}"
+
+
+def _decode_pointer_segment(value):
+    return str(value).replace("~1", "/").replace("~0", "~")
+
+
+def _resolve_pointer(doc, pointer):
+    if pointer == "":
+        return True, doc
+    if not isinstance(pointer, str) or not pointer.startswith("/"):
+        return False, _MISSING
+    current = doc
+    for raw_part in pointer.split("/")[1:]:
+        part = _decode_pointer_segment(raw_part)
+        if isinstance(current, dict):
+            if part not in current:
+                return False, _MISSING
+            current = current[part]
+        elif isinstance(current, list):
+            if not part.isdigit():
+                return False, _MISSING
+            index = int(part)
+            if index < 0 or index >= len(current):
+                return False, _MISSING
+            current = current[index]
+        else:
+            return False, _MISSING
+    return True, current
+
+
+def _review_pointer_to_contract_pointer(target_path):
+    prefix = "/reviewed_contract"
+    if not isinstance(target_path, str) or not target_path.startswith(prefix):
+        return None
+    suffix = target_path[len(prefix):]
+    if suffix == "":
+        return ""
+    return suffix if suffix.startswith("/") else f"/{suffix}"
+
+
+def _column_path_column_name(reviewed_contract, target_path):
+    prefix = "/reviewed_contract/column_contracts/"
+    if not isinstance(target_path, str) or not target_path.startswith(prefix):
+        return None
+    suffix = target_path[len(prefix):]
+    first = suffix.split("/", 1)[0]
+    if not first.isdigit():
+        return None
+    index = int(first)
+    rows = reviewed_contract.get("column_contracts")
+    if not isinstance(rows, list) or index < 0 or index >= len(rows):
+        return None
+    row = rows[index]
+    if not isinstance(row, dict):
+        return None
+    return row.get("column")
+
+
+def _collect_diffs(before, after, path="/reviewed_contract", out=None):
+    if out is None:
+        out = set()
+
+    if isinstance(before, dict) and isinstance(after, dict):
+        keys = sorted(set(before.keys()) | set(after.keys()))
+        for key in keys:
+            next_path = _pointer_append(path, key)
+            if key not in before or key not in after:
+                out.add(next_path)
+            else:
+                _collect_diffs(before[key], after[key], next_path, out)
+        return out
+
+    if isinstance(before, list) and isinstance(after, list):
+        max_len = max(len(before), len(after))
+        for index in range(max_len):
+            next_path = _pointer_append(path, index)
+            if index >= len(before) or index >= len(after):
+                out.add(next_path)
+            else:
+                _collect_diffs(before[index], after[index], next_path, out)
+        return out
+
+    if before != after:
+        out.add(path)
+    return out
+
+
+def _path_covered(diff_path, change_paths):
+    for change_path in change_paths:
+        if diff_path == change_path or diff_path.startswith(change_path + "/"):
+            return True
+    return False
+
+
+def _validate_change_log(change_log, original_contract, reviewed_contract, errors):
+    if not _require_list(change_log, "change_log", errors):
+        return []
+
+    seen_change_ids = set()
+    change_paths = []
+
+    for i, item in enumerate(change_log):
+        path = f"change_log[{i}]"
+        if not _require_obj(item, path, errors):
+            continue
+
+        required = [
+            "change_id",
+            "column",
+            "target_path",
+            "before_value",
+            "after_value",
+            "reasoning",
+            "justification",
+            "confidence",
+            "needs_human_review",
+        ]
+        for key in required:
+            if key not in item:
+                _add_error(errors, f"{path}.{key} is required.")
+
+        if "change_id" in item and _require_str(item["change_id"], f"{path}.change_id", errors):
+            if item["change_id"] in seen_change_ids:
+                _add_error(errors, f"Duplicate change_log.change_id: {item['change_id']}")
+            else:
+                seen_change_ids.add(item["change_id"])
+
+        if "column" in item:
+            _require_str(item["column"], f"{path}.column", errors, allow_blank=True)
+
+        target_path = item.get("target_path")
+        resolved_reviewed = _MISSING
+        if "target_path" in item and _require_str(target_path, f"{path}.target_path", errors):
+            if not target_path.startswith("/reviewed_contract/") and target_path != "/reviewed_contract":
+                _add_error(errors, f"{path}.target_path must start with /reviewed_contract/.")
+            else:
+                exists_reviewed, resolved_reviewed = _resolve_pointer({"reviewed_contract": reviewed_contract}, target_path)
+                if not exists_reviewed:
+                    _add_error(errors, f"{path}.target_path does not resolve in reviewed_contract.")
+                else:
+                    change_paths.append(target_path)
+
+                row_column_name = _column_path_column_name(reviewed_contract, target_path)
+                if row_column_name is not None:
+                    if str(item.get("column") or "").strip() == "":
+                        _add_error(errors, f"{path}.column must not be blank for row-level changes.")
+                    elif item.get("column") != row_column_name:
+                        _add_error(errors, f"{path}.column must match the referenced reviewed row column ({row_column_name}).")
+
+                contract_pointer = _review_pointer_to_contract_pointer(target_path)
+                if contract_pointer is not None:
+                    exists_original, resolved_original = _resolve_pointer(original_contract, contract_pointer)
+                    if exists_original and item.get("before_value") != resolved_original:
+                        _add_error(errors, f"{path}.before_value must match the original contract value at target_path.")
+                    if resolved_reviewed is not _MISSING and item.get("after_value") != resolved_reviewed:
+                        _add_error(errors, f"{path}.after_value must match the reviewed contract value at target_path.")
+                    if exists_original and resolved_reviewed is not _MISSING and resolved_original == resolved_reviewed:
+                        _add_error(errors, f"{path} is a no-op change entry.")
+
+        for text_key in ["reasoning", "justification"]:
+            if text_key in item:
+                _require_str(item[text_key], f"{path}.{text_key}", errors)
+
+        if "confidence" in item:
+            if not _is_number(item["confidence"]):
+                _add_error(errors, f"{path}.confidence must be numeric.")
+            elif not (0 <= float(item["confidence"]) <= 1):
+                _add_error(errors, f"{path}.confidence must be between 0 and 1.")
+
+        if "needs_human_review" in item:
+            _require_bool(item["needs_human_review"], f"{path}.needs_human_review", errors)
+
+    return change_paths
+
+
+def _validate_strict(reviewer_output: str, original_contract_json: str):
+    reviewed_envelope, parse_errors = _parse_json_object(reviewer_output, "reviewer_output")
+    if parse_errors:
+        error = parse_errors[0]
+        return {
+            "validation_ok": "false",
+            "canonical_contract_reviewer_json": "",
+            "validation_error": error,
+            "validation_errors_json": json.dumps(parse_errors, separators=(",", ":")),
+        }
+
+    original_contract, original_errors = _parse_json_object(original_contract_json, "original_contract_json")
+    if original_errors:
+        error = original_errors[0]
+        return {
+            "validation_ok": "false",
+            "canonical_contract_reviewer_json": "",
+            "validation_error": error,
+            "validation_errors_json": json.dumps(original_errors, separators=(",", ":")),
+        }
+
+    errors = []
+
+    original_expected_columns = None
+    if isinstance(original_contract.get("column_contracts"), list):
+        original_expected_columns = [
+            row.get("column")
+            for row in original_contract.get("column_contracts")
+            if isinstance(row, dict) and isinstance(row.get("column"), str) and row.get("column").strip() != ""
+        ]
+
+    _validate_canonical_contract_dict(
+        original_contract,
+        errors,
+        expected_source_columns=original_expected_columns,
+        path_prefix="original_contract",
+        enforce_worker=True,
+    )
+
+    for key in REQUIRED_TOP_LEVEL:
+        if key not in reviewed_envelope:
+            _add_error(errors, f"Missing required top-level key: {key}")
+
+    if "worker" in reviewed_envelope and _require_str(reviewed_envelope["worker"], "worker", errors):
+        if reviewed_envelope["worker"] != "canonical_contract_reviewer":
+            _add_error(errors, "worker must be 'canonical_contract_reviewer'.")
+
+    if "review_summary" in reviewed_envelope:
+        _validate_review_summary(reviewed_envelope["review_summary"], errors)
+
+    reviewed_contract = reviewed_envelope.get("reviewed_contract")
+    if "reviewed_contract" in reviewed_envelope:
+        _validate_canonical_contract_dict(
+            reviewed_contract,
+            errors,
+            expected_source_columns=original_expected_columns,
+            path_prefix="reviewed_contract",
+            enforce_worker=True,
+        )
+
+    if "review_flags" in reviewed_envelope:
+        _validate_review_flags(reviewed_envelope["review_flags"], errors, "review_flags")
+    if "assumptions" in reviewed_envelope:
+        _validate_assumptions(reviewed_envelope["assumptions"], errors, "assumptions")
+
+    if isinstance(original_contract.get("column_contracts"), list) and isinstance((reviewed_contract or {}).get("column_contracts"), list):
+        original_columns = [row.get("column") for row in original_contract["column_contracts"]]
+        reviewed_columns = [row.get("column") for row in reviewed_contract["column_contracts"]]
+        if len(original_columns) != len(reviewed_columns):
+            _add_error(errors, "reviewed_contract.column_contracts length must match the original contract exactly.")
+        else:
+            for index, (before_col, after_col) in enumerate(zip(original_columns, reviewed_columns)):
+                if before_col != after_col:
+                    _add_error(
+                        errors,
+                        f"reviewed_contract.column_contracts order changed at index {index}: expected {before_col}, found {after_col}.",
+                    )
+                    break
+
+    change_paths = []
+    if isinstance(reviewed_contract, dict) and "change_log" in reviewed_envelope:
+        change_paths = _validate_change_log(
+            reviewed_envelope["change_log"],
+            original_contract,
+            reviewed_contract,
+            errors,
+        )
+        _validate_reviewed_contract_summary_counts(reviewed_contract, errors)
+
+    review_summary = reviewed_envelope.get("review_summary") if isinstance(reviewed_envelope.get("review_summary"), dict) else {}
+    change_log = reviewed_envelope.get("change_log") if isinstance(reviewed_envelope.get("change_log"), list) else []
+    if isinstance(review_summary, dict):
+        if "change_count" in review_summary and isinstance(review_summary.get("change_count"), int):
+            if review_summary["change_count"] != len(change_log):
+                _add_error(errors, "review_summary.change_count must equal len(change_log).")
+        if "changed_column_count" in review_summary and isinstance(review_summary.get("changed_column_count"), int):
+            distinct_columns = {
+                str(item.get("column") or "").strip()
+                for item in change_log
+                if isinstance(item, dict) and str(item.get("column") or "").strip() != ""
+            }
+            if review_summary["changed_column_count"] != len(distinct_columns):
+                _add_error(errors, "review_summary.changed_column_count must equal the count of distinct non-blank change_log.column values.")
+
+    if isinstance(reviewed_contract, dict):
+        diff_paths = sorted(_collect_diffs(original_contract, reviewed_contract))
+        uncovered = [path for path in diff_paths if not _path_covered(path, change_paths)]
+        if uncovered:
+            for path in uncovered[:20]:
+                _add_error(errors, f"Unlogged substantive diff at {path}")
+            if len(uncovered) > 20:
+                _add_error(errors, f"Additional unlogged substantive diff count: {len(uncovered) - 20}")
+
+    if errors:
+        return {
+            "validation_ok": "false",
+            "canonical_contract_reviewer_json": "",
+            "validation_error": errors[0],
+            "validation_errors_json": json.dumps(errors, separators=(",", ":")),
+        }
+
+    return {
+        "validation_ok": "true",
+        "canonical_contract_reviewer_json": json.dumps(reviewed_envelope, separators=(",", ":")),
+        "validation_error": "",
+        "validation_errors_json": "[]",
+    }
+
+
+def main(reviewer_output: str, original_contract_json: str):
+    return _validate_strict(reviewer_output, original_contract_json)

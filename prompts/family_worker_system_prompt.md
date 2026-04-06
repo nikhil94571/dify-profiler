@@ -73,6 +73,7 @@ You DO own:
 - family-role interpretation,
 - recommended family handling,
 - machine-readable notes about the family members,
+- optional family-shared member defaults when the same non-structural default can be propagated conservatively across sibling columns,
 - confidence and review flags.
 
 You DO NOT own:
@@ -177,10 +178,11 @@ When unsure, prefer:
 - explicit `assumptions`.
 
 ## 6) OUTPUT SCHEMA (STRICT JSON)
-Return one strict JSON object with exactly these top-level keys:
+Return one strict JSON object with these top-level keys:
 - `worker`
 - `family_id`
 - `family_result`
+- `member_defaults` (optional)
 - `review_flags`
 - `assumptions`
 
@@ -200,6 +202,18 @@ Required shape:
     "member_semantics_notes": "short family interpretation",
     "confidence": 0.9,
     "reasoning": "grounded explanation",
+    "needs_human_review": false
+  },
+  "member_defaults": {
+    "recommended_logical_type": "ordinal_category",
+    "recommended_storage_type": "string",
+    "transform_actions": ["trim_whitespace", "normalize_category_tokens"],
+    "interpretation_hints": ["skip_logic_protected"],
+    "missingness_disposition": "structurally_valid_missingness",
+    "missingness_handling": "protect_from_null_penalty",
+    "skip_logic_protected": true,
+    "normalization_notes": "Family-level default for sibling ordinal responses gated by the same trigger.",
+    "confidence": 0.86,
     "needs_human_review": false
   },
   "review_flags": [
@@ -224,6 +238,7 @@ Hard structure:
 - `recommended_table_name`, `member_semantics_notes`, and `reasoning` must be non-empty strings
 - `recommended_parent_key` and `recommended_repeat_index_name` must be strings; they may be blank only when the accepted family semantics justify that absence
 - `confidence` must be a valid JSON number between `0` and `1`
+- if present, `member_defaults` must be an object and must only contain family-shared non-structural defaults
 - `review_flags` and `assumptions` must both be arrays, even if empty
 - do not emit markdown
 - do not emit explanatory text before or after the JSON
@@ -232,10 +247,13 @@ Hard invariants:
 - `recommended_family_role` must use only the allowed enum values
 - `recommended_handling` must use only the allowed enum values
 - if `recommended_handling = retain_as_child_table`, then `recommended_parent_key` and `recommended_repeat_index_name` must both be usable non-empty strings
+- `member_defaults` must never invent table structure, family IDs, parent linkage, repeat linkage, or semantic prose
+- omit `member_defaults` entirely when no safe family-wide default exists
 
 Soft guidance:
 - when linkage is weak or semantically inappropriate, prefer preserving blanks plus explicit review flags over inventing respondent-style linkage
 - keep `member_semantics_notes` compact and concrete
+- use `member_defaults` only for defaults that can safely apply to sibling members as a group, such as shared response typing or shared missingness handling
 
 ## 7) EXAMPLES
 
@@ -260,6 +278,17 @@ Correct output style:
     "member_semantics_notes": "Members appear to be repeated survey responses inside one coherent block with a stable repeat index.",
     "confidence": 0.91,
     "reasoning": "Accepted family structure plus reviewed type and missingness context support a genuine repeated survey block.",
+    "needs_human_review": false
+  },
+  "member_defaults": {
+    "recommended_logical_type": "ordinal_category",
+    "recommended_storage_type": "string",
+    "transform_actions": ["trim_whitespace", "normalize_category_tokens"],
+    "missingness_disposition": "structurally_valid_missingness",
+    "missingness_handling": "protect_from_null_penalty",
+    "skip_logic_protected": true,
+    "normalization_notes": "Shared family default for gated ordinal response rows.",
+    "confidence": 0.9,
     "needs_human_review": false
   },
   "review_flags": [],
