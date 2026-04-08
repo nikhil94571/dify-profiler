@@ -1,0 +1,437 @@
+import json
+
+ALLOWED_GRAIN_TYPES = {
+    "single_column",
+    "composite",
+    "no_clear_key",
+}
+
+ALLOWED_REFERENCE_KINDS = {
+    "descriptive_entity",
+    "code_list",
+    "answer_key_or_lookup",
+    "external_entity",
+    "other_reference",
+}
+
+ALLOWED_RELATIONSHIPS = {
+    "many_to_one",
+    "one_to_one",
+    "unknown",
+}
+
+ALLOWED_TABLE_STATUSES = {
+    "recommended",
+    "candidate",
+}
+
+ALLOWED_FAMILY_STATUSES = {
+    "confirm_detected",
+    "needs_user_input",
+}
+
+ALLOWED_ANSWER_TYPES = {
+    "boolean",
+    "enum",
+    "free_text",
+}
+
+ALLOWED_ENCODING_HINTS = {
+    "wide_or_mixed",
+    "likely_long_or_simple",
+    "unknown",
+}
+
+REQUIRED_TOP_LEVEL = [
+    "recommended_primary_grain",
+    "candidate_reference_tables",
+    "preliminary_table_plan",
+    "family_review_candidates",
+    "review_questions",
+    "user_inputs_requested",
+    "diagnostics",
+    "reasoning",
+    "assumptions",
+]
+
+REQUIRED_REVIEW_QUESTION_KEYS = [
+    "grain_confirmation",
+    "family_confirmation",
+    "index_drop_confirmation",
+]
+
+REQUIRED_USER_INPUT_KEYS = [
+    "global_renaming_instructions",
+    "missed_family_information",
+    "free_text_override_instructions",
+]
+
+
+def _normalization_repr(value):
+    return json.dumps(value, separators=(",", ":"))
+
+
+def _log_normalization(normalization_log, path, value):
+    normalization_log.append({
+        "path": path,
+        "defaulted_to": _normalization_repr(value),
+    })
+
+
+def _default_in_dict(container, key, value, path, normalization_log):
+    if not isinstance(container, dict):
+        return
+    if key not in container or container[key] is None:
+        container[key] = value
+        _log_normalization(normalization_log, path, value)
+
+
+def _normalize_grain_output(parsed):
+    normalization_log = []
+
+    if not isinstance(parsed, dict):
+        return parsed, normalization_log
+
+    _default_in_dict(parsed, "candidate_reference_tables", [], "candidate_reference_tables", normalization_log)
+    _default_in_dict(parsed, "preliminary_table_plan", [], "preliminary_table_plan", normalization_log)
+    _default_in_dict(parsed, "family_review_candidates", [], "family_review_candidates", normalization_log)
+    _default_in_dict(parsed, "assumptions", [], "assumptions", normalization_log)
+
+    diagnostics = parsed.get("diagnostics")
+    if isinstance(diagnostics, dict):
+        _default_in_dict(
+            diagnostics,
+            "rejected_primary_candidates",
+            [],
+            "diagnostics.rejected_primary_candidates",
+            normalization_log,
+        )
+
+    review_questions = parsed.get("review_questions")
+    if isinstance(review_questions, dict):
+        for key in REQUIRED_REVIEW_QUESTION_KEYS:
+            item = review_questions.get(key)
+            if isinstance(item, dict):
+                _default_in_dict(
+                    item,
+                    "allowed_answers",
+                    [],
+                    f"review_questions.{key}.allowed_answers",
+                    normalization_log,
+                )
+
+    return parsed, normalization_log
+
+
+def _add_error(errors, message):
+    if message not in errors:
+        errors.append(message)
+
+
+def _require(condition, message, errors):
+    if not condition:
+        _add_error(errors, message)
+
+
+def _is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _is_string(value):
+    return isinstance(value, str)
+
+
+def _is_non_empty_string(value):
+    return isinstance(value, str) and value.strip() != ""
+
+
+def _require_string(value, field_name, errors, allow_empty=False):
+    _require(isinstance(value, str), f"{field_name} must be a string", errors)
+    if not allow_empty:
+        _require(isinstance(value, str) and value.strip() != "", f"{field_name} must be a non-empty string", errors)
+
+
+def _require_bool(value, field_name, errors):
+    _require(isinstance(value, bool), f"{field_name} must be a boolean", errors)
+
+
+def _require_array(value, field_name, errors):
+    _require(isinstance(value, list), f"{field_name} must be an array", errors)
+
+
+def _require_string_array(value, field_name, errors, allow_empty=True):
+    _require_array(value, field_name, errors)
+    if not isinstance(value, list):
+        return
+    if not allow_empty:
+        _require(isinstance(value, list) and len(value) > 0, f"{field_name} must be a non-empty array", errors)
+    for i, item in enumerate(value):
+        _require(isinstance(item, str), f"{field_name}[{i}] must be a string", errors)
+
+
+def _require_object(value, field_name, errors):
+    _require(isinstance(value, dict), f"{field_name} must be an object", errors)
+
+
+def _require_enum(value, allowed, field_name, errors):
+    _require(value in allowed, f"Invalid {field_name}: {value}", errors)
+
+
+def _validate_recommended_primary_grain(value, errors):
+    field_name = "recommended_primary_grain"
+    _require_object(value, field_name, errors)
+    if not isinstance(value, dict):
+        return
+
+    _require_string(value.get("description"), f"{field_name}.description", errors)
+    _require_enum(value.get("grain_type"), ALLOWED_GRAIN_TYPES, f"{field_name}.grain_type", errors)
+    _require_string_array(value.get("keys"), f"{field_name}.keys", errors, allow_empty=False)
+    _require(_is_number(value.get("confidence_score")), f"{field_name}.confidence_score must be numeric", errors)
+    _require(
+        _is_number(value.get("confidence_score")) and 0.0 <= float(value["confidence_score"]) <= 1.0,
+        f"{field_name}.confidence_score must be between 0 and 1",
+        errors,
+    )
+    _require_string(value.get("justification"), f"{field_name}.justification", errors)
+
+    if value.get("grain_type") == "no_clear_key":
+        # The prompt still requires keys to be present; allow a conservative placeholder like ["UNKNOWN"]
+        _require(len(value.get("keys", [])) > 0, f"{field_name}.keys must still be non-empty for no_clear_key", errors)
+
+
+def _validate_candidate_reference_tables(value, errors):
+    field_name = "candidate_reference_tables"
+    _require_array(value, field_name, errors)
+    if not isinstance(value, list):
+        return
+
+    for i, item in enumerate(value):
+        item_name = f"{field_name}[{i}]"
+        if not isinstance(item, dict):
+            _require_object(item, item_name, errors)
+            continue
+        _require_string_array(item.get("keys"), f"{item_name}.keys", errors, allow_empty=False)
+        _require_string(item.get("entity_description"), f"{item_name}.entity_description", errors)
+        _require_string_array(item.get("supporting_attributes"), f"{item_name}.supporting_attributes", errors, allow_empty=True)
+        _require_enum(item.get("reference_kind"), ALLOWED_REFERENCE_KINDS, f"{item_name}.reference_kind", errors)
+        _require_enum(item.get("relationship_to_primary"), ALLOWED_RELATIONSHIPS, f"{item_name}.relationship_to_primary", errors)
+        _require_string(item.get("suggested_table_name"), f"{item_name}.suggested_table_name", errors)
+        _require_string(item.get("why_not_base_attribute"), f"{item_name}.why_not_base_attribute", errors)
+        _require_string(item.get("justification"), f"{item_name}.justification", errors)
+
+
+def _validate_preliminary_table_plan(value, errors):
+    field_name = "preliminary_table_plan"
+    _require_array(value, field_name, errors)
+    if not isinstance(value, list):
+        return
+
+    for i, item in enumerate(value):
+        item_name = f"{field_name}[{i}]"
+        if not isinstance(item, dict):
+            _require_object(item, item_name, errors)
+            continue
+        _require_string(item.get("table_name"), f"{item_name}.table_name", errors)
+        _require_enum(item.get("status"), ALLOWED_TABLE_STATUSES, f"{item_name}.status", errors)
+        _require_string_array(item.get("grain"), f"{item_name}.grain", errors, allow_empty=False)
+        _require_string(item.get("table_description"), f"{item_name}.table_description", errors)
+        _require_string_array(item.get("source_columns"), f"{item_name}.source_columns", errors, allow_empty=True)
+        _require_string_array(item.get("source_family_ids"), f"{item_name}.source_family_ids", errors, allow_empty=True)
+        _require_string_array(item.get("proposed_columns_to_keep"), f"{item_name}.proposed_columns_to_keep", errors, allow_empty=True)
+        _require_string_array(item.get("columns_requiring_review"), f"{item_name}.columns_requiring_review", errors, allow_empty=True)
+        _require_string(item.get("justification"), f"{item_name}.justification", errors)
+
+
+def _validate_family_review_candidates(value, errors):
+    field_name = "family_review_candidates"
+    _require_array(value, field_name, errors)
+    if not isinstance(value, list):
+        return
+
+    for i, item in enumerate(value):
+        item_name = f"{field_name}[{i}]"
+        if not isinstance(item, dict):
+            _require_object(item, item_name, errors)
+            continue
+        _require_string(item.get("family_id"), f"{item_name}.family_id", errors)
+        _require_string(item.get("suggested_table_name"), f"{item_name}.suggested_table_name", errors)
+        _require_string(item.get("repeat_index_name"), f"{item_name}.repeat_index_name", errors)
+        _require_enum(item.get("status"), ALLOWED_FAMILY_STATUSES, f"{item_name}.status", errors)
+        _require_string(item.get("why_review"), f"{item_name}.why_review", errors)
+
+
+def _validate_review_questions(value, errors):
+    field_name = "review_questions"
+    _require_object(value, field_name, errors)
+    if not isinstance(value, dict):
+        return
+
+    for key in REQUIRED_REVIEW_QUESTION_KEYS:
+        _require(key in value, f"Missing required review question: {field_name}.{key}", errors)
+        item = value.get(key)
+        item_name = f"{field_name}.{key}"
+        if not isinstance(item, dict):
+            _require_object(item, item_name, errors)
+            continue
+        _require_string(item.get("prompt"), f"{item_name}.prompt", errors)
+        _require_string(item.get("recommended_answer"), f"{item_name}.recommended_answer", errors)
+        _require_string(item.get("why_it_matters"), f"{item_name}.why_it_matters", errors)
+        _require_enum(item.get("answer_type"), ALLOWED_ANSWER_TYPES, f"{item_name}.answer_type", errors)
+
+        if "allowed_answers" in item and item["allowed_answers"] is not None:
+            _require_string_array(item["allowed_answers"], f"{item_name}.allowed_answers", errors, allow_empty=True)
+
+
+def _validate_user_inputs_requested(value, errors):
+    field_name = "user_inputs_requested"
+    _require_object(value, field_name, errors)
+    if not isinstance(value, dict):
+        return
+
+    for key in REQUIRED_USER_INPUT_KEYS:
+        _require(key in value, f"Missing required user input descriptor: {field_name}.{key}", errors)
+        item = value.get(key)
+        item_name = f"{field_name}.{key}"
+        if not isinstance(item, dict):
+            _require_object(item, item_name, errors)
+            continue
+        _require(item.get("input_type") == "free_text", f"{item_name}.input_type must be 'free_text'", errors)
+        _require_bool(item.get("required"), f"{item_name}.required", errors)
+        _require_string(item.get("purpose"), f"{item_name}.purpose", errors)
+
+
+def _validate_diagnostics(value, errors):
+    field_name = "diagnostics"
+    _require_object(value, field_name, errors)
+    if not isinstance(value, dict):
+        return
+    _require_enum(value.get("encoding_hint"), ALLOWED_ENCODING_HINTS, f"{field_name}.encoding_hint", errors)
+    _require_string(value.get("encoding_justification"), f"{field_name}.encoding_justification", errors)
+    _require_string(value.get("recommended_next_action"), f"{field_name}.recommended_next_action", errors)
+
+    rejected = value.get("rejected_primary_candidates")
+    _require_array(rejected, f"{field_name}.rejected_primary_candidates", errors)
+    if not isinstance(rejected, list):
+        return
+    for i, item in enumerate(rejected):
+        item_name = f"{field_name}.rejected_primary_candidates[{i}]"
+        if not isinstance(item, dict):
+            _require_object(item, item_name, errors)
+            continue
+        _require_string_array(item.get("keys"), f"{item_name}.keys", errors, allow_empty=False)
+        _require_string(item.get("reason"), f"{item_name}.reason", errors)
+
+
+def _validate_assumptions(value, errors):
+    field_name = "assumptions"
+    _require_array(value, field_name, errors)
+    if not isinstance(value, list):
+        return
+
+    for i, item in enumerate(value):
+        item_name = f"{field_name}[{i}]"
+        if not isinstance(item, dict):
+            _require_object(item, item_name, errors)
+            continue
+        _require_string(item.get("assumption"), f"{item_name}.assumption", errors)
+        _require_string(item.get("explanation"), f"{item_name}.explanation", errors)
+        _require_bool(item.get("needs_user_validation"), f"{item_name}.needs_user_validation", errors)
+
+
+def main(grain_output: str):
+    output_key = "grain_worker_json"
+    if not isinstance(grain_output, str):
+        error = "grain_output must be a string."
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+    if grain_output.strip() == "":
+        error = "grain_output is empty."
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    try:
+        parsed = json.loads(grain_output)
+    except json.JSONDecodeError as exc:
+        error = f"grain_output is not valid JSON: {exc}"
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    if not isinstance(parsed, dict):
+        error = "Grain worker output must be a JSON object."
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    parsed, normalization_log = _normalize_grain_output(parsed)
+    normalization_log_json = json.dumps(normalization_log, separators=(",", ":"))
+    normalization_applied = "true" if normalization_log else "false"
+
+    errors = []
+
+    extra_keys = set(parsed.keys()) - set(REQUIRED_TOP_LEVEL)
+    missing_keys = [key for key in REQUIRED_TOP_LEVEL if key not in parsed]
+
+    _require(not missing_keys, f"Missing required top-level key(s): {', '.join(missing_keys)}", errors)
+    _require(not extra_keys, f"Unexpected top-level key(s): {', '.join(sorted(extra_keys))}", errors)
+
+    if "recommended_primary_grain" in parsed:
+        _validate_recommended_primary_grain(parsed["recommended_primary_grain"], errors)
+    if "candidate_reference_tables" in parsed:
+        _validate_candidate_reference_tables(parsed["candidate_reference_tables"], errors)
+    if "preliminary_table_plan" in parsed:
+        _validate_preliminary_table_plan(parsed["preliminary_table_plan"], errors)
+    if "family_review_candidates" in parsed:
+        _validate_family_review_candidates(parsed["family_review_candidates"], errors)
+    if "review_questions" in parsed:
+        _validate_review_questions(parsed["review_questions"], errors)
+    if "user_inputs_requested" in parsed:
+        _validate_user_inputs_requested(parsed["user_inputs_requested"], errors)
+    if "diagnostics" in parsed:
+        _validate_diagnostics(parsed["diagnostics"], errors)
+
+    if "reasoning" in parsed:
+        _require_string(parsed["reasoning"], "reasoning", errors)
+    if "assumptions" in parsed:
+        _validate_assumptions(parsed["assumptions"], errors)
+
+    if errors:
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": errors[0],
+            "validation_errors_json": json.dumps(errors, separators=(",", ":")),
+            "normalization_applied": normalization_applied,
+            "normalization_log_json": normalization_log_json,
+        }
+
+    return {
+        "validation_ok": "true",
+        output_key: json.dumps(parsed, separators=(",", ":")),
+        "validation_error": "",
+        "validation_errors_json": "[]",
+        "normalization_applied": normalization_applied,
+        "normalization_log_json": normalization_log_json,
+    }

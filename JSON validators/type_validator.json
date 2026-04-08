@@ -1,0 +1,517 @@
+import json
+
+ALLOWED_LOGICAL_TYPES = {
+    "identifier",
+    "categorical_code",
+    "nominal_category",
+    "ordinal_category",
+    "boolean_flag",
+    "date",
+    "datetime",
+    "numeric_measure",
+    "free_text",
+    "mixed_or_ambiguous",
+}
+
+ALLOWED_STORAGE_TYPES = {
+    "string",
+    "integer",
+    "decimal",
+    "boolean",
+    "date",
+    "datetime",
+}
+
+ALLOWED_TRANSFORM_ACTIONS = {
+    "trim_whitespace",
+    "normalize_missing_tokens",
+    "normalize_boolean_tokens",
+    "cast_to_string",
+    "cast_to_integer",
+    "cast_to_decimal",
+    "cast_to_date",
+    "cast_to_datetime",
+    "strip_numeric_formatting",
+    "normalize_decimal_separator",
+    "lowercase_values",
+    "uppercase_values",
+    "titlecase_values",
+    "normalize_category_tokens",
+    "extract_numeric_component",
+    "strip_unit_suffix",
+    "standardize_percent_scale",
+}
+
+ALLOWED_STRUCTURAL_HINTS = {
+    "split_multiselect_tokens",
+    "requires_multiselect_modeling_decision",
+    "split_range_into_start_end",
+    "requires_range_semantics_review",
+    "requires_unit_normalization_review",
+    "requires_wide_to_long_review",
+    "requires_child_table_review",
+    "requires_multi_column_derivation",
+    "requires_start_end_pair_review",
+    "requires_codebook_or_label_mapping_review",
+}
+
+ALLOWED_INTERPRETATION_HINTS = {
+    "leading_zero_risk",
+    "identifier_not_measure",
+    "code_not_quantity",
+    "time_index_not_identifier",
+    "repeat_context_do_not_use_as_base_key",
+    "skip_logic_protected",
+    "mixed_content_high_risk",
+    "free_text_high_cardinality",
+    "numeric_parse_is_misleading",
+    "light_contract_override_applied",
+}
+
+REQUIRED_TOP_LEVEL = [
+    "worker",
+    "summary",
+    "column_decisions",
+    "global_transform_rules",
+    "review_flags",
+    "assumptions",
+]
+
+
+def _normalization_repr(value):
+    return json.dumps(value, separators=(",", ":"))
+
+
+def _log_normalization(normalization_log, path, value):
+    normalization_log.append({
+        "path": path,
+        "defaulted_to": _normalization_repr(value),
+    })
+
+
+def _default_in_dict(container, key, value, path, normalization_log):
+    if not isinstance(container, dict):
+        return
+    if key not in container or container[key] is None:
+        container[key] = value
+        _log_normalization(normalization_log, path, value)
+
+
+def _normalize_type_transform_output(parsed):
+    normalization_log = []
+
+    if not isinstance(parsed, dict):
+        return parsed, normalization_log
+
+    summary = parsed.get("summary")
+    if isinstance(summary, dict):
+        _default_in_dict(summary, "key_patterns", [], "summary.key_patterns", normalization_log)
+
+    _default_in_dict(parsed, "global_transform_rules", [], "global_transform_rules", normalization_log)
+    _default_in_dict(parsed, "review_flags", [], "review_flags", normalization_log)
+    _default_in_dict(parsed, "assumptions", [], "assumptions", normalization_log)
+
+    column_decisions = parsed.get("column_decisions")
+    if isinstance(column_decisions, list):
+        for i, item in enumerate(column_decisions):
+            if not isinstance(item, dict):
+                continue
+            _default_in_dict(item, "transform_actions", [], f"column_decisions[{i}].transform_actions", normalization_log)
+            _default_in_dict(
+                item,
+                "structural_transform_hints",
+                [],
+                f"column_decisions[{i}].structural_transform_hints",
+                normalization_log,
+            )
+            _default_in_dict(
+                item,
+                "interpretation_hints",
+                [],
+                f"column_decisions[{i}].interpretation_hints",
+                normalization_log,
+            )
+
+    return parsed, normalization_log
+
+
+def _add_error(errors, message):
+    if message not in errors:
+        errors.append(message)
+
+
+def _require_dict(value, field_name, errors):
+    if not isinstance(value, dict):
+        _add_error(errors, f"{field_name} must be an object.")
+        return False
+    return True
+
+
+def _require_list(value, field_name, errors):
+    if not isinstance(value, list):
+        _add_error(errors, f"{field_name} must be an array.")
+        return False
+    return True
+
+
+def _require_string(value, field_name, errors, allow_blank=False):
+    if not isinstance(value, str):
+        _add_error(errors, f"{field_name} must be a string.")
+        return False
+    if not allow_blank and value.strip() == "":
+        _add_error(errors, f"{field_name} must not be blank.")
+        return False
+    return True
+
+
+def _require_non_empty_string(value, field_name, errors):
+    return _require_string(value, field_name, errors, allow_blank=False)
+
+
+def _require_bool(value, field_name, errors):
+    if not isinstance(value, bool):
+        _add_error(errors, f"{field_name} must be a boolean.")
+        return False
+    return True
+
+
+def _require_number(value, field_name, errors):
+    if not (isinstance(value, (int, float)) and not isinstance(value, bool)):
+        _add_error(errors, f"{field_name} must be numeric.")
+        return False
+    return True
+
+
+def _require_string_list(value, field_name, errors, allow_empty=True, allow_blank_items=False):
+    if not _require_list(value, field_name, errors):
+        return False
+    ok = True
+    if not allow_empty and len(value) == 0:
+        _add_error(errors, f"{field_name} must not be empty.")
+        ok = False
+    for i, item in enumerate(value):
+        if not _require_string(item, f"{field_name}[{i}]", errors, allow_blank=allow_blank_items):
+            ok = False
+    return ok
+
+
+def _load_expected_columns(raw_value, field_name, errors):
+    if raw_value in ("", None):
+        return None
+    if not isinstance(raw_value, str):
+        _add_error(errors, f"{field_name} must be a string when provided.")
+        return None
+    try:
+        parsed = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        _add_error(errors, f"{field_name} is not valid JSON: {exc}")
+        return None
+    if not isinstance(parsed, list):
+        _add_error(errors, f"{field_name} must decode to an array.")
+        return None
+
+    expected = []
+    seen = set()
+    for i, item in enumerate(parsed):
+        if not isinstance(item, str):
+            _add_error(errors, f"{field_name}[{i}] must be a string.")
+            continue
+        if item.strip() == "":
+            _add_error(errors, f"{field_name}[{i}] must not be blank.")
+            continue
+        if item in seen:
+            _add_error(errors, f"{field_name} contains a duplicate column: {item}")
+            continue
+        seen.add(item)
+        expected.append(item)
+    return expected
+
+
+def _validate_summary(summary, errors):
+    if not _require_dict(summary, "summary", errors):
+        return
+
+    if "overview" not in summary:
+        _add_error(errors, "summary.overview is required.")
+    else:
+        _require_non_empty_string(summary["overview"], "summary.overview", errors)
+
+    if "key_patterns" not in summary:
+        _add_error(errors, "summary.key_patterns is required.")
+    else:
+        _require_string_list(
+            summary["key_patterns"],
+            "summary.key_patterns",
+            errors,
+            allow_empty=True,
+            allow_blank_items=True,
+        )
+
+
+def _validate_type_storage_pair(logical_type, storage_type, field_prefix, errors):
+    if logical_type == "identifier":
+        if storage_type != "string":
+            _add_error(errors, f"{field_prefix} has inconsistent type/storage pair: identifier must use storage type string")
+    elif logical_type == "categorical_code":
+        if storage_type != "string":
+            _add_error(errors, f"{field_prefix} has inconsistent type/storage pair: categorical_code cannot use storage type {storage_type}")
+    elif logical_type in {"nominal_category", "ordinal_category", "free_text", "mixed_or_ambiguous"}:
+        if storage_type != "string":
+            _add_error(errors, f"{field_prefix} has inconsistent type/storage pair: {logical_type} must use storage type string")
+    elif logical_type == "boolean_flag":
+        if storage_type != "boolean":
+            _add_error(errors, f"{field_prefix} has inconsistent type/storage pair: boolean_flag must use storage type boolean")
+    elif logical_type == "date":
+        if storage_type != "date":
+            _add_error(errors, f"{field_prefix} has inconsistent type/storage pair: date must use storage type date")
+    elif logical_type == "datetime":
+        if storage_type != "datetime":
+            _add_error(errors, f"{field_prefix} has inconsistent type/storage pair: datetime must use storage type datetime")
+    elif logical_type == "numeric_measure":
+        if storage_type not in {"integer", "decimal"}:
+            _add_error(errors, f"{field_prefix} has inconsistent type/storage pair: numeric_measure must use storage type integer or decimal")
+
+
+def _validate_column_decisions(items, errors, expected_review_columns=None):
+    if not _require_list(items, "column_decisions", errors):
+        return
+
+    required_keys = {
+        "column",
+        "recommended_logical_type",
+        "recommended_storage_type",
+        "transform_actions",
+        "structural_transform_hints",
+        "interpretation_hints",
+        "normalization_notes",
+        "confidence",
+        "reasoning",
+        "skip_logic_protected",
+        "needs_human_review",
+    }
+
+    seen_columns = set()
+
+    for i, item in enumerate(items):
+        field_prefix = f"column_decisions[{i}]"
+        if not _require_dict(item, field_prefix, errors):
+            continue
+
+        for key in required_keys:
+            if key not in item:
+                _add_error(errors, f"{field_prefix}.{key} is required.")
+
+        column_valid = "column" in item and _require_non_empty_string(item["column"], f"{field_prefix}.column", errors)
+        if column_valid:
+            if item["column"] in seen_columns:
+                _add_error(errors, f"Duplicate column_decisions entry for column: {item['column']}")
+            else:
+                seen_columns.add(item["column"])
+
+        logical_type_valid = False
+        storage_type_valid = False
+
+        logical_type = item.get("recommended_logical_type")
+        if "recommended_logical_type" in item and _require_non_empty_string(logical_type, f"{field_prefix}.recommended_logical_type", errors):
+            if logical_type not in ALLOWED_LOGICAL_TYPES:
+                _add_error(errors, f"{field_prefix}.recommended_logical_type must be one of: {', '.join(sorted(ALLOWED_LOGICAL_TYPES))}")
+            else:
+                logical_type_valid = True
+
+        storage_type = item.get("recommended_storage_type")
+        if "recommended_storage_type" in item and _require_non_empty_string(storage_type, f"{field_prefix}.recommended_storage_type", errors):
+            if storage_type not in ALLOWED_STORAGE_TYPES:
+                _add_error(errors, f"{field_prefix}.recommended_storage_type must be one of: {', '.join(sorted(ALLOWED_STORAGE_TYPES))}")
+            else:
+                storage_type_valid = True
+
+        if logical_type_valid and storage_type_valid:
+            _validate_type_storage_pair(logical_type, storage_type, field_prefix, errors)
+
+        if "transform_actions" in item:
+            if _require_list(item["transform_actions"], f"{field_prefix}.transform_actions", errors):
+                for j, action in enumerate(item["transform_actions"]):
+                    if _require_non_empty_string(action, f"{field_prefix}.transform_actions[{j}]", errors):
+                        if action not in ALLOWED_TRANSFORM_ACTIONS:
+                            _add_error(errors, f"{field_prefix}.transform_actions[{j}] must be one of: {', '.join(sorted(ALLOWED_TRANSFORM_ACTIONS))}")
+
+        if "structural_transform_hints" in item:
+            if _require_list(item["structural_transform_hints"], f"{field_prefix}.structural_transform_hints", errors):
+                for j, hint in enumerate(item["structural_transform_hints"]):
+                    if _require_non_empty_string(hint, f"{field_prefix}.structural_transform_hints[{j}]", errors):
+                        if hint not in ALLOWED_STRUCTURAL_HINTS:
+                            _add_error(errors, f"{field_prefix}.structural_transform_hints[{j}] must be one of: {', '.join(sorted(ALLOWED_STRUCTURAL_HINTS))}")
+
+        if "interpretation_hints" in item:
+            if _require_list(item["interpretation_hints"], f"{field_prefix}.interpretation_hints", errors):
+                for j, hint in enumerate(item["interpretation_hints"]):
+                    if _require_non_empty_string(hint, f"{field_prefix}.interpretation_hints[{j}]", errors):
+                        if hint not in ALLOWED_INTERPRETATION_HINTS:
+                            _add_error(errors, f"{field_prefix}.interpretation_hints[{j}] must be one of: {', '.join(sorted(ALLOWED_INTERPRETATION_HINTS))}")
+
+        if "normalization_notes" in item:
+            _require_non_empty_string(item["normalization_notes"], f"{field_prefix}.normalization_notes", errors)
+
+        if "reasoning" in item:
+            _require_non_empty_string(item["reasoning"], f"{field_prefix}.reasoning", errors)
+
+        if "confidence" in item and _require_number(item["confidence"], f"{field_prefix}.confidence", errors):
+            if not (0 <= float(item["confidence"]) <= 1):
+                _add_error(errors, f"{field_prefix}.confidence must be between 0 and 1.")
+
+        if "skip_logic_protected" in item:
+            _require_bool(item["skip_logic_protected"], f"{field_prefix}.skip_logic_protected", errors)
+
+        if "needs_human_review" in item:
+            _require_bool(item["needs_human_review"], f"{field_prefix}.needs_human_review", errors)
+
+    if expected_review_columns is not None:
+        expected_set = set(expected_review_columns)
+        missing_columns = sorted(expected_set - seen_columns)
+        unexpected_columns = sorted(seen_columns - expected_set)
+        if missing_columns:
+            _add_error(errors, f"column_decisions is missing reviewed columns: {', '.join(missing_columns)}")
+        if unexpected_columns:
+            _add_error(errors, f"column_decisions contains unexpected columns: {', '.join(unexpected_columns)}")
+
+
+def _validate_global_transform_rules(items, errors):
+    if not _require_list(items, "global_transform_rules", errors):
+        return
+    for i, item in enumerate(items):
+        field_prefix = f"global_transform_rules[{i}]"
+        if not _require_dict(item, field_prefix, errors):
+            continue
+        for key in ["rule_name", "applies_when", "rule_description"]:
+            if key not in item:
+                _add_error(errors, f"{field_prefix}.{key} is required.")
+            else:
+                _require_non_empty_string(item[key], f"{field_prefix}.{key}", errors)
+
+
+def _validate_review_flags(items, errors):
+    if not _require_list(items, "review_flags", errors):
+        return
+    for i, item in enumerate(items):
+        field_prefix = f"review_flags[{i}]"
+        if not _require_dict(item, field_prefix, errors):
+            continue
+        for key in ["column", "issue", "why"]:
+            if key not in item:
+                _add_error(errors, f"{field_prefix}.{key} is required.")
+            else:
+                _require_non_empty_string(item[key], f"{field_prefix}.{key}", errors)
+
+
+def _validate_assumptions(items, errors):
+    if not _require_list(items, "assumptions", errors):
+        return
+    for i, item in enumerate(items):
+        field_prefix = f"assumptions[{i}]"
+        if not _require_dict(item, field_prefix, errors):
+            continue
+        for key in ["assumption", "explanation"]:
+            if key not in item:
+                _add_error(errors, f"{field_prefix}.{key} is required.")
+            else:
+                _require_non_empty_string(item[key], f"{field_prefix}.{key}", errors)
+
+
+def _validate_strict(type_transform_worker_output: str, expected_review_columns_json: str = ""):
+    output_key = "type_transform_worker_json"
+
+    if not isinstance(type_transform_worker_output, str):
+        error = "type_transform_worker_output must be a string."
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    if type_transform_worker_output.strip() == "":
+        error = "type_transform_worker_output is empty."
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    try:
+        parsed = json.loads(type_transform_worker_output)
+    except json.JSONDecodeError as exc:
+        error = f"type_transform_worker_output is not valid JSON: {exc}"
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    if not isinstance(parsed, dict):
+        error = "root must be an object."
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    parsed, normalization_log = _normalize_type_transform_output(parsed)
+    normalization_log_json = json.dumps(normalization_log, separators=(",", ":"))
+    normalization_applied = "true" if normalization_log else "false"
+
+    errors = []
+    expected_review_columns = _load_expected_columns(expected_review_columns_json, "expected_review_columns_json", errors)
+
+    for key in REQUIRED_TOP_LEVEL:
+        if key not in parsed:
+            _add_error(errors, f"Missing required top-level key: {key}")
+
+    if "worker" in parsed:
+        if _require_non_empty_string(parsed["worker"], "worker", errors):
+            if parsed["worker"] != "type_value_specialist":
+                _add_error(errors, "worker must be 'type_value_specialist'.")
+
+    if "summary" in parsed:
+        _validate_summary(parsed["summary"], errors)
+    if "column_decisions" in parsed:
+        _validate_column_decisions(parsed["column_decisions"], errors, expected_review_columns=expected_review_columns)
+    if "global_transform_rules" in parsed:
+        _validate_global_transform_rules(parsed["global_transform_rules"], errors)
+    if "review_flags" in parsed:
+        _validate_review_flags(parsed["review_flags"], errors)
+    if "assumptions" in parsed:
+        _validate_assumptions(parsed["assumptions"], errors)
+
+    if errors:
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": errors[0],
+            "validation_errors_json": json.dumps(errors, separators=(",", ":")),
+            "normalization_applied": normalization_applied,
+            "normalization_log_json": normalization_log_json,
+        }
+
+    return {
+        "validation_ok": "true",
+        output_key: json.dumps(parsed, separators=(",", ":")),
+        "validation_error": "",
+        "validation_errors_json": "[]",
+        "normalization_applied": normalization_applied,
+        "normalization_log_json": normalization_log_json,
+    }
+
+
+def main(type_transform_worker_output: str, expected_review_columns_json: str = ""):
+    return _validate_strict(type_transform_worker_output, expected_review_columns_json=expected_review_columns_json)

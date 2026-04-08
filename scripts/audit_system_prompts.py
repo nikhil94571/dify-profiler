@@ -58,6 +58,7 @@ PROMPT_SPECS: dict[str, PromptSpec] = {
         min_example_headers=6,
         semantics_terms=(
             "light_contract_decisions",
+            "expected_review_columns_json",
             "semantic_context_json",
             "A2",
             "A3-T",

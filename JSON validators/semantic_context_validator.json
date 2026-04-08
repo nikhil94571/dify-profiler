@@ -1,0 +1,258 @@
+import json
+
+ALLOWED_KINDS = {
+    "condition_column",
+    "status_or_flag",
+    "code_column",
+    "family_context",
+    "date_or_phase_context",
+    "business_key_context",
+    "placeholder_value_context",
+    "other",
+}
+
+ALLOWED_SKIP_REASONS = {
+    "light_contract_accepted",
+    "blank_semantic_input",
+}
+
+
+def _normalization_repr(value):
+    return json.dumps(value, separators=(",", ":"))
+
+
+def _log_normalization(normalization_log, path, value):
+    normalization_log.append({
+        "path": path,
+        "defaulted_to": _normalization_repr(value),
+    })
+
+
+def _default_in_dict(container, key, value, path, normalization_log):
+    if not isinstance(container, dict):
+        return
+    if key not in container or container[key] is None:
+        container[key] = value
+        _log_normalization(normalization_log, path, value)
+
+
+def _normalize_semantic_context_output(parsed):
+    normalization_log = []
+
+    if not isinstance(parsed, dict):
+        return parsed, normalization_log
+
+    if parsed.get("status") == "skipped":
+        return parsed, normalization_log
+
+    summary = parsed.get("summary")
+    if isinstance(summary, dict):
+        _default_in_dict(summary, "key_points", [], "summary.key_points", normalization_log)
+
+    dataset_context = parsed.get("dataset_context")
+    if isinstance(dataset_context, dict):
+        _default_in_dict(
+            dataset_context,
+            "collection_change_notes",
+            [],
+            "dataset_context.collection_change_notes",
+            normalization_log,
+        )
+        _default_in_dict(
+            dataset_context,
+            "known_optional_or_conditioned_sections",
+            [],
+            "dataset_context.known_optional_or_conditioned_sections",
+            normalization_log,
+        )
+
+    _default_in_dict(parsed, "codebook_hints", [], "codebook_hints", normalization_log)
+    _default_in_dict(parsed, "review_flags", [], "review_flags", normalization_log)
+    _default_in_dict(parsed, "assumptions", [], "assumptions", normalization_log)
+
+    return parsed, normalization_log
+
+
+def _require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+def _is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+def _require_non_empty_string(value, field_name):
+    _require(isinstance(value, str), f"{field_name} must be a string.")
+    _require(value.strip() != "", f"{field_name} must not be blank.")
+
+def _require_dict(value, field_name):
+    _require(isinstance(value, dict), f"{field_name} must be an object.")
+
+def _require_list(value, field_name):
+    _require(isinstance(value, list), f"{field_name} must be an array.")
+
+def _validate_summary(summary):
+    _require_dict(summary, "summary")
+    _require("overview" in summary, "summary.overview is required.")
+    _require("key_points" in summary, "summary.key_points is required.")
+    _require_non_empty_string(summary["overview"], "summary.overview")
+    _require_list(summary["key_points"], "summary.key_points")
+    for i, item in enumerate(summary["key_points"]):
+        _require_non_empty_string(item, f"summary.key_points[{i}]")
+
+def _validate_dataset_context(dataset_context):
+    _require_dict(dataset_context, "dataset_context")
+    for key in [
+        "dataset_purpose",
+        "row_meaning_notes",
+        "collection_change_notes",
+        "known_optional_or_conditioned_sections",
+    ]:
+        _require(key in dataset_context, f"dataset_context.{key} is required.")
+    _require(isinstance(dataset_context["dataset_purpose"], str), "dataset_context.dataset_purpose must be a string.")
+    _require(isinstance(dataset_context["row_meaning_notes"], str), "dataset_context.row_meaning_notes must be a string.")
+    for key in ["collection_change_notes", "known_optional_or_conditioned_sections"]:
+        _require_list(dataset_context[key], f"dataset_context.{key}")
+        for i, item in enumerate(dataset_context[key]):
+            _require_non_empty_string(item, f"dataset_context.{key}[{i}]")
+
+def _validate_important_variables(items):
+    _require_list(items, "important_variables")
+    for i, item in enumerate(items):
+        field_prefix = f"important_variables[{i}]"
+        _require_dict(item, field_prefix)
+        for key in ["column_or_family", "kind", "meaning", "downstream_importance", "confidence"]:
+            _require(key in item, f"{field_prefix}.{key} is required.")
+        _require_non_empty_string(item["column_or_family"], f"{field_prefix}.column_or_family")
+        _require_non_empty_string(item["kind"], f"{field_prefix}.kind")
+        _require(item["kind"] in ALLOWED_KINDS, f"{field_prefix}.kind must be one of: {', '.join(sorted(ALLOWED_KINDS))}")
+        _require_non_empty_string(item["meaning"], f"{field_prefix}.meaning")
+        _require_non_empty_string(item["downstream_importance"], f"{field_prefix}.downstream_importance")
+        _require(_is_number(item["confidence"]), f"{field_prefix}.confidence must be numeric.")
+        _require(0 <= float(item["confidence"]) <= 1, f"{field_prefix}.confidence must be between 0 and 1.")
+
+def _validate_codebook_hints(items):
+    _require_list(items, "codebook_hints")
+    for i, item in enumerate(items):
+        field_prefix = f"codebook_hints[{i}]"
+        _require_dict(item, field_prefix)
+        for key in ["column", "codes_or_labels_note", "meaning", "confidence"]:
+            _require(key in item, f"{field_prefix}.{key} is required.")
+        _require_non_empty_string(item["column"], f"{field_prefix}.column")
+        _require_non_empty_string(item["codes_or_labels_note"], f"{field_prefix}.codes_or_labels_note")
+        _require_non_empty_string(item["meaning"], f"{field_prefix}.meaning")
+        _require(_is_number(item["confidence"]), f"{field_prefix}.confidence must be numeric.")
+        _require(0 <= float(item["confidence"]) <= 1, f"{field_prefix}.confidence must be between 0 and 1.")
+
+def _validate_review_flags(items):
+    _require_list(items, "review_flags")
+    for i, item in enumerate(items):
+        field_prefix = f"review_flags[{i}]"
+        _require_dict(item, field_prefix)
+        for key in ["item", "issue", "why"]:
+            _require(key in item, f"{field_prefix}.{key} is required.")
+            _require_non_empty_string(item[key], f"{field_prefix}.{key}")
+
+def _validate_assumptions(items):
+    _require_list(items, "assumptions")
+    for i, item in enumerate(items):
+        field_prefix = f"assumptions[{i}]"
+        _require_dict(item, field_prefix)
+        for key in ["assumption", "explanation"]:
+            _require(key in item, f"{field_prefix}.{key} is required.")
+            _require_non_empty_string(item[key], f"{field_prefix}.{key}")
+
+def main(semantic_context_output: str):
+    output_key = "semantic_context_json"
+
+    if not isinstance(semantic_context_output, str):
+        error = "semantic_context_output must be a string."
+        return {
+            output_key: "",
+            "validation_ok": "false",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+    if semantic_context_output.strip() == "":
+        error = "semantic_context_output is empty."
+        return {
+            output_key: "",
+            "validation_ok": "false",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    try:
+        parsed = json.loads(semantic_context_output)
+    except json.JSONDecodeError as exc:
+        error = f"Semantic context output is not valid JSON: {exc}"
+        return {
+            output_key: "",
+            "validation_ok": "false",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    if not isinstance(parsed, dict):
+        error = "root must be an object."
+        return {
+            output_key: "",
+            "validation_ok": "false",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    parsed, normalization_log = _normalize_semantic_context_output(parsed)
+    normalization_log_json = json.dumps(normalization_log, separators=(",", ":"))
+    normalization_applied = "true" if normalization_log else "false"
+
+    try:
+        if parsed.get("status") == "skipped":
+            _require_non_empty_string(parsed.get("reason"), "reason")
+            _require(parsed["reason"] in ALLOWED_SKIP_REASONS, f"reason must be one of: {', '.join(sorted(ALLOWED_SKIP_REASONS))}")
+            return {
+                output_key: json.dumps(parsed, separators=(",", ":")),
+                "validation_ok": "true",
+                "validation_error": "",
+                "validation_errors_json": "[]",
+                "normalization_applied": normalization_applied,
+                "normalization_log_json": normalization_log_json,
+            }
+
+        for key in ["worker", "summary", "dataset_context", "important_variables", "codebook_hints", "review_flags", "assumptions"]:
+            _require(key in parsed, f"Missing required top-level key: {key}")
+
+        _require_non_empty_string(parsed["worker"], "worker")
+        _require(parsed["worker"] == "semantic_context_interpreter", "worker must be 'semantic_context_interpreter'.")
+        _validate_summary(parsed["summary"])
+        _validate_dataset_context(parsed["dataset_context"])
+        _validate_important_variables(parsed["important_variables"])
+        _validate_codebook_hints(parsed["codebook_hints"])
+        _validate_review_flags(parsed["review_flags"])
+        _validate_assumptions(parsed["assumptions"])
+    except ValueError as exc:
+        error = str(exc)
+        return {
+            output_key: "",
+            "validation_ok": "false",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": normalization_applied,
+            "normalization_log_json": normalization_log_json,
+        }
+
+    return {
+        output_key: json.dumps(parsed, separators=(",", ":")),
+        "validation_ok": "true",
+        "validation_error": "",
+        "validation_errors_json": "[]",
+        "normalization_applied": normalization_applied,
+        "normalization_log_json": normalization_log_json,
+    }

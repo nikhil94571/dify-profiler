@@ -26,7 +26,7 @@ Thumbs.db
 !*.schema.json
 !llm_pruning_ledger.json
 !profiles/*.json
-!JSON validators/canonical_contract_reviewer_validator.json
+!JSON validators/*.json
 
 sa-key.json
 *-key.json

@@ -1,0 +1,446 @@
+import json
+
+REQUIRED_TOP_LEVEL = [
+    "worker",
+    "summary",
+    "analysis_table_suggestions",
+    "derivations",
+    "review_flags",
+    "assumptions",
+]
+
+TABLE_KINDS = {
+    "long_response_table",
+    "score_table",
+    "analysis_mart",
+    "reference_passthrough",
+}
+
+BUILD_STRATEGIES = {
+    "merge_sibling_families_with_wave",
+    "aggregate_scores",
+    "join_reference_and_score",
+    "assemble_analysis_mart",
+    "pass_through",
+}
+
+DERIVATION_KINDS = {
+    "family_merge",
+    "answer_key_scoring",
+    "score_aggregation",
+    "analysis_mart_join",
+}
+
+NULL_HANDLING_POLICIES = {
+    "preserve_structural_missing",
+    "exclude_from_score",
+    "treat_as_incorrect",
+    "needs_review",
+}
+
+
+def _normalization_repr(value):
+    return json.dumps(value, separators=(",", ":"))
+
+
+def _log_normalization(normalization_log, path, value):
+    normalization_log.append({
+        "path": path,
+        "defaulted_to": _normalization_repr(value),
+    })
+
+
+def _default_in_dict(container, key, value, path, normalization_log):
+    if not isinstance(container, dict):
+        return
+    if key not in container or container[key] is None:
+        container[key] = value
+        _log_normalization(normalization_log, path, value)
+
+
+def _normalize_analysis_layout_output(parsed):
+    normalization_log = []
+
+    if not isinstance(parsed, dict):
+        return parsed, normalization_log
+
+    summary = parsed.get("summary")
+    if isinstance(summary, dict):
+        _default_in_dict(
+            summary,
+            "analysis_layout_principles",
+            [],
+            "summary.analysis_layout_principles",
+            normalization_log,
+        )
+
+    _default_in_dict(parsed, "derivations", [], "derivations", normalization_log)
+    _default_in_dict(parsed, "review_flags", [], "review_flags", normalization_log)
+    _default_in_dict(parsed, "assumptions", [], "assumptions", normalization_log)
+
+    suggestions = parsed.get("analysis_table_suggestions")
+    if isinstance(suggestions, list):
+        for i, item in enumerate(suggestions):
+            if not isinstance(item, dict):
+                continue
+            _default_in_dict(
+                item,
+                "included_family_ids",
+                [],
+                f"analysis_table_suggestions[{i}].included_family_ids",
+                normalization_log,
+            )
+            _default_in_dict(item, "wave_column", "", f"analysis_table_suggestions[{i}].wave_column", normalization_log)
+
+    derivations = parsed.get("derivations")
+    if isinstance(derivations, list):
+        for i, item in enumerate(derivations):
+            if not isinstance(item, dict):
+                continue
+            _default_in_dict(item, "join_keys", [], f"derivations[{i}].join_keys", normalization_log)
+            _default_in_dict(item, "grouping_keys", [], f"derivations[{i}].grouping_keys", normalization_log)
+
+    return parsed, normalization_log
+
+
+def _add_error(errors, message):
+    if message not in errors:
+        errors.append(message)
+
+
+def _require_obj(value, field_name, errors):
+    if not isinstance(value, dict):
+        _add_error(errors, f"{field_name} must be an object.")
+        return False
+    return True
+
+
+def _require_list(value, field_name, errors):
+    if not isinstance(value, list):
+        _add_error(errors, f"{field_name} must be an array.")
+        return False
+    return True
+
+
+def _require_str(value, field_name, errors, allow_blank=False):
+    if not isinstance(value, str):
+        _add_error(errors, f"{field_name} must be a string.")
+        return False
+    if not allow_blank and value.strip() == "":
+        _add_error(errors, f"{field_name} must not be blank.")
+        return False
+    return True
+
+
+def _require_string_list(value, field_name, errors, allow_empty=True, allow_blank_items=False):
+    if not _require_list(value, field_name, errors):
+        return False
+    ok = True
+    if not allow_empty and len(value) == 0:
+        _add_error(errors, f"{field_name} must not be empty.")
+        ok = False
+    for i, item in enumerate(value):
+        if not _require_str(item, f"{field_name}[{i}]", errors, allow_blank=allow_blank_items):
+            ok = False
+    return ok
+
+
+def _is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _validate_summary(summary, errors):
+    if not _require_obj(summary, "summary", errors):
+        return
+
+    if "overview" not in summary:
+        _add_error(errors, "summary.overview is required.")
+    else:
+        _require_str(summary["overview"], "summary.overview", errors)
+
+    if "analysis_layout_principles" not in summary:
+        _add_error(errors, "summary.analysis_layout_principles is required.")
+    else:
+        _require_string_list(
+            summary["analysis_layout_principles"],
+            "summary.analysis_layout_principles",
+            errors,
+            allow_empty=True,
+            allow_blank_items=True,
+        )
+
+
+def _validate_analysis_table_suggestions(analysis_table_suggestions, errors):
+    if not _require_list(analysis_table_suggestions, "analysis_table_suggestions", errors):
+        return set()
+
+    seen_table_names = set()
+
+    for i, item in enumerate(analysis_table_suggestions):
+        path = f"analysis_table_suggestions[{i}]"
+        if not _require_obj(item, path, errors):
+            continue
+
+        required = [
+            "table_name",
+            "kind",
+            "source_canonical_tables",
+            "included_family_ids",
+            "grain_columns",
+            "build_strategy",
+            "wave_column",
+            "value_columns",
+            "confidence",
+            "reasoning",
+            "needs_human_review",
+        ]
+        for key in required:
+            if key not in item:
+                _add_error(errors, f"{path}.{key} is required.")
+
+        table_name_valid = "table_name" in item and _require_str(item["table_name"], f"{path}.table_name", errors)
+        if table_name_valid:
+            if item["table_name"] in seen_table_names:
+                _add_error(errors, f"Duplicate analysis table_name: {item['table_name']}")
+            else:
+                seen_table_names.add(item["table_name"])
+
+        if "kind" in item and _require_str(item["kind"], f"{path}.kind", errors):
+            if item["kind"] not in TABLE_KINDS:
+                _add_error(errors, f"{path}.kind is invalid.")
+
+        if "build_strategy" in item and _require_str(item["build_strategy"], f"{path}.build_strategy", errors):
+            if item["build_strategy"] not in BUILD_STRATEGIES:
+                _add_error(errors, f"{path}.build_strategy is invalid.")
+
+        if "source_canonical_tables" in item:
+            _require_string_list(item["source_canonical_tables"], f"{path}.source_canonical_tables", errors, allow_empty=False)
+
+        if "included_family_ids" in item:
+            _require_string_list(item["included_family_ids"], f"{path}.included_family_ids", errors, allow_empty=True)
+
+        if "grain_columns" in item:
+            _require_string_list(item["grain_columns"], f"{path}.grain_columns", errors, allow_empty=False)
+
+        if "wave_column" in item:
+            _require_str(item["wave_column"], f"{path}.wave_column", errors, allow_blank=True)
+
+        if "value_columns" in item:
+            _require_string_list(item["value_columns"], f"{path}.value_columns", errors, allow_empty=False)
+
+        if "confidence" in item:
+            if not _is_number(item["confidence"]):
+                _add_error(errors, f"{path}.confidence must be numeric.")
+            elif not (0 <= float(item["confidence"]) <= 1):
+                _add_error(errors, f"{path}.confidence must be between 0 and 1.")
+
+        if "reasoning" in item:
+            _require_str(item["reasoning"], f"{path}.reasoning", errors)
+
+        if "needs_human_review" in item and not isinstance(item["needs_human_review"], bool):
+            _add_error(errors, f"{path}.needs_human_review must be boolean.")
+
+        if (
+            item.get("build_strategy") == "merge_sibling_families_with_wave"
+            and isinstance(item.get("wave_column"), str)
+            and isinstance(item.get("grain_columns"), list)
+        ):
+            if item["wave_column"].strip() == "":
+                _add_error(errors, f"{path}.wave_column must be non-empty for merge_sibling_families_with_wave.")
+            elif item["wave_column"] not in item["grain_columns"]:
+                _add_error(errors, f"{path}.wave_column must be present in grain_columns for merge_sibling_families_with_wave.")
+
+        if item.get("build_strategy") == "pass_through":
+            if isinstance(item.get("source_canonical_tables"), list) and len(item["source_canonical_tables"]) != 1:
+                _add_error(errors, f"{path}.pass_through should reference exactly one source canonical table.")
+
+    return seen_table_names
+
+
+def _validate_derivations(derivations, errors):
+    if not _require_list(derivations, "derivations", errors):
+        return set()
+
+    seen_output_table_names = set()
+
+    for i, item in enumerate(derivations):
+        path = f"derivations[{i}]"
+        if not _require_obj(item, path, errors):
+            continue
+
+        required = [
+            "derivation_name",
+            "derivation_kind",
+            "source_tables",
+            "output_table_name",
+            "join_keys",
+            "grouping_keys",
+            "null_handling_policy",
+            "reasoning",
+        ]
+        for key in required:
+            if key not in item:
+                _add_error(errors, f"{path}.{key} is required.")
+
+        if "derivation_name" in item:
+            _require_str(item["derivation_name"], f"{path}.derivation_name", errors)
+
+        if "derivation_kind" in item and _require_str(item["derivation_kind"], f"{path}.derivation_kind", errors):
+            if item["derivation_kind"] not in DERIVATION_KINDS:
+                _add_error(errors, f"{path}.derivation_kind is invalid.")
+
+        if "source_tables" in item:
+            _require_string_list(item["source_tables"], f"{path}.source_tables", errors, allow_empty=False)
+
+        output_table_name_valid = "output_table_name" in item and _require_str(item["output_table_name"], f"{path}.output_table_name", errors)
+        if output_table_name_valid:
+            if item["output_table_name"] in seen_output_table_names:
+                _add_error(errors, f"Duplicate derivations.output_table_name: {item['output_table_name']}")
+            else:
+                seen_output_table_names.add(item["output_table_name"])
+
+        if "join_keys" in item:
+            _require_string_list(item["join_keys"], f"{path}.join_keys", errors, allow_empty=True)
+
+        if "grouping_keys" in item:
+            _require_string_list(item["grouping_keys"], f"{path}.grouping_keys", errors, allow_empty=True)
+
+        if "null_handling_policy" in item and _require_str(item["null_handling_policy"], f"{path}.null_handling_policy", errors):
+            if item["null_handling_policy"] not in NULL_HANDLING_POLICIES:
+                _add_error(errors, f"{path}.null_handling_policy is invalid.")
+
+        if "reasoning" in item:
+            _require_str(item["reasoning"], f"{path}.reasoning", errors)
+
+    return seen_output_table_names
+
+
+def _validate_review_flags(review_flags, errors):
+    if not _require_list(review_flags, "review_flags", errors):
+        return
+    for i, item in enumerate(review_flags):
+        path = f"review_flags[{i}]"
+        if not _require_obj(item, path, errors):
+            continue
+        for key in ["item", "issue", "why"]:
+            if key not in item:
+                _add_error(errors, f"{path}.{key} is required.")
+            else:
+                _require_str(item[key], f"{path}.{key}", errors)
+
+
+def _validate_assumptions(assumptions, errors):
+    if not _require_list(assumptions, "assumptions", errors):
+        return
+    for i, item in enumerate(assumptions):
+        path = f"assumptions[{i}]"
+        if not _require_obj(item, path, errors):
+            continue
+        for key in ["assumption", "explanation"]:
+            if key not in item:
+                _add_error(errors, f"{path}.{key} is required.")
+            else:
+                _require_str(item[key], f"{path}.{key}", errors)
+
+
+def _validate_strict(analysis_layout_output: str):
+    output_key = "analysis_layout_worker_json"
+
+    if not isinstance(analysis_layout_output, str):
+        error = "analysis_layout_output must be a string."
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    if analysis_layout_output.strip() == "":
+        error = "analysis_layout_output is empty."
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    try:
+        parsed = json.loads(analysis_layout_output)
+    except json.JSONDecodeError as exc:
+        error = f"Analysis layout worker output is not valid JSON: {exc}"
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    if not isinstance(parsed, dict):
+        error = "root must be an object."
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    parsed, normalization_log = _normalize_analysis_layout_output(parsed)
+    normalization_log_json = json.dumps(normalization_log, separators=(",", ":"))
+    normalization_applied = "true" if normalization_log else "false"
+
+    errors = []
+
+    for key in REQUIRED_TOP_LEVEL:
+        if key not in parsed:
+            _add_error(errors, f"Missing required top-level key: {key}")
+
+    if "worker" in parsed:
+        if _require_str(parsed["worker"], "worker", errors):
+            if parsed["worker"] != "analysis_layout_specialist":
+                _add_error(errors, "worker must be 'analysis_layout_specialist'.")
+
+    if "summary" in parsed:
+        _validate_summary(parsed["summary"], errors)
+
+    if "analysis_table_suggestions" in parsed:
+        _validate_analysis_table_suggestions(parsed["analysis_table_suggestions"], errors)
+
+    if "derivations" in parsed:
+        _validate_derivations(parsed["derivations"], errors)
+
+    if "review_flags" in parsed:
+        _validate_review_flags(parsed["review_flags"], errors)
+
+    if "assumptions" in parsed:
+        _validate_assumptions(parsed["assumptions"], errors)
+
+    if errors:
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": errors[0],
+            "validation_errors_json": json.dumps(errors, separators=(",", ":")),
+            "normalization_applied": normalization_applied,
+            "normalization_log_json": normalization_log_json,
+        }
+
+    return {
+        "validation_ok": "true",
+        output_key: json.dumps(parsed, separators=(",", ":")),
+        "validation_error": "",
+        "validation_errors_json": "[]",
+        "normalization_applied": normalization_applied,
+        "normalization_log_json": normalization_log_json,
+    }
+
+
+def main(analysis_layout_output: str):
+    return _validate_strict(analysis_layout_output)

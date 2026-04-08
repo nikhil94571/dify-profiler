@@ -7358,7 +7358,8 @@ def _extract_columns_from_value_filter(
     value_filter: Optional[Any],
     filter_keys: Optional[Iterable[str]] = None,
 ) -> Set[str]:
-    keys = [str(key).strip() for key in (filter_keys or ["force_include_columns", "a9_force_include_columns"]) if str(key).strip()]
+    raw_keys = filter_keys if filter_keys is not None else ["force_include_columns", "a9_force_include_columns"]
+    keys = [str(key).strip() for key in raw_keys if str(key).strip()]
     forced_names: Set[str] = set()
     if isinstance(value_filter, dict):
         for key in keys:
@@ -7481,12 +7482,17 @@ def _compact_pairs_by_inferred_group(
         return list(pairs)
 
     ordered_pairs = list(pairs)
+    group_keys_by_name = _resolve_inferred_group_keys(
+        str(pair[1].get(name_field, "") or "").strip()
+        for pair in ordered_pairs
+    )
     if group_sample_mode == "all":
         compacted: List[Tuple[int, Dict[str, Any]]] = []
         group_counts: Dict[str, int] = {}
         for pair in ordered_pairs:
             _, row = pair
-            group_key = _infer_column_group_key(row.get(name_field, ""))
+            column_name = str(row.get(name_field, "") or "").strip()
+            group_key = group_keys_by_name.get(column_name, _infer_column_group_key(column_name))
             if group_key and group_counts.get(group_key, 0) >= cap_per_group:
                 continue
             compacted.append(pair)
@@ -7497,7 +7503,8 @@ def _compact_pairs_by_inferred_group(
     grouped_positions: Dict[str, List[Tuple[int, Tuple[int, Dict[str, Any]]]]] = {}
     for pos, pair in enumerate(ordered_pairs):
         _, row = pair
-        group_key = _infer_column_group_key(row.get(name_field, ""))
+        column_name = str(row.get(name_field, "") or "").strip()
+        group_key = group_keys_by_name.get(column_name, _infer_column_group_key(column_name))
         if not group_key:
             group_key = f"__ungrouped__:{pos}"
         grouped_positions.setdefault(group_key, []).append((pos, pair))
@@ -7677,6 +7684,65 @@ def _infer_column_group_key(name: Any) -> str:
         return match.group(1)
 
     return text
+
+
+def _parse_dense_numbered_family_candidate(name: Any) -> Optional[Tuple[str, int]]:
+    text = str(name or "").strip()
+    if not text:
+        return None
+
+    match = re.match(r"^([A-Za-z]+(?:_[A-Za-z]+)*)(\d+)$", text)
+    if not match:
+        return None
+
+    try:
+        suffix = int(match.group(2))
+    except (TypeError, ValueError):
+        return None
+    return match.group(1), suffix
+
+
+def _resolve_inferred_group_keys(names: Iterable[Any]) -> Dict[str, str]:
+    ordered_names = _ordered_nonempty_strings(names)
+    if not ordered_names:
+        return {}
+
+    stem_members: Dict[str, List[str]] = {}
+    stem_suffixes: Dict[str, Set[int]] = {}
+    resolved: Dict[str, str] = {}
+
+    for name in ordered_names:
+        explicit_group = _infer_column_group_key(name)
+        if explicit_group != name:
+            resolved[name] = explicit_group
+            continue
+
+        fallback_candidate = _parse_dense_numbered_family_candidate(name)
+        if fallback_candidate is None:
+            resolved[name] = explicit_group
+            continue
+
+        stem, suffix = fallback_candidate
+        stem_members.setdefault(stem, []).append(name)
+        stem_suffixes.setdefault(stem, set()).add(suffix)
+
+    dense_stems = {
+        stem
+        for stem, members in stem_members.items()
+        if len(members) >= 5 and len(stem_suffixes.get(stem, set())) >= 4
+    }
+
+    for name in ordered_names:
+        if name in resolved:
+            continue
+        fallback_candidate = _parse_dense_numbered_family_candidate(name)
+        if fallback_candidate is None:
+            resolved[name] = _infer_column_group_key(name)
+            continue
+        stem, _ = fallback_candidate
+        resolved[name] = stem if stem in dense_stems else _infer_column_group_key(name)
+
+    return resolved
 
 
 def _apply_column_scope_selector_policy(
@@ -10099,6 +10165,15 @@ def _run_pruning_smoke_checks() -> None:
         "ID",
     ]
 
+    dense_numbered_group_keys = _resolve_inferred_group_keys(
+        ["Q1", "Q2", "Q3", "Q4", "Q5", "Q30", "A1", "A2", "Age", "M1_Q1"]
+    )
+    assert dense_numbered_group_keys.get("Q1") == "Q"
+    assert dense_numbered_group_keys.get("Q30") == "Q"
+    assert dense_numbered_group_keys.get("A1") == "A1"
+    assert dense_numbered_group_keys.get("A2") == "A2"
+    assert dense_numbered_group_keys.get("M1_Q1") == "M1"
+
     role_bucket_pruned = _apply_a9_columns_policy(
         [
             {"column": f"A1_Q{idx}", "primary_role": "measure", "review_required": idx == 12}
@@ -10125,6 +10200,32 @@ def _run_pruning_smoke_checks() -> None:
         "A1_Q3",
         "A1_Q4",
     ]
+
+    dense_q_role_bucket_pruned = _apply_a9_columns_policy(
+        (
+            [{"column": "ID", "primary_role": "id_key", "review_required": False}]
+            + [{"column": f"Q{idx}", "primary_role": "invariant_attr", "review_required": True} for idx in range(1, 31)]
+        ),
+        {
+            "name_field": "column",
+            "role_field": "primary_role",
+            "review_field": "review_required",
+            "include_roles_all": [
+                {"role": "id_key", "cap": 5},
+                {"role": "invariant_attr", "cap": 30},
+            ],
+            "include_review_required_topk": 30,
+            "selection_cap_per_inferred_group": 6,
+            "group_sample_mode": "representative_plus_worst_outlier",
+            "hard_cap_total": 40,
+        },
+        {"force_include_columns": ["ID"]},
+        {},
+    )
+    dense_q_role_bucket_names = [row.get("column") for row in dense_q_role_bucket_pruned if isinstance(row, dict)]
+    assert "ID" in dense_q_role_bucket_names
+    assert "Q30" not in dense_q_role_bucket_names
+    assert sum(1 for name in dense_q_role_bucket_names if re.match(r"^Q\d+$", str(name or ""))) <= 6
 
     reviewer_a1_columns = [f"A1_Q{idx}" for idx in range(1, 61)]
     reviewer_a2_columns = [f"A2_Q{idx}" for idx in range(1, 61)]
@@ -10169,10 +10270,18 @@ def _run_pruning_smoke_checks() -> None:
         "A9": (
             "json",
             {
-                "columns": [
-                    {"column": "ID", "primary_role": "id_key", "review_required": False},
-                    {"column": "ANXATT", "primary_role": "measure", "review_required": True},
-                ]
+                "columns": (
+                    [
+                        {"column": "ID", "primary_role": "id_key", "review_required": False},
+                        {"column": "ANXATT", "primary_role": "measure", "review_required": True},
+                        {"column": "M1_Q14", "primary_role": "invariant_attr", "review_required": True},
+                        {"column": "M1_Q18", "primary_role": "invariant_attr", "review_required": True},
+                    ]
+                    + [
+                        {"column": column, "primary_role": "invariant_attr", "review_required": True}
+                        for column in reviewer_q_columns
+                    ]
+                )
             },
             {},
         ),
@@ -10294,14 +10403,29 @@ def _run_pruning_smoke_checks() -> None:
                 mode="canonical_contract_reviewer",
                 global_scope=ArtifactBundleScope(
                     mode="canonical_contract_reviewer",
-                    value_filter={"force_include_columns": reviewer_all_columns},
+                    value_filter={"force_include_columns": ["ID", "ANXATT", "A2_Q1"]},
                 ),
+            ),
+            response=Response(),
+        )
+        reviewer_bundle_debug = _artifact_bundle_view(
+            req=ArtifactBundleRequest(
+                run_id="run_pruning_smoke",
+                mode="canonical_contract_reviewer",
+                global_scope=ArtifactBundleScope(
+                    mode="canonical_contract_reviewer",
+                    value_filter={"force_include_columns": ["ID", "ANXATT", "A2_Q1"]},
+                ),
+                debug=True,
             ),
             response=Response(),
         )
     finally:
         globals()["_get_decoded_payload"] = original_get_decoded_payload
 
+    assert reviewer_buckets["structural_columns"] == ["ID"]
+    assert reviewer_buckets["review_priority_columns"][:4] == ["ANXATT", "M1_Q14", "M1_Q18", "Q1"]
+    assert "Q30" in reviewer_buckets["review_priority_columns"]
     assert reviewer_buckets["reviewer_focus_columns"][0] == "A2_Q1"
     assert reviewer_buckets["reviewer_focus_columns"][1] == "Mjr2"
     assert len(reviewer_buckets["reviewer_focus_columns"]) == 28
@@ -10312,14 +10436,19 @@ def _run_pruning_smoke_checks() -> None:
 
     reviewer_a2_names = [row.get("column") for row in reviewer_bundle.get("artifacts", {}).get("A2", []) if isinstance(row, dict)]
     reviewer_a4_names = [row.get("column") for row in reviewer_bundle.get("artifacts", {}).get("A4", {}).get("per_column", []) if isinstance(row, dict)]
+    reviewer_a9_names = [row.get("column") for row in reviewer_bundle.get("artifacts", {}).get("A9", {}).get("columns", []) if isinstance(row, dict)]
     reviewer_a13_rows = [row for row in reviewer_bundle.get("artifacts", {}).get("A13", {}).get("columns", []) if isinstance(row, dict)]
     reviewer_a13_names = [row.get("column") for row in reviewer_a13_rows]
     reviewer_a14_names = [row.get("column") for row in reviewer_bundle.get("artifacts", {}).get("A14", {}).get("columns", []) if isinstance(row, dict)]
     reviewer_a17_names = [row.get("column") for row in reviewer_bundle.get("artifacts", {}).get("A17", {}).get("columns", []) if isinstance(row, dict)]
+    reviewer_bundle_report = reviewer_bundle_debug.get("_bundle_prune_report", {})
+    reviewer_a13_report = reviewer_bundle_report.get("A13", {})
+    reviewer_a13_policy_report = ((reviewer_a13_report.get("column_scope_policies") or [{}])[-1]) if isinstance(reviewer_a13_report, dict) else {}
     assert reviewer_bundle.get("artifacts", {}).get("A3-T", {}).get("items") == []
     assert reviewer_bundle.get("artifacts", {}).get("A3-V", {}).get("items") == []
     assert len(reviewer_a2_names) <= 120
     assert len(reviewer_a4_names) <= 120
+    assert len(reviewer_a9_names) <= 100
     assert len(reviewer_a13_names) <= 40
     assert len(reviewer_a14_names) <= 96
     assert len(reviewer_a17_names) <= 120
@@ -10337,12 +10466,19 @@ def _run_pruning_smoke_checks() -> None:
     assert "ID" in reviewer_a2_names
     assert "ANXATT" in reviewer_a2_names
     assert "A2_Q1" in reviewer_a2_names
+    assert "ID" in reviewer_a9_names
+    assert "ANXATT" in reviewer_a9_names
+    assert "Q30" not in reviewer_a9_names
+    assert sum(1 for name in reviewer_a9_names if re.match(r"^Q\d+$", str(name or ""))) <= 6
     assert "ID" in reviewer_a17_names
     assert "ANXATT" in reviewer_a17_names
     assert "A2_Q1" in reviewer_a17_names
     assert "ID" not in reviewer_a13_names
     assert all(_is_nonempty_field_value(row.get("detected_anchors")) for row in reviewer_a13_rows)
+    assert reviewer_a13_policy_report.get("forced_output") == 0
     assert "Q30" not in reviewer_a14_names
+    assert "Q30" not in reviewer_a2_names
+    assert "Q30" not in reviewer_a4_names
     assert "Q30" not in reviewer_a17_names
     assert "A1_Q60" not in reviewer_a2_names
     assert "A1_Q60" not in reviewer_a4_names
@@ -10359,7 +10495,7 @@ def _run_pruning_smoke_checks() -> None:
     assert len(reviewer_a2_names) < len(reviewer_all_columns)
     assert len(reviewer_a4_names) < len(reviewer_all_columns)
     assert len(reviewer_a14_names) < len(reviewer_all_columns)
-    assert len(json.dumps(reviewer_bundle, sort_keys=True).encode("utf-8")) < 195724
+    assert len(json.dumps(reviewer_bundle, sort_keys=True).encode("utf-8")) < (120 * 1024)
 
     light_contract_override_rows = []
     for default in DEFAULT_OVERRIDE_FIELDS:
@@ -10577,6 +10713,7 @@ def _build_ranked_reviewer_focus_columns(rows: Iterable[Any]) -> List[str]:
 
     budget = min(64, max(16, int(math.ceil(total_columns * 0.15))))
     ranked = sorted(candidates, key=lambda item: (-item[0], item[1], item[2], item[3]))
+    group_keys_by_name = _resolve_inferred_group_keys(item[3] for item in ranked)
     selected: List[str] = []
     selected_seen: Set[str] = set()
     selected_group_counts: Dict[str, int] = {}
@@ -10586,12 +10723,12 @@ def _build_ranked_reviewer_focus_columns(rows: Iterable[Any]) -> List[str]:
             return
         selected_seen.add(column_name)
         selected.append(column_name)
-        group_key = _infer_column_group_key(column_name)
+        group_key = group_keys_by_name.get(column_name, _infer_column_group_key(column_name))
         if group_key:
             selected_group_counts[group_key] = selected_group_counts.get(group_key, 0) + 1
 
     for _, _, _, column_name in ranked:
-        group_key = _infer_column_group_key(column_name)
+        group_key = group_keys_by_name.get(column_name, _infer_column_group_key(column_name))
         if group_key and selected_group_counts.get(group_key, 0) >= 4:
             continue
         _take(column_name)
@@ -10611,6 +10748,7 @@ def _build_post_contract_auto_scope_buckets(run_id: str) -> Dict[str, List[str]]
     structural_columns: Set[str] = set()
     skip_trigger_columns: Set[str] = set()
     skip_affected_preview_columns: Set[str] = set()
+    review_priority_columns: List[str] = []
     reviewer_focus_columns: List[str] = []
 
     try:
@@ -10644,8 +10782,10 @@ def _build_post_contract_auto_scope_buckets(run_id: str) -> Dict[str, List[str]]
                 col = str(row.get("column") or "").strip()
                 role = str(row.get("primary_role") or "").strip()
                 review_required = bool(row.get("review_required", False))
-                if col and (review_required or role in {"id_key", "time_index", "repeat_index"}):
+                if col and role in {"id_key", "time_index", "repeat_index"}:
                     structural_columns.add(col)
+                if col and review_required:
+                    review_priority_columns.append(col)
     except HTTPException:
         pass
 
@@ -10682,6 +10822,7 @@ def _build_post_contract_auto_scope_buckets(run_id: str) -> Dict[str, List[str]]
         "structural_columns": sorted(structural_columns),
         "skip_trigger_columns": sorted(skip_trigger_columns),
         "skip_affected_preview_columns": sorted(skip_affected_preview_columns),
+        "review_priority_columns": _ordered_nonempty_strings(review_priority_columns),
         "reviewer_focus_columns": reviewer_focus_columns,
     }
 

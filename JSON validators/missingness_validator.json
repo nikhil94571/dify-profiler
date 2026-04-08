@@ -1,0 +1,437 @@
+import json
+
+ALLOWED_MISSINGNESS_DISPOSITIONS = {
+    "no_material_missingness",
+    "token_missingness_present",
+    "structurally_valid_missingness",
+    "partially_structural_missingness",
+    "unexplained_high_missingness",
+    "mixed_missingness_risk",
+}
+
+ALLOWED_STRUCTURAL_VALIDITY = {
+    "confirmed_structural",
+    "plausible_structural",
+    "not_structurally_explained",
+    "not_applicable",
+}
+
+ALLOWED_RECOMMENDED_HANDLING = {
+    "no_action_needed",
+    "protect_from_null_penalty",
+    "retain_with_caution",
+    "review_before_drop",
+    "candidate_drop_review",
+}
+
+DISPOSITION_TO_VALIDITY_COMPATIBILITY = {
+    "no_material_missingness": {"not_applicable", "not_structurally_explained"},
+    "token_missingness_present": {"not_structurally_explained", "plausible_structural", "not_applicable"},
+    "structurally_valid_missingness": {"confirmed_structural", "plausible_structural"},
+    "partially_structural_missingness": {"plausible_structural"},
+    "unexplained_high_missingness": {"not_structurally_explained"},
+    "mixed_missingness_risk": {"plausible_structural", "not_structurally_explained"},
+}
+
+DISPOSITION_TO_HANDLING_COMPATIBILITY = {
+    "no_material_missingness": {"no_action_needed"},
+    "token_missingness_present": {"retain_with_caution", "review_before_drop"},
+    "structurally_valid_missingness": {"protect_from_null_penalty", "retain_with_caution"},
+    "partially_structural_missingness": {"retain_with_caution", "review_before_drop"},
+    "unexplained_high_missingness": {"review_before_drop", "candidate_drop_review"},
+    "mixed_missingness_risk": {"retain_with_caution", "review_before_drop"},
+}
+
+REQUIRED_TOP_LEVEL = [
+    "worker",
+    "summary",
+    "column_decisions",
+    "global_findings",
+    "review_flags",
+    "assumptions",
+]
+
+
+def _normalization_repr(value):
+    return json.dumps(value, separators=(",", ":"))
+
+
+def _log_normalization(normalization_log, path, value):
+    normalization_log.append({
+        "path": path,
+        "defaulted_to": _normalization_repr(value),
+    })
+
+
+def _default_in_dict(container, key, value, path, normalization_log):
+    if not isinstance(container, dict):
+        return
+    if key not in container or container[key] is None:
+        container[key] = value
+        _log_normalization(normalization_log, path, value)
+
+
+def _normalize_missingness_output(parsed):
+    normalization_log = []
+
+    if not isinstance(parsed, dict):
+        return parsed, normalization_log
+
+    summary = parsed.get("summary")
+    if isinstance(summary, dict):
+        _default_in_dict(summary, "key_patterns", [], "summary.key_patterns", normalization_log)
+
+    _default_in_dict(parsed, "global_findings", [], "global_findings", normalization_log)
+    _default_in_dict(parsed, "review_flags", [], "review_flags", normalization_log)
+    _default_in_dict(parsed, "assumptions", [], "assumptions", normalization_log)
+
+    column_decisions = parsed.get("column_decisions")
+    if isinstance(column_decisions, list):
+        for i, item in enumerate(column_decisions):
+            if not isinstance(item, dict):
+                continue
+            _default_in_dict(item, "trigger_columns", [], f"column_decisions[{i}].trigger_columns", normalization_log)
+
+    return parsed, normalization_log
+
+
+def _add_error(errors, message):
+    if message not in errors:
+        errors.append(message)
+
+
+def _is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _require_string(value, field_name, errors, allow_blank=False):
+    if not isinstance(value, str):
+        _add_error(errors, f"{field_name} must be a string.")
+        return False
+    if not allow_blank and value.strip() == "":
+        _add_error(errors, f"{field_name} must not be blank.")
+        return False
+    return True
+
+
+def _require_non_empty_string(value, field_name, errors):
+    return _require_string(value, field_name, errors, allow_blank=False)
+
+
+def _require_list(value, field_name, errors):
+    if not isinstance(value, list):
+        _add_error(errors, f"{field_name} must be an array.")
+        return False
+    return True
+
+
+def _require_dict(value, field_name, errors):
+    if not isinstance(value, dict):
+        _add_error(errors, f"{field_name} must be an object.")
+        return False
+    return True
+
+
+def _require_string_list(value, field_name, errors, allow_empty=True, allow_blank_items=False):
+    if not _require_list(value, field_name, errors):
+        return False
+    ok = True
+    if not allow_empty and len(value) == 0:
+        _add_error(errors, f"{field_name} must not be empty.")
+        ok = False
+    for i, item in enumerate(value):
+        if not _require_string(item, f"{field_name}[{i}]", errors, allow_blank=allow_blank_items):
+            ok = False
+    return ok
+
+
+def _validate_summary(summary, errors):
+    if not _require_dict(summary, "summary", errors):
+        return
+
+    if "overview" not in summary:
+        _add_error(errors, "summary.overview is required.")
+    else:
+        _require_non_empty_string(summary["overview"], "summary.overview", errors)
+
+    if "key_patterns" not in summary:
+        _add_error(errors, "summary.key_patterns is required.")
+    else:
+        _require_string_list(
+            summary["key_patterns"],
+            "summary.key_patterns",
+            errors,
+            allow_empty=True,
+            allow_blank_items=True,
+        )
+
+
+def _validate_column_decisions(column_decisions, errors):
+    if not _require_list(column_decisions, "column_decisions", errors):
+        return
+
+    seen_columns = set()
+    required_column_fields = [
+        "column",
+        "missingness_disposition",
+        "structural_validity",
+        "recommended_handling",
+        "trigger_columns",
+        "normalization_notes",
+        "reasoning",
+        "confidence",
+        "skip_logic_protected",
+        "needs_human_review",
+    ]
+
+    for i, item in enumerate(column_decisions):
+        field_prefix = f"column_decisions[{i}]"
+        if not _require_dict(item, field_prefix, errors):
+            continue
+
+        for key in required_column_fields:
+            if key not in item:
+                _add_error(errors, f"{field_prefix}.{key} is required.")
+
+        column_valid = "column" in item and _require_non_empty_string(item.get("column"), f"{field_prefix}.column", errors)
+        if column_valid:
+            if item["column"] in seen_columns:
+                _add_error(errors, f"Duplicate column_decisions entry for column: {item['column']}")
+            else:
+                seen_columns.add(item["column"])
+
+        disposition_valid = False
+        structural_validity_valid = False
+        handling_valid = False
+        skip_logic_protected_valid = False
+
+        disposition = item.get("missingness_disposition")
+        if "missingness_disposition" in item and _require_non_empty_string(disposition, f"{field_prefix}.missingness_disposition", errors):
+            if disposition not in ALLOWED_MISSINGNESS_DISPOSITIONS:
+                _add_error(
+                    errors,
+                    f"{field_prefix}.missingness_disposition must be one of: {', '.join(sorted(ALLOWED_MISSINGNESS_DISPOSITIONS))}",
+                )
+            else:
+                disposition_valid = True
+
+        structural_validity = item.get("structural_validity")
+        if "structural_validity" in item and _require_non_empty_string(structural_validity, f"{field_prefix}.structural_validity", errors):
+            if structural_validity not in ALLOWED_STRUCTURAL_VALIDITY:
+                _add_error(
+                    errors,
+                    f"{field_prefix}.structural_validity must be one of: {', '.join(sorted(ALLOWED_STRUCTURAL_VALIDITY))}",
+                )
+            else:
+                structural_validity_valid = True
+
+        handling = item.get("recommended_handling")
+        if "recommended_handling" in item and _require_non_empty_string(handling, f"{field_prefix}.recommended_handling", errors):
+            if handling not in ALLOWED_RECOMMENDED_HANDLING:
+                _add_error(
+                    errors,
+                    f"{field_prefix}.recommended_handling must be one of: {', '.join(sorted(ALLOWED_RECOMMENDED_HANDLING))}",
+                )
+            else:
+                handling_valid = True
+
+        if disposition_valid and structural_validity_valid:
+            if structural_validity not in DISPOSITION_TO_VALIDITY_COMPATIBILITY[disposition]:
+                _add_error(
+                    errors,
+                    f"{field_prefix} has inconsistent missingness_disposition/structural_validity pair: {disposition} cannot use {structural_validity}",
+                )
+
+        if disposition_valid and handling_valid:
+            if handling not in DISPOSITION_TO_HANDLING_COMPATIBILITY[disposition]:
+                _add_error(
+                    errors,
+                    f"{field_prefix} has inconsistent missingness_disposition/recommended_handling pair: {disposition} cannot use {handling}",
+                )
+
+        if "trigger_columns" in item:
+            _require_string_list(item["trigger_columns"], f"{field_prefix}.trigger_columns", errors, allow_empty=True)
+
+        if "normalization_notes" in item:
+            _require_non_empty_string(item["normalization_notes"], f"{field_prefix}.normalization_notes", errors)
+
+        if "reasoning" in item:
+            _require_non_empty_string(item["reasoning"], f"{field_prefix}.reasoning", errors)
+
+        if "confidence" in item:
+            if not _is_number(item["confidence"]):
+                _add_error(errors, f"{field_prefix}.confidence must be numeric.")
+            elif not (0 <= float(item["confidence"]) <= 1):
+                _add_error(errors, f"{field_prefix}.confidence must be between 0 and 1.")
+
+        if "skip_logic_protected" in item:
+            if not isinstance(item["skip_logic_protected"], bool):
+                _add_error(errors, f"{field_prefix}.skip_logic_protected must be boolean.")
+            else:
+                skip_logic_protected_valid = True
+
+        if "needs_human_review" in item and not isinstance(item["needs_human_review"], bool):
+            _add_error(errors, f"{field_prefix}.needs_human_review must be boolean.")
+
+        if handling_valid and skip_logic_protected_valid:
+            if handling == "protect_from_null_penalty" and item["skip_logic_protected"] is not True:
+                _add_error(
+                    errors,
+                    f"{field_prefix}.skip_logic_protected must be true when recommended_handling is protect_from_null_penalty.",
+                )
+
+        if structural_validity_valid and skip_logic_protected_valid:
+            if structural_validity == "confirmed_structural" and item["skip_logic_protected"] is not True:
+                _add_error(
+                    errors,
+                    f"{field_prefix}.skip_logic_protected must be true when structural_validity is confirmed_structural.",
+                )
+            if item["skip_logic_protected"] and structural_validity not in {"confirmed_structural", "plausible_structural"}:
+                _add_error(
+                    errors,
+                    f"{field_prefix}.skip_logic_protected cannot be true when structural_validity is {structural_validity}.",
+                )
+
+def _validate_global_findings(global_findings, errors):
+    if not _require_list(global_findings, "global_findings", errors):
+        return
+    for i, item in enumerate(global_findings):
+        field_prefix = f"global_findings[{i}]"
+        if not _require_dict(item, field_prefix, errors):
+            continue
+        for key in ["finding", "impact"]:
+            if key not in item:
+                _add_error(errors, f"{field_prefix}.{key} is required.")
+            else:
+                _require_non_empty_string(item[key], f"{field_prefix}.{key}", errors)
+
+
+def _validate_review_flags(review_flags, errors):
+    if not _require_list(review_flags, "review_flags", errors):
+        return
+    for i, item in enumerate(review_flags):
+        field_prefix = f"review_flags[{i}]"
+        if not _require_dict(item, field_prefix, errors):
+            continue
+        for key in ["column", "issue", "why"]:
+            if key not in item:
+                _add_error(errors, f"{field_prefix}.{key} is required.")
+            else:
+                _require_non_empty_string(item[key], f"{field_prefix}.{key}", errors)
+
+
+def _validate_assumptions(assumptions, errors):
+    if not _require_list(assumptions, "assumptions", errors):
+        return
+    for i, item in enumerate(assumptions):
+        field_prefix = f"assumptions[{i}]"
+        if not _require_dict(item, field_prefix, errors):
+            continue
+        for key in ["assumption", "explanation"]:
+            if key not in item:
+                _add_error(errors, f"{field_prefix}.{key} is required.")
+            else:
+                _require_non_empty_string(item[key], f"{field_prefix}.{key}", errors)
+
+
+def _validate_strict(missingness_output: str):
+    output_key = "missingness_worker_json"
+
+    if not isinstance(missingness_output, str):
+        error = "missingness_output must be a string."
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    if missingness_output.strip() == "":
+        error = "missingness_output is empty."
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    try:
+        parsed = json.loads(missingness_output)
+    except json.JSONDecodeError as exc:
+        error = f"Missingness worker output is not valid JSON: {exc}"
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    if not isinstance(parsed, dict):
+        error = "root must be an object."
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    parsed, normalization_log = _normalize_missingness_output(parsed)
+    normalization_log_json = json.dumps(normalization_log, separators=(",", ":"))
+    normalization_applied = "true" if normalization_log else "false"
+
+    errors = []
+
+    for key in REQUIRED_TOP_LEVEL:
+        if key not in parsed:
+            _add_error(errors, f"Missing required top-level key: {key}")
+
+    if "worker" in parsed:
+        if _require_non_empty_string(parsed["worker"], "worker", errors):
+            if parsed["worker"] != "missingness_structural_validity_specialist":
+                _add_error(errors, "worker must be 'missingness_structural_validity_specialist'.")
+
+    if "summary" in parsed:
+        _validate_summary(parsed["summary"], errors)
+
+    if "column_decisions" in parsed:
+        _validate_column_decisions(parsed["column_decisions"], errors)
+
+    if "global_findings" in parsed:
+        _validate_global_findings(parsed["global_findings"], errors)
+
+    if "review_flags" in parsed:
+        _validate_review_flags(parsed["review_flags"], errors)
+
+    if "assumptions" in parsed:
+        _validate_assumptions(parsed["assumptions"], errors)
+
+    if errors:
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": errors[0],
+            "validation_errors_json": json.dumps(errors, separators=(",", ":")),
+            "normalization_applied": normalization_applied,
+            "normalization_log_json": normalization_log_json,
+        }
+
+    return {
+        "validation_ok": "true",
+        output_key: json.dumps(parsed, separators=(",", ":")),
+        "validation_error": "",
+        "validation_errors_json": "[]",
+        "normalization_applied": normalization_applied,
+        "normalization_log_json": normalization_log_json,
+    }
+
+
+def main(missingness_output: str):
+    return _validate_strict(missingness_output)

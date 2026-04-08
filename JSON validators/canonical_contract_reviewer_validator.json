@@ -161,6 +161,33 @@ SEMANTIC_DECISION_SOURCES = {
 _MISSING = object()
 
 
+def _normalization_repr(value):
+    return json.dumps(value, separators=(",", ":"))
+
+
+def _log_normalization(normalization_log, path, value):
+    normalization_log.append({
+        "path": path,
+        "defaulted_to": _normalization_repr(value),
+    })
+
+
+def _default_in_dict(container, key, value, path, normalization_log):
+    if not isinstance(container, dict):
+        return
+    if key not in container or container[key] is None:
+        container[key] = value
+        _log_normalization(normalization_log, path, value)
+
+
+def _set_in_dict_if_changed(container, key, value, path, normalization_log):
+    if not isinstance(container, dict):
+        return
+    if container.get(key) != value:
+        container[key] = value
+        _log_normalization(normalization_log, path, value)
+
+
 def _add_error(errors, message):
     if message not in errors:
         errors.append(message)
@@ -216,6 +243,156 @@ def _require_string_list(value, field_name, errors, allow_empty=True, allow_blan
 
 def _is_number(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _normalize_canonical_contract_dict(parsed, normalization_log, path_prefix):
+    if not isinstance(parsed, dict):
+        return
+
+    summary = parsed.get("summary")
+    if isinstance(summary, dict):
+        _default_in_dict(
+            summary,
+            "key_contract_principles",
+            [],
+            _qualify(_qualify(path_prefix, "summary"), "key_contract_principles"),
+            normalization_log,
+        )
+
+    _default_in_dict(parsed, "global_value_rules", [], _qualify(path_prefix, "global_value_rules"), normalization_log)
+    _default_in_dict(parsed, "review_flags", [], _qualify(path_prefix, "review_flags"), normalization_log)
+    _default_in_dict(parsed, "assumptions", [], _qualify(path_prefix, "assumptions"), normalization_log)
+
+    rows = parsed.get("column_contracts")
+    if isinstance(rows, list):
+        for i, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            row_prefix = f"{_qualify(path_prefix, 'column_contracts')}[{i}]"
+            _default_in_dict(row, "source_family_id", "", f"{row_prefix}.source_family_id", normalization_log)
+            _default_in_dict(row, "a9_primary_role", "", f"{row_prefix}.a9_primary_role", normalization_log)
+            _default_in_dict(row, "transform_actions", [], f"{row_prefix}.transform_actions", normalization_log)
+            _default_in_dict(
+                row,
+                "structural_transform_hints",
+                [],
+                f"{row_prefix}.structural_transform_hints",
+                normalization_log,
+            )
+            _default_in_dict(
+                row,
+                "interpretation_hints",
+                [],
+                f"{row_prefix}.interpretation_hints",
+                normalization_log,
+            )
+            _default_in_dict(row, "applied_sources", [], f"{row_prefix}.applied_sources", normalization_log)
+
+    if not isinstance(summary, dict) or not isinstance(rows, list):
+        return
+
+    expected_counts = {
+        "total_source_columns": len(rows),
+        "included_column_count": sum(
+            1 for row in rows
+            if isinstance(row, dict) and row.get("canonical_modeling_status") not in {"excluded_from_outputs", "unresolved"}
+        ),
+        "excluded_column_count": sum(
+            1 for row in rows
+            if isinstance(row, dict) and row.get("canonical_modeling_status") == "excluded_from_outputs"
+        ),
+        "unresolved_column_count": sum(
+            1 for row in rows
+            if isinstance(row, dict) and row.get("canonical_modeling_status") == "unresolved"
+        ),
+        "reviewed_override_count": sum(
+            1 for row in rows
+            if isinstance(row, dict) and (
+                row.get("type_decision_source") == "reviewed_type_worker"
+                or row.get("missingness_decision_source") == "reviewed_missingness_worker"
+            )
+        ),
+        "family_default_count": sum(
+            1 for row in rows
+            if isinstance(row, dict) and (
+                row.get("type_decision_source") == "family_default"
+                or row.get("missingness_decision_source") == "family_default"
+            )
+        ),
+        "deterministic_baseline_count": sum(
+            1 for row in rows
+            if isinstance(row, dict)
+            and row.get("type_decision_source") == "a17_baseline"
+            and row.get("missingness_decision_source") == "a17_baseline"
+        ),
+        "reviewed_type_count": sum(
+            1 for row in rows
+            if isinstance(row, dict) and row.get("type_decision_source") == "reviewed_type_worker"
+        ),
+        "fallback_type_count": sum(
+            1 for row in rows
+            if isinstance(row, dict) and row.get("type_decision_source") != "reviewed_type_worker"
+        ),
+    }
+
+    for key, value in expected_counts.items():
+        _set_in_dict_if_changed(
+            summary,
+            key,
+            value,
+            _qualify(_qualify(path_prefix, "summary"), key),
+            normalization_log,
+        )
+
+
+def _normalize_reviewer_output(parsed):
+    normalization_log = []
+
+    if not isinstance(parsed, dict):
+        return parsed, normalization_log
+
+    review_summary = parsed.get("review_summary")
+    if isinstance(review_summary, dict):
+        _default_in_dict(
+            review_summary,
+            "review_principles",
+            [],
+            "review_summary.review_principles",
+            normalization_log,
+        )
+
+    _default_in_dict(parsed, "change_log", [], "change_log", normalization_log)
+    _default_in_dict(parsed, "review_flags", [], "review_flags", normalization_log)
+    _default_in_dict(parsed, "assumptions", [], "assumptions", normalization_log)
+
+    reviewed_contract = parsed.get("reviewed_contract")
+    if isinstance(reviewed_contract, dict):
+        _normalize_canonical_contract_dict(reviewed_contract, normalization_log, "reviewed_contract")
+
+    if isinstance(review_summary, dict):
+        change_log = parsed.get("change_log")
+        if isinstance(change_log, list):
+            distinct_columns = {
+                str(item.get("column") or "").strip()
+                for item in change_log
+                if isinstance(item, dict) and str(item.get("column") or "").strip() != ""
+            }
+            _set_in_dict_if_changed(
+                review_summary,
+                "change_count",
+                len(change_log),
+                "review_summary.change_count",
+                normalization_log,
+            )
+            _set_in_dict_if_changed(
+                review_summary,
+                "changed_column_count",
+                len(distinct_columns),
+                "review_summary.changed_column_count",
+                normalization_log,
+            )
+
+    return parsed, normalization_log
 
 
 def _parse_json_object(raw_value, field_name):
@@ -752,14 +929,18 @@ def _validate_change_log(change_log, original_contract, reviewed_contract, error
 
 
 def _validate_strict(reviewer_output: str, original_contract_json: str):
+    output_key = "canonical_contract_reviewer_json"
+
     reviewed_envelope, parse_errors = _parse_json_object(reviewer_output, "reviewer_output")
     if parse_errors:
         error = parse_errors[0]
         return {
             "validation_ok": "false",
-            "canonical_contract_reviewer_json": "",
+            output_key: "",
             "validation_error": error,
             "validation_errors_json": json.dumps(parse_errors, separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
         }
 
     original_contract, original_errors = _parse_json_object(original_contract_json, "original_contract_json")
@@ -767,10 +948,16 @@ def _validate_strict(reviewer_output: str, original_contract_json: str):
         error = original_errors[0]
         return {
             "validation_ok": "false",
-            "canonical_contract_reviewer_json": "",
+            output_key: "",
             "validation_error": error,
             "validation_errors_json": json.dumps(original_errors, separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
         }
+
+    reviewed_envelope, normalization_log = _normalize_reviewer_output(reviewed_envelope)
+    normalization_log_json = json.dumps(normalization_log, separators=(",", ":"))
+    normalization_applied = "true" if normalization_log else "false"
 
     errors = []
 
@@ -867,16 +1054,20 @@ def _validate_strict(reviewer_output: str, original_contract_json: str):
     if errors:
         return {
             "validation_ok": "false",
-            "canonical_contract_reviewer_json": "",
+            output_key: "",
             "validation_error": errors[0],
             "validation_errors_json": json.dumps(errors, separators=(",", ":")),
+            "normalization_applied": normalization_applied,
+            "normalization_log_json": normalization_log_json,
         }
 
     return {
         "validation_ok": "true",
-        "canonical_contract_reviewer_json": json.dumps(reviewed_envelope, separators=(",", ":")),
+        output_key: json.dumps(reviewed_envelope, separators=(",", ":")),
         "validation_error": "",
         "validation_errors_json": "[]",
+        "normalization_applied": normalization_applied,
+        "normalization_log_json": normalization_log_json,
     }
 
 

@@ -1,0 +1,504 @@
+import json
+
+ALLOWED_FAMILY_ROLES = {
+    "repeated_survey_block",
+    "repeated_measure_set",
+    "event_sequence",
+    "answer_key_or_reference_block",
+    "other_repeat_family",
+}
+
+ALLOWED_HANDLING = {
+    "retain_as_child_table",
+    "retain_with_review",
+    "needs_manual_confirmation",
+}
+
+TYPE_LOGICAL_TYPES = {
+    "identifier",
+    "categorical_code",
+    "nominal_category",
+    "ordinal_category",
+    "boolean_flag",
+    "date",
+    "datetime",
+    "numeric_measure",
+    "free_text",
+    "mixed_or_ambiguous",
+}
+
+TYPE_STORAGE_TYPES = {
+    "string",
+    "integer",
+    "decimal",
+    "boolean",
+    "date",
+    "datetime",
+}
+
+TYPE_TRANSFORM_ACTIONS = {
+    "trim_whitespace",
+    "normalize_missing_tokens",
+    "normalize_boolean_tokens",
+    "cast_to_string",
+    "cast_to_integer",
+    "cast_to_decimal",
+    "cast_to_date",
+    "cast_to_datetime",
+    "strip_numeric_formatting",
+    "normalize_decimal_separator",
+    "lowercase_values",
+    "uppercase_values",
+    "titlecase_values",
+    "normalize_category_tokens",
+    "extract_numeric_component",
+    "strip_unit_suffix",
+    "standardize_percent_scale",
+}
+
+TYPE_STRUCTURAL_HINTS = {
+    "split_multiselect_tokens",
+    "requires_multiselect_modeling_decision",
+    "split_range_into_start_end",
+    "requires_range_semantics_review",
+    "requires_unit_normalization_review",
+    "requires_wide_to_long_review",
+    "requires_child_table_review",
+    "requires_multi_column_derivation",
+    "requires_start_end_pair_review",
+    "requires_codebook_or_label_mapping_review",
+}
+
+TYPE_INTERPRETATION_HINTS = {
+    "leading_zero_risk",
+    "identifier_not_measure",
+    "code_not_quantity",
+    "time_index_not_identifier",
+    "repeat_context_do_not_use_as_base_key",
+    "skip_logic_protected",
+    "mixed_content_high_risk",
+    "free_text_high_cardinality",
+    "numeric_parse_is_misleading",
+    "light_contract_override_applied",
+}
+
+MISSINGNESS_DISPOSITIONS = {
+    "no_material_missingness",
+    "token_missingness_present",
+    "structurally_valid_missingness",
+    "partially_structural_missingness",
+    "unexplained_high_missingness",
+    "mixed_missingness_risk",
+}
+
+MISSINGNESS_HANDLING = {
+    "no_action_needed",
+    "protect_from_null_penalty",
+    "retain_with_caution",
+    "review_before_drop",
+    "candidate_drop_review",
+}
+
+REQUIRED_TOP_LEVEL = [
+    "worker",
+    "family_id",
+    "family_result",
+    "review_flags",
+    "assumptions",
+]
+
+
+def _normalization_repr(value):
+    return json.dumps(value, separators=(",", ":"))
+
+
+def _log_normalization(normalization_log, path, value):
+    normalization_log.append({
+        "path": path,
+        "defaulted_to": _normalization_repr(value),
+    })
+
+
+def _default_in_dict(container, key, value, path, normalization_log):
+    if not isinstance(container, dict):
+        return
+    if key not in container or container[key] is None:
+        container[key] = value
+        _log_normalization(normalization_log, path, value)
+
+
+def _normalize_family_output(parsed):
+    normalization_log = []
+
+    if not isinstance(parsed, dict):
+        return parsed, normalization_log
+
+    _default_in_dict(parsed, "review_flags", [], "review_flags", normalization_log)
+    _default_in_dict(parsed, "assumptions", [], "assumptions", normalization_log)
+
+    member_defaults = parsed.get("member_defaults")
+    if isinstance(member_defaults, dict):
+        _default_in_dict(member_defaults, "transform_actions", [], "member_defaults.transform_actions", normalization_log)
+        _default_in_dict(
+            member_defaults,
+            "structural_transform_hints",
+            [],
+            "member_defaults.structural_transform_hints",
+            normalization_log,
+        )
+        _default_in_dict(
+            member_defaults,
+            "interpretation_hints",
+            [],
+            "member_defaults.interpretation_hints",
+            normalization_log,
+        )
+
+    return parsed, normalization_log
+
+
+def _add_error(errors, message):
+    if message not in errors:
+        errors.append(message)
+
+
+def _require_dict(value, field_name, errors):
+    if not isinstance(value, dict):
+        _add_error(errors, f"{field_name} must be an object.")
+        return False
+    return True
+
+
+def _require_list(value, field_name, errors):
+    if not isinstance(value, list):
+        _add_error(errors, f"{field_name} must be an array.")
+        return False
+    return True
+
+
+def _require_string(value, field_name, errors, allow_blank=False):
+    if not isinstance(value, str):
+        _add_error(errors, f"{field_name} must be a string.")
+        return False
+    if not allow_blank and value.strip() == "":
+        _add_error(errors, f"{field_name} must be non-empty.")
+        return False
+    return True
+
+
+def _require_non_empty_string(value, field_name, errors):
+    return _require_string(value, field_name, errors, allow_blank=False)
+
+
+def _require_bool(value, field_name, errors):
+    if not isinstance(value, bool):
+        _add_error(errors, f"{field_name} must be boolean.")
+        return False
+    return True
+
+
+def _require_number_between_0_and_1(value, field_name, errors):
+    if not (isinstance(value, (int, float)) and not isinstance(value, bool)):
+        _add_error(errors, f"{field_name} must be numeric.")
+        return False
+    if not (0 <= float(value) <= 1):
+        _add_error(errors, f"{field_name} must be between 0 and 1.")
+        return False
+    return True
+
+
+def _require_enum(value, field_name, allowed, errors):
+    if _require_non_empty_string(value, field_name, errors):
+        if value not in allowed:
+            _add_error(errors, f"{field_name} must be one of {sorted(allowed)}.")
+
+
+def _require_string_array(value, field_name, allowed, errors):
+    if not _require_list(value, field_name, errors):
+        return
+    for i, item in enumerate(value):
+        item_field = f"{field_name}[{i}]"
+        if not _require_non_empty_string(item, item_field, errors):
+            continue
+        if item not in allowed:
+            _add_error(errors, f"{item_field} must be one of {sorted(allowed)}.")
+
+
+def _validate_review_flags(review_flags, errors):
+    if not _require_list(review_flags, "review_flags", errors):
+        return
+    for i, item in enumerate(review_flags):
+        field_prefix = f"review_flags[{i}]"
+        if not _require_dict(item, field_prefix, errors):
+            continue
+        for key in ["item", "issue", "why"]:
+            if key not in item:
+                _add_error(errors, f"{field_prefix}.{key} is required.")
+            else:
+                _require_non_empty_string(item[key], f"{field_prefix}.{key}", errors)
+
+
+def _validate_assumptions(assumptions, errors):
+    if not _require_list(assumptions, "assumptions", errors):
+        return
+    for i, item in enumerate(assumptions):
+        field_prefix = f"assumptions[{i}]"
+        if not _require_dict(item, field_prefix, errors):
+            continue
+        for key in ["assumption", "explanation"]:
+            if key not in item:
+                _add_error(errors, f"{field_prefix}.{key} is required.")
+            else:
+                _require_non_empty_string(item[key], f"{field_prefix}.{key}", errors)
+
+
+def _validate_member_defaults(member_defaults, errors):
+    if not _require_dict(member_defaults, "member_defaults", errors):
+        return
+
+    substantive_fields = [
+        "recommended_logical_type",
+        "recommended_storage_type",
+        "transform_actions",
+        "structural_transform_hints",
+        "interpretation_hints",
+        "missingness_disposition",
+        "missingness_handling",
+        "skip_logic_protected",
+        "normalization_notes",
+    ]
+    if not any(field in member_defaults for field in substantive_fields):
+        _add_error(errors, "member_defaults must include at least one defaultable field.")
+
+    if "recommended_logical_type" in member_defaults:
+        _require_enum(member_defaults["recommended_logical_type"], "member_defaults.recommended_logical_type", TYPE_LOGICAL_TYPES, errors)
+    if "recommended_storage_type" in member_defaults:
+        _require_enum(member_defaults["recommended_storage_type"], "member_defaults.recommended_storage_type", TYPE_STORAGE_TYPES, errors)
+    if "transform_actions" in member_defaults:
+        _require_string_array(member_defaults["transform_actions"], "member_defaults.transform_actions", TYPE_TRANSFORM_ACTIONS, errors)
+    if "structural_transform_hints" in member_defaults:
+        _require_string_array(
+            member_defaults["structural_transform_hints"],
+            "member_defaults.structural_transform_hints",
+            TYPE_STRUCTURAL_HINTS,
+            errors,
+        )
+    if "interpretation_hints" in member_defaults:
+        _require_string_array(
+            member_defaults["interpretation_hints"],
+            "member_defaults.interpretation_hints",
+            TYPE_INTERPRETATION_HINTS,
+            errors,
+        )
+    if "missingness_disposition" in member_defaults:
+        _require_enum(
+            member_defaults["missingness_disposition"],
+            "member_defaults.missingness_disposition",
+            MISSINGNESS_DISPOSITIONS,
+            errors,
+        )
+    if "missingness_handling" in member_defaults:
+        _require_enum(
+            member_defaults["missingness_handling"],
+            "member_defaults.missingness_handling",
+            MISSINGNESS_HANDLING,
+            errors,
+        )
+    if "skip_logic_protected" in member_defaults:
+        _require_bool(member_defaults["skip_logic_protected"], "member_defaults.skip_logic_protected", errors)
+    if "normalization_notes" in member_defaults:
+        _require_string(member_defaults["normalization_notes"], "member_defaults.normalization_notes", errors, allow_blank=True)
+    if "confidence" in member_defaults:
+        _require_number_between_0_and_1(member_defaults["confidence"], "member_defaults.confidence", errors)
+    if "needs_human_review" in member_defaults:
+        _require_bool(member_defaults["needs_human_review"], "member_defaults.needs_human_review", errors)
+
+
+def _validate_family_result(root_family_id, family_result, errors):
+    if not _require_dict(family_result, "family_result", errors):
+        return
+
+    required_keys = [
+        "family_id",
+        "recommended_table_name",
+        "recommended_parent_key",
+        "recommended_repeat_index_name",
+        "recommended_family_role",
+        "recommended_handling",
+        "member_semantics_notes",
+        "confidence",
+        "reasoning",
+        "needs_human_review",
+    ]
+    for key in required_keys:
+        if key not in family_result:
+            _add_error(errors, f"family_result.{key} is required.")
+
+    family_id_valid = "family_id" in family_result and _require_non_empty_string(
+        family_result.get("family_id"),
+        "family_result.family_id",
+        errors,
+    )
+
+    if family_id_valid and isinstance(root_family_id, str) and root_family_id.strip() != "":
+        if family_result["family_id"] != root_family_id:
+            _add_error(errors, "top-level family_id must equal family_result.family_id.")
+
+    if "recommended_table_name" in family_result:
+        _require_non_empty_string(family_result["recommended_table_name"], "family_result.recommended_table_name", errors)
+
+    parent_key_non_blank = False
+    if "recommended_parent_key" in family_result:
+        if _require_string(family_result["recommended_parent_key"], "family_result.recommended_parent_key", errors, allow_blank=True):
+            parent_key_non_blank = family_result["recommended_parent_key"].strip() != ""
+
+    repeat_index_non_blank = False
+    if "recommended_repeat_index_name" in family_result:
+        if _require_string(
+            family_result["recommended_repeat_index_name"],
+            "family_result.recommended_repeat_index_name",
+            errors,
+            allow_blank=True,
+        ):
+            repeat_index_non_blank = family_result["recommended_repeat_index_name"].strip() != ""
+
+    if "member_semantics_notes" in family_result:
+        _require_non_empty_string(family_result["member_semantics_notes"], "family_result.member_semantics_notes", errors)
+
+    if "reasoning" in family_result:
+        _require_non_empty_string(family_result["reasoning"], "family_result.reasoning", errors)
+
+    role_valid = False
+    handling_valid = False
+
+    role = family_result.get("recommended_family_role")
+    if "recommended_family_role" in family_result and _require_non_empty_string(role, "family_result.recommended_family_role", errors):
+        if role not in ALLOWED_FAMILY_ROLES:
+            _add_error(errors, f"family_result.recommended_family_role must be one of {sorted(ALLOWED_FAMILY_ROLES)}.")
+        else:
+            role_valid = True
+
+    handling = family_result.get("recommended_handling")
+    if "recommended_handling" in family_result and _require_non_empty_string(handling, "family_result.recommended_handling", errors):
+        if handling not in ALLOWED_HANDLING:
+            _add_error(errors, f"family_result.recommended_handling must be one of {sorted(ALLOWED_HANDLING)}.")
+        else:
+            handling_valid = True
+
+    if "confidence" in family_result:
+        _require_number_between_0_and_1(family_result["confidence"], "family_result.confidence", errors)
+
+    if "needs_human_review" in family_result:
+        _require_bool(family_result["needs_human_review"], "family_result.needs_human_review", errors)
+
+    if handling_valid and handling == "retain_as_child_table":
+        if not parent_key_non_blank:
+            _add_error(errors, "family_result.recommended_parent_key must be non-empty when recommended_handling is retain_as_child_table.")
+        if not repeat_index_non_blank:
+            _add_error(errors, "family_result.recommended_repeat_index_name must be non-empty when recommended_handling is retain_as_child_table.")
+
+
+def _validate_strict(family_output: str):
+    output_key = "family_worker_item_json"
+
+    if not isinstance(family_output, str):
+        error = "family_output must be a string."
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    if family_output.strip() == "":
+        error = "family_output is empty."
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    try:
+        parsed = json.loads(family_output)
+    except json.JSONDecodeError as exc:
+        error = f"Family worker output is not valid JSON: {exc}"
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    if not isinstance(parsed, dict):
+        error = "root must be an object."
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    parsed, normalization_log = _normalize_family_output(parsed)
+    normalization_log_json = json.dumps(normalization_log, separators=(",", ":"))
+    normalization_applied = "true" if normalization_log else "false"
+
+    errors = []
+
+    for key in REQUIRED_TOP_LEVEL:
+        if key not in parsed:
+            _add_error(errors, f"Missing required top-level key: {key}")
+
+    family_id_valid = False
+
+    if "worker" in parsed:
+        if _require_non_empty_string(parsed["worker"], "worker", errors):
+            if parsed["worker"] != "family_specialist":
+                _add_error(errors, "worker must be 'family_specialist'.")
+
+    if "family_id" in parsed:
+        family_id_valid = _require_non_empty_string(parsed["family_id"], "family_id", errors)
+
+    if "family_result" in parsed:
+        root_family_id = parsed["family_id"] if family_id_valid else ""
+        _validate_family_result(root_family_id, parsed["family_result"], errors)
+
+    if "member_defaults" in parsed:
+        _validate_member_defaults(parsed["member_defaults"], errors)
+
+    if "review_flags" in parsed:
+        _validate_review_flags(parsed["review_flags"], errors)
+
+    if "assumptions" in parsed:
+        _validate_assumptions(parsed["assumptions"], errors)
+
+    if errors:
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": errors[0],
+            "validation_errors_json": json.dumps(errors, separators=(",", ":")),
+            "normalization_applied": normalization_applied,
+            "normalization_log_json": normalization_log_json,
+        }
+
+    return {
+        "validation_ok": "true",
+        output_key: json.dumps(parsed, separators=(",", ":")),
+        "validation_error": "",
+        "validation_errors_json": "[]",
+        "normalization_applied": normalization_applied,
+        "normalization_log_json": normalization_log_json,
+    }
+
+
+def main(family_output: str):
+    return _validate_strict(family_output)

@@ -228,7 +228,7 @@ Before making any column decision:
 You must interpret artifact evidence inside this finalized structural context.
 
 ### STEP 2 - Build the in-scope review set
-Build your explicit decision set from the union of:
+Build your explicit decision set conservatively from the union of:
 - columns directly referenced by `light_contract_decisions`,
 - columns in `A16.detected_skip_logic[].sample_affected_columns`,
 - columns in `A16.master_switch_candidates[].sample_affected_columns`,
@@ -237,6 +237,8 @@ Build your explicit decision set from the union of:
 - any columns where token-based missingness is present and notable.
 
 Do not force a full-dataset per-column pass.
+Do not try to emit a reviewed row for every benign column.
+It is valid to return a sparse override set when the remaining columns can safely inherit profiler baseline behavior downstream.
 
 ### STEP 3 - Decide whether missingness is structurally explained
 For each reviewed column, decide whether the missingness is:

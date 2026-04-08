@@ -1,0 +1,588 @@
+import json
+
+REQUIRED_TOP_LEVEL = [
+    "worker",
+    "summary",
+    "table_suggestions",
+    "column_table_assignments",
+    "global_layout_findings",
+    "review_flags",
+    "assumptions",
+]
+
+MODEL_SHAPES = {
+    "single_base_table",
+    "base_plus_references",
+    "base_plus_children",
+    "base_plus_references_plus_children",
+    "mixed_with_reference_tables",
+}
+
+TABLE_KINDS = {
+    "base_entity",
+    "child_repeat",
+    "reference_lookup",
+    "event_table",
+}
+
+SOURCE_KINDS = {
+    "primary_grain",
+    "accepted_reference",
+    "accepted_family",
+    "reference_block",
+    "residual_grouping",
+}
+
+BUILD_STRATEGIES = {
+    "direct_select",
+    "wide_to_long_family",
+    "reference_extract",
+    "event_projection",
+}
+
+ASSIGNMENT_ROLES = {
+    "base_key",
+    "base_attribute",
+    "reference_key",
+    "reference_attribute",
+    "repeat_parent_key",
+    "repeat_index",
+    "melt_member",
+    "reference_value",
+    "exclude_from_outputs",
+    "unresolved",
+}
+
+ASSIGNED_TABLE_OPTIONAL_ROLES = {
+    "exclude_from_outputs",
+    "unresolved",
+}
+
+
+def _normalization_repr(value):
+    return json.dumps(value, separators=(",", ":"))
+
+
+def _log_normalization(normalization_log, path, value):
+    normalization_log.append({
+        "path": path,
+        "defaulted_to": _normalization_repr(value),
+    })
+
+
+def _default_in_dict(container, key, value, path, normalization_log):
+    if not isinstance(container, dict):
+        return
+    if key not in container or container[key] is None:
+        container[key] = value
+        _log_normalization(normalization_log, path, value)
+
+
+def _normalize_table_layout_output(parsed):
+    normalization_log = []
+
+    if not isinstance(parsed, dict):
+        return parsed, normalization_log
+
+    summary = parsed.get("summary")
+    if isinstance(summary, dict):
+        _default_in_dict(summary, "key_layout_principles", [], "summary.key_layout_principles", normalization_log)
+
+    _default_in_dict(parsed, "global_layout_findings", [], "global_layout_findings", normalization_log)
+    _default_in_dict(parsed, "review_flags", [], "review_flags", normalization_log)
+    _default_in_dict(parsed, "assumptions", [], "assumptions", normalization_log)
+
+    table_suggestions = parsed.get("table_suggestions")
+    if isinstance(table_suggestions, list):
+        for i, tbl in enumerate(table_suggestions):
+            if not isinstance(tbl, dict):
+                continue
+            _default_in_dict(tbl, "parent_table_name", "", f"table_suggestions[{i}].parent_table_name", normalization_log)
+            _default_in_dict(tbl, "parent_key", [], f"table_suggestions[{i}].parent_key", normalization_log)
+            _default_in_dict(tbl, "repeat_index_name", "", f"table_suggestions[{i}].repeat_index_name", normalization_log)
+            _default_in_dict(tbl, "excluded_columns", [], f"table_suggestions[{i}].excluded_columns", normalization_log)
+            _default_in_dict(tbl, "included_columns", [], f"table_suggestions[{i}].included_columns", normalization_log)
+            _default_in_dict(
+                tbl,
+                "included_columns_preview",
+                [],
+                f"table_suggestions[{i}].included_columns_preview",
+                normalization_log,
+            )
+
+    assignments = parsed.get("column_table_assignments")
+    if isinstance(assignments, list):
+        for i, row in enumerate(assignments):
+            if not isinstance(row, dict):
+                continue
+            _default_in_dict(row, "source_family_id", "", f"column_table_assignments[{i}].source_family_id", normalization_log)
+
+    return parsed, normalization_log
+
+
+def _add_error(errors, message):
+    if message not in errors:
+        errors.append(message)
+
+
+def _require_obj(value, field_name, errors):
+    if not isinstance(value, dict):
+        _add_error(errors, f"{field_name} must be an object.")
+        return False
+    return True
+
+
+def _require_list(value, field_name, errors):
+    if not isinstance(value, list):
+        _add_error(errors, f"{field_name} must be an array.")
+        return False
+    return True
+
+
+def _require_str(value, field_name, errors, allow_blank=False):
+    if not isinstance(value, str):
+        _add_error(errors, f"{field_name} must be a string.")
+        return False
+    if not allow_blank and value.strip() == "":
+        _add_error(errors, f"{field_name} must not be blank.")
+        return False
+    return True
+
+
+def _require_string_list(value, field_name, errors, allow_empty=True, allow_blank_items=False):
+    if not _require_list(value, field_name, errors):
+        return False
+    ok = True
+    if not allow_empty and len(value) == 0:
+        _add_error(errors, f"{field_name} must not be empty.")
+        ok = False
+    for i, item in enumerate(value):
+        if not _require_str(item, f"{field_name}[{i}]", errors, allow_blank=allow_blank_items):
+            ok = False
+    return ok
+
+
+def _is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _load_expected_columns(raw_value, field_name, errors):
+    if raw_value in ("", None):
+        return None
+    if not isinstance(raw_value, str):
+        _add_error(errors, f"{field_name} must be a string when provided.")
+        return None
+    try:
+        parsed = json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        _add_error(errors, f"{field_name} is not valid JSON: {exc}")
+        return None
+    if not isinstance(parsed, list):
+        _add_error(errors, f"{field_name} must decode to an array.")
+        return None
+
+    expected = []
+    seen = set()
+    for i, item in enumerate(parsed):
+        if not isinstance(item, str):
+            _add_error(errors, f"{field_name}[{i}] must be a string.")
+            continue
+        if item.strip() == "":
+            _add_error(errors, f"{field_name}[{i}] must not be blank.")
+            continue
+        if item in seen:
+            _add_error(errors, f"{field_name} contains a duplicate column: {item}")
+            continue
+        seen.add(item)
+        expected.append(item)
+    return expected
+
+
+def _validate_summary(summary, errors):
+    if not _require_obj(summary, "summary", errors):
+        return
+
+    if "overview" not in summary:
+        _add_error(errors, "summary.overview is required.")
+    else:
+        _require_str(summary["overview"], "summary.overview", errors)
+
+    if "recommended_model_shape" not in summary:
+        _add_error(errors, "summary.recommended_model_shape is required.")
+    else:
+        if _require_str(summary["recommended_model_shape"], "summary.recommended_model_shape", errors):
+            if summary["recommended_model_shape"] not in MODEL_SHAPES:
+                _add_error(errors, "summary.recommended_model_shape is invalid.")
+
+    if "key_layout_principles" not in summary:
+        _add_error(errors, "summary.key_layout_principles is required.")
+    else:
+        _require_string_list(
+            summary["key_layout_principles"],
+            "summary.key_layout_principles",
+            errors,
+            allow_empty=True,
+            allow_blank_items=True,
+        )
+
+
+def _validate_table_suggestions(table_suggestions, errors):
+    if not _require_list(table_suggestions, "table_suggestions", errors):
+        return set()
+
+    if len(table_suggestions) == 0:
+        _add_error(errors, "table_suggestions must not be empty.")
+        return set()
+
+    seen_table_names = set()
+
+    for i, tbl in enumerate(table_suggestions):
+        path = f"table_suggestions[{i}]"
+        if not _require_obj(tbl, path, errors):
+            continue
+
+        required = [
+            "table_name",
+            "kind",
+            "source_basis",
+            "parent_table_name",
+            "parent_key",
+            "grain_columns",
+            "repeat_index_name",
+            "build_strategy",
+            "excluded_columns",
+            "confidence",
+            "reasoning",
+            "needs_human_review",
+        ]
+        for key in required:
+            if key not in tbl:
+                _add_error(errors, f"{path}.{key} is required.")
+
+        table_name_valid = "table_name" in tbl and _require_str(tbl["table_name"], f"{path}.table_name", errors)
+        if table_name_valid:
+            if tbl["table_name"] in seen_table_names:
+                _add_error(errors, f"Duplicate table_name: {tbl['table_name']}")
+            else:
+                seen_table_names.add(tbl["table_name"])
+
+        if "kind" in tbl and _require_str(tbl["kind"], f"{path}.kind", errors):
+            if tbl["kind"] not in TABLE_KINDS:
+                _add_error(errors, f"{path}.kind is invalid.")
+
+        source_basis_valid = False
+        if "source_basis" in tbl and _require_obj(tbl["source_basis"], f"{path}.source_basis", errors):
+            source_basis_valid = True
+            kind = tbl["source_basis"].get("kind")
+            if not _require_str(kind, f"{path}.source_basis.kind", errors):
+                source_basis_valid = False
+            elif kind not in SOURCE_KINDS:
+                _add_error(errors, f"{path}.source_basis.kind is invalid.")
+                source_basis_valid = False
+
+        if "parent_table_name" in tbl:
+            _require_str(tbl["parent_table_name"], f"{path}.parent_table_name", errors, allow_blank=True)
+
+        if "parent_key" in tbl:
+            _require_string_list(tbl["parent_key"], f"{path}.parent_key", errors, allow_empty=True)
+
+        if "grain_columns" in tbl:
+            _require_string_list(tbl["grain_columns"], f"{path}.grain_columns", errors, allow_empty=False)
+
+        if "repeat_index_name" in tbl:
+            _require_str(tbl["repeat_index_name"], f"{path}.repeat_index_name", errors, allow_blank=True)
+
+        if "build_strategy" in tbl and _require_str(tbl["build_strategy"], f"{path}.build_strategy", errors):
+            if tbl["build_strategy"] not in BUILD_STRATEGIES:
+                _add_error(errors, f"{path}.build_strategy is invalid.")
+
+        if "excluded_columns" in tbl:
+            _require_string_list(tbl["excluded_columns"], f"{path}.excluded_columns", errors, allow_empty=True)
+
+        if "confidence" in tbl:
+            if not _is_number(tbl["confidence"]):
+                _add_error(errors, f"{path}.confidence must be numeric.")
+            elif not (0 <= float(tbl["confidence"]) <= 1):
+                _add_error(errors, f"{path}.confidence must be between 0 and 1.")
+
+        if "reasoning" in tbl:
+            _require_str(tbl["reasoning"], f"{path}.reasoning", errors)
+
+        if "needs_human_review" in tbl and not isinstance(tbl["needs_human_review"], bool):
+            _add_error(errors, f"{path}.needs_human_review must be boolean.")
+
+        if (
+            tbl.get("kind") == "child_repeat"
+            and tbl.get("build_strategy") == "wide_to_long_family"
+            and isinstance(tbl.get("parent_key"), list)
+            and isinstance(tbl.get("grain_columns"), list)
+            and isinstance(tbl.get("repeat_index_name"), str)
+        ):
+            if tbl["repeat_index_name"].strip() == "":
+                _add_error(errors, f"{path}.repeat_index_name must be non-empty.")
+            else:
+                expected_grain = list(tbl["parent_key"]) + [tbl["repeat_index_name"]]
+                if tbl["grain_columns"] != expected_grain:
+                    _add_error(errors, f"{path}.grain_columns must equal parent_key + repeat_index_name.")
+
+        is_accepted_family = source_basis_valid and tbl["source_basis"]["kind"] == "accepted_family"
+
+        if is_accepted_family:
+            if "source_family_id" not in tbl:
+                _add_error(errors, f"{path}.source_family_id is required for accepted-family tables.")
+            else:
+                _require_str(tbl["source_family_id"], f"{path}.source_family_id", errors)
+
+            if "included_column_count" not in tbl:
+                _add_error(errors, f"{path}.included_column_count is required for accepted-family tables.")
+            else:
+                if not isinstance(tbl["included_column_count"], int):
+                    _add_error(errors, f"{path}.included_column_count must be an integer.")
+                elif tbl["included_column_count"] <= 0:
+                    _add_error(errors, f"{path}.included_column_count must be > 0.")
+
+            if "included_columns_preview" not in tbl:
+                _add_error(errors, f"{path}.included_columns_preview is required for accepted-family tables.")
+            else:
+                _require_string_list(tbl["included_columns_preview"], f"{path}.included_columns_preview", errors, allow_empty=False)
+
+            if "included_columns" in tbl and tbl["included_columns"]:
+                _add_error(errors, f"{path}.included_columns must be omitted or empty for accepted-family compact summaries.")
+        else:
+            if "source_family_id" in tbl and tbl["source_family_id"] not in ("", None):
+                _add_error(errors, f"{path}.source_family_id must be omitted or blank for non-family tables.")
+
+    return seen_table_names
+
+
+def _validate_column_table_assignments(assignments, seen_table_names, errors, expected_source_columns=None):
+    if not _require_list(assignments, "column_table_assignments", errors):
+        return
+
+    if len(assignments) == 0:
+        _add_error(errors, "column_table_assignments must not be empty.")
+        return
+
+    seen_columns = set()
+
+    for i, row in enumerate(assignments):
+        path = f"column_table_assignments[{i}]"
+        if not _require_obj(row, path, errors):
+            continue
+
+        required = ["column", "assigned_table", "assignment_role", "source_family_id", "why"]
+        for key in required:
+            if key not in row:
+                _add_error(errors, f"{path}.{key} is required.")
+
+        column_valid = "column" in row and _require_str(row["column"], f"{path}.column", errors)
+        if column_valid:
+            if row["column"] in seen_columns:
+                _add_error(errors, f"Duplicate column_table_assignments entry for column: {row['column']}")
+            else:
+                seen_columns.add(row["column"])
+
+        assignment_role_valid = False
+        if "assignment_role" in row and _require_str(row["assignment_role"], f"{path}.assignment_role", errors):
+            if row["assignment_role"] not in ASSIGNMENT_ROLES:
+                _add_error(errors, f"{path}.assignment_role is invalid.")
+            else:
+                assignment_role_valid = True
+
+        allow_blank_assigned_table = (
+            assignment_role_valid and row["assignment_role"] in ASSIGNED_TABLE_OPTIONAL_ROLES
+        )
+
+        if "assigned_table" in row:
+            _require_str(
+                row["assigned_table"],
+                f"{path}.assigned_table",
+                errors,
+                allow_blank=allow_blank_assigned_table,
+            )
+
+        if "source_family_id" in row and not isinstance(row["source_family_id"], str):
+            _add_error(errors, f"{path}.source_family_id must be a string.")
+
+        if "why" in row:
+            _require_str(row["why"], f"{path}.why", errors)
+
+        if assignment_role_valid and row["assignment_role"] not in ASSIGNED_TABLE_OPTIONAL_ROLES:
+            if (
+                isinstance(row.get("assigned_table"), str)
+                and row["assigned_table"].strip() != ""
+                and row["assigned_table"] not in seen_table_names
+            ):
+                _add_error(errors, f"{path}.assigned_table must match a table_name in table_suggestions.")
+
+        if assignment_role_valid and row["assignment_role"] == "melt_member":
+            if not isinstance(row.get("source_family_id"), str) or row["source_family_id"].strip() == "":
+                _add_error(errors, f"{path}.source_family_id is required for melt_member.")
+
+    if expected_source_columns is not None:
+        expected_set = set(expected_source_columns)
+        missing_columns = sorted(expected_set - seen_columns)
+        unexpected_columns = sorted(seen_columns - expected_set)
+        if missing_columns:
+            _add_error(errors, f"column_table_assignments is missing source columns: {', '.join(missing_columns)}")
+        if unexpected_columns:
+            _add_error(errors, f"column_table_assignments contains unexpected source columns: {', '.join(unexpected_columns)}")
+
+
+def _validate_global_layout_findings(global_layout_findings, errors):
+    if not _require_list(global_layout_findings, "global_layout_findings", errors):
+        return
+    for i, item in enumerate(global_layout_findings):
+        path = f"global_layout_findings[{i}]"
+        if not _require_obj(item, path, errors):
+            continue
+        if "finding" not in item:
+            _add_error(errors, f"{path}.finding is required.")
+        else:
+            _require_str(item["finding"], f"{path}.finding", errors)
+        if "impact" not in item:
+            _add_error(errors, f"{path}.impact is required.")
+        else:
+            _require_str(item["impact"], f"{path}.impact", errors)
+
+
+def _validate_review_flags(review_flags, errors):
+    if not _require_list(review_flags, "review_flags", errors):
+        return
+    for i, item in enumerate(review_flags):
+        path = f"review_flags[{i}]"
+        if not _require_obj(item, path, errors):
+            continue
+        for key in ["item", "issue", "why"]:
+            if key not in item:
+                _add_error(errors, f"{path}.{key} is required.")
+            else:
+                _require_str(item[key], f"{path}.{key}", errors)
+
+
+def _validate_assumptions(assumptions, errors):
+    if not _require_list(assumptions, "assumptions", errors):
+        return
+    for i, item in enumerate(assumptions):
+        path = f"assumptions[{i}]"
+        if not _require_obj(item, path, errors):
+            continue
+        for key in ["assumption", "explanation"]:
+            if key not in item:
+                _add_error(errors, f"{path}.{key} is required.")
+            else:
+                _require_str(item[key], f"{path}.{key}", errors)
+
+
+def _validate_strict(table_layout_output: str, expected_source_columns_json: str = ""):
+    output_key = "table_layout_worker_json"
+
+    if not isinstance(table_layout_output, str):
+        error = "table_layout_output must be a string."
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    if table_layout_output.strip() == "":
+        error = "table_layout_output is empty."
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    try:
+        parsed = json.loads(table_layout_output)
+    except json.JSONDecodeError as exc:
+        error = f"Table layout worker output is not valid JSON: {exc}"
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    if not isinstance(parsed, dict):
+        error = "root must be an object."
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    parsed, normalization_log = _normalize_table_layout_output(parsed)
+    normalization_log_json = json.dumps(normalization_log, separators=(",", ":"))
+    normalization_applied = "true" if normalization_log else "false"
+
+    errors = []
+    expected_source_columns = _load_expected_columns(expected_source_columns_json, "expected_source_columns_json", errors)
+
+    for key in REQUIRED_TOP_LEVEL:
+        if key not in parsed:
+            _add_error(errors, f"Missing required top-level key: {key}")
+
+    if "worker" in parsed:
+        if _require_str(parsed["worker"], "worker", errors):
+            if parsed["worker"] != "table_layout_specialist":
+                _add_error(errors, "worker must be 'table_layout_specialist'.")
+
+    if "summary" in parsed:
+        _validate_summary(parsed["summary"], errors)
+
+    if "table_suggestions" in parsed:
+        seen_table_names = _validate_table_suggestions(parsed["table_suggestions"], errors)
+    else:
+        seen_table_names = set()
+
+    if "column_table_assignments" in parsed:
+        _validate_column_table_assignments(
+            parsed["column_table_assignments"],
+            seen_table_names,
+            errors,
+            expected_source_columns=expected_source_columns,
+        )
+
+    if "global_layout_findings" in parsed:
+        _validate_global_layout_findings(parsed["global_layout_findings"], errors)
+
+    if "review_flags" in parsed:
+        _validate_review_flags(parsed["review_flags"], errors)
+
+    if "assumptions" in parsed:
+        _validate_assumptions(parsed["assumptions"], errors)
+
+    if errors:
+        return {
+            "validation_ok": "false",
+            output_key: "",
+            "validation_error": errors[0],
+            "validation_errors_json": json.dumps(errors, separators=(",", ":")),
+            "normalization_applied": normalization_applied,
+            "normalization_log_json": normalization_log_json,
+        }
+
+    return {
+        "validation_ok": "true",
+        output_key: json.dumps(parsed, separators=(",", ":")),
+        "validation_error": "",
+        "validation_errors_json": "[]",
+        "normalization_applied": normalization_applied,
+        "normalization_log_json": normalization_log_json,
+    }
+
+
+def main(table_layout_output: str, expected_source_columns_json: str = ""):
+    return _validate_strict(table_layout_output, expected_source_columns_json=expected_source_columns_json)

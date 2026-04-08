@@ -21,6 +21,7 @@
             "skip_affected_preview_columns"
           ],
           "seed_from_filter_keys": [
+            "review_priority_columns",
             "reviewer_focus_columns",
             "review_columns"
           ],
@@ -95,6 +96,7 @@
             "skip_affected_preview_columns"
           ],
           "seed_from_filter_keys": [
+            "review_priority_columns",
             "reviewer_focus_columns",
             "review_columns"
           ],
@@ -231,6 +233,7 @@
             "skip_affected_preview_columns"
           ],
           "seed_from_filter_keys": [
+            "review_priority_columns",
             "reviewer_focus_columns",
             "review_columns"
           ],
@@ -273,6 +276,7 @@
             "skip_affected_preview_columns"
           ],
           "seed_from_filter_keys": [
+            "review_priority_columns",
             "reviewer_focus_columns",
             "review_columns"
           ],

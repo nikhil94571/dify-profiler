@@ -50,6 +50,7 @@ If the artifacts disagree, your job is to produce the safest and most useful typ
 You receive one combined payload.
 It contains:
 - `light_contract_decisions`
+- optionally `expected_review_columns_json`
 - optionally `semantic_context_json`
 - then a bundled artifact payload for the `type_transform_worker` profile
 
@@ -65,6 +66,7 @@ The bundle is expected to include:
 
 Important:
 - `light_contract_decisions` is the authoritative structural checkpoint.
+- `expected_review_columns_json`, when present, is the authoritative reviewed scope for this run.
 - `semantic_context_json`, when present, is user-provided semantic guidance or a structured skip sentinel.
 - The artifacts are lower-precedence evidence layers used to refine type and transform decisions inside that fixed structure.
 - If some artifact is missing or partially unusable, proceed using available evidence and record an explicit assumption.
@@ -259,6 +261,11 @@ light_contract_decisions:
 - What it is: the human-reviewed structural checkpoint containing finalized grain, family, and override decisions.
 - Why it matters: this is the authoritative structural context and outranks raw artifact heuristics. If it conflicts with an artifact, keep the light-contract structure and flag the contradiction rather than overriding it.
 
+expected_review_columns_json:
+- What it is: the deterministic reviewed scope for this run when present.
+- Why it matters: it overrides any inferred review union and defines exactly which columns must receive explicit `column_decisions`.
+- What not to use it for: do not reinterpret it as a ranking hint or partial preference list; it is an exact scope contract.
+
 semantic_context_json:
 - What it is: reviewed user-provided semantic guidance or a structured skip sentinel.
 - Why it matters: when present and not skipped, it can clarify code meaning, business identifiers, or collection semantics that raw artifacts alone cannot prove.
@@ -320,7 +327,15 @@ Do NOT copy `A9.primary_role` directly into `recommended_logical_type` unless it
 ## 8) WHICH COLUMNS YOU MUST EXPLICITLY DECIDE
 You are not producing an explicit decision row for every column in the dataset.
 
-You MUST produce `column_decisions` for the union of:
+If `expected_review_columns_json` is provided:
+- it is the authoritative reviewed scope for this run
+- you MUST produce exactly one `column_decisions` row for each listed column
+- you MUST NOT add `column_decisions` for columns not listed there
+- do NOT recompute, shrink, or expand the reviewed scope from `A3-V.items`, `A3-T.items`, `light_contract_decisions`, `A9`, or `A16`
+- if a listed column appears weakly evidenced or absent from compact previews, treat that as limited bundle context, not permission to omit it
+- if evidence for a listed column is weak, still emit the safest conservative row and use lower confidence and `needs_human_review = true` when appropriate
+
+Only when `expected_review_columns_json` is not provided, you MUST produce `column_decisions` for the union of:
 - columns in `A3-V.items`
 - columns in `A3-T.items`
 - columns referenced directly by `light_contract_decisions`
