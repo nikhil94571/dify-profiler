@@ -1,4 +1,4 @@
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 import io
 import os
 import hashlib
@@ -7428,6 +7428,114 @@ def _sorted_columns_for_bucket(columns: List[Tuple[int, Dict[str, Any]]], name_f
     return sorted(columns, key=lambda pair: str(pair[1].get(name_field, "")))
 
 
+def _normalize_group_sample_mode(value: Any) -> str:
+    mode = str(value or "all").strip().lower()
+    if mode in {"all", "representative_plus_worst_outlier"}:
+        return mode
+    return "all"
+
+
+def _column_scope_match_severity(
+    row: Dict[str, Any],
+    *,
+    bool_true_fields: List[str],
+    nonempty_fields: List[str],
+    numeric_gte: Dict[str, float],
+    numeric_lte: Dict[str, float],
+) -> Tuple[int, int, int, float]:
+    bool_hits = sum(1 for field in bool_true_fields if bool(row.get(field, False)))
+    nonempty_hits = sum(1 for field in nonempty_fields if _is_nonempty_field_value(row.get(field)))
+    numeric_hits = 0
+    numeric_margin = 0.0
+
+    for field, threshold in numeric_gte.items():
+        try:
+            value = float(row.get(field))
+        except (TypeError, ValueError):
+            continue
+        if value >= threshold:
+            numeric_hits += 1
+            numeric_margin += value - threshold
+
+    for field, threshold in numeric_lte.items():
+        try:
+            value = float(row.get(field))
+        except (TypeError, ValueError):
+            continue
+        if value <= threshold:
+            numeric_hits += 1
+            numeric_margin += threshold - value
+
+    return bool_hits, nonempty_hits, numeric_hits, numeric_margin
+
+
+def _compact_pairs_by_inferred_group(
+    pairs: List[Tuple[int, Dict[str, Any]]],
+    *,
+    name_field: str,
+    cap_per_group: int,
+    group_sample_mode: str,
+    score_fn: Callable[[Dict[str, Any]], Tuple[Any, ...]],
+) -> List[Tuple[int, Dict[str, Any]]]:
+    if cap_per_group <= 0 or len(pairs) <= 1:
+        return list(pairs)
+
+    ordered_pairs = list(pairs)
+    if group_sample_mode == "all":
+        compacted: List[Tuple[int, Dict[str, Any]]] = []
+        group_counts: Dict[str, int] = {}
+        for pair in ordered_pairs:
+            _, row = pair
+            group_key = _infer_column_group_key(row.get(name_field, ""))
+            if group_key and group_counts.get(group_key, 0) >= cap_per_group:
+                continue
+            compacted.append(pair)
+            if group_key:
+                group_counts[group_key] = group_counts.get(group_key, 0) + 1
+        return compacted
+
+    grouped_positions: Dict[str, List[Tuple[int, Tuple[int, Dict[str, Any]]]]] = {}
+    for pos, pair in enumerate(ordered_pairs):
+        _, row = pair
+        group_key = _infer_column_group_key(row.get(name_field, ""))
+        if not group_key:
+            group_key = f"__ungrouped__:{pos}"
+        grouped_positions.setdefault(group_key, []).append((pos, pair))
+
+    keep_positions: Set[int] = set()
+    for members in grouped_positions.values():
+        if len(members) <= cap_per_group:
+            keep_positions.update(pos for pos, _ in members)
+            continue
+
+        representative_count = min(2, max(0, cap_per_group - 1))
+        local_keep: List[int] = [members[idx][0] for idx in range(representative_count)]
+        local_keep_set: Set[int] = set(local_keep)
+
+        if cap_per_group > representative_count:
+            remaining = [(pos, pair) for pos, pair in members if pos not in local_keep_set]
+            if remaining:
+                worst_pos, _ = max(
+                    remaining,
+                    key=lambda item: (score_fn(item[1][1]), -item[0]),
+                )
+                local_keep.append(worst_pos)
+                local_keep_set.add(worst_pos)
+
+        if len(local_keep) < cap_per_group:
+            for pos, _ in members:
+                if pos in local_keep_set:
+                    continue
+                local_keep.append(pos)
+                local_keep_set.add(pos)
+                if len(local_keep) >= cap_per_group:
+                    break
+
+        keep_positions.update(local_keep)
+
+    return [pair for pos, pair in enumerate(ordered_pairs) if pos in keep_positions]
+
+
 def _apply_a9_columns_policy(
     columns: List[Any],
     policy: Dict[str, Any],
@@ -7442,6 +7550,11 @@ def _apply_a9_columns_policy(
     review_field = str(policy.get("review_field", "review_required"))
     hard_cap = int(policy.get("hard_cap_total", len(columns)))
     exclude_roles = set(policy.get("exclude_roles") or [])
+    try:
+        selection_cap_per_group = int(policy.get("selection_cap_per_inferred_group", 0) or 0)
+    except (TypeError, ValueError):
+        selection_cap_per_group = 0
+    group_sample_mode = _normalize_group_sample_mode(policy.get("group_sample_mode"))
 
     valid_columns: List[Tuple[int, Dict[str, Any]]] = [
         (idx, col) for idx, col in enumerate(columns) if isinstance(col, dict)
@@ -7495,11 +7608,32 @@ def _apply_a9_columns_policy(
             _take(pair)
 
     final_selected: List[Dict[str, Any]] = []
-    for _, col in selected:
+    filtered_selected: List[Tuple[int, Dict[str, Any]]] = []
+    for pair in selected:
+        _, col = pair
         role = str(col.get(role_field, ""))
         if role in exclude_roles and str(col.get(name_field, "")) not in forced_names:
             continue
-        final_selected.append(col)
+        filtered_selected.append(pair)
+
+    if selection_cap_per_group > 0:
+        forced_selected = [
+            pair for pair in filtered_selected
+            if str(pair[1].get(name_field, "")) in forced_names
+        ]
+        non_forced_selected = [
+            pair for pair in filtered_selected
+            if str(pair[1].get(name_field, "")) not in forced_names
+        ]
+        filtered_selected = forced_selected + _compact_pairs_by_inferred_group(
+            non_forced_selected,
+            name_field=name_field,
+            cap_per_group=selection_cap_per_group,
+            group_sample_mode=group_sample_mode,
+            score_fn=lambda row: (1 if bool(row.get(review_field, False)) else 0,),
+        )
+
+    final_selected = [col for _, col in filtered_selected]
 
     if len(final_selected) > hard_cap:
         final_selected = final_selected[:hard_cap]
@@ -7509,6 +7643,8 @@ def _apply_a9_columns_policy(
         "output": len(final_selected),
         "forced_includes": sorted(forced_names),
         "overflow_flags": overflow_flags,
+        "selection_cap_per_inferred_group": selection_cap_per_group,
+        "group_sample_mode": group_sample_mode,
     }
     return final_selected
 
@@ -7572,37 +7708,30 @@ def _apply_column_scope_selector_policy(
     filter_keys = [str(field) for field in (raw_filter_keys or []) if str(field).strip()]
     seed_filter_keys = [str(field) for field in (policy.get("seed_from_filter_keys") or []) if str(field).strip()]
     try:
-        hard_cap_per_group = int(policy.get("hard_cap_per_inferred_group", 0) or 0)
+        legacy_hard_cap_per_group = int(policy.get("hard_cap_per_inferred_group", 0) or 0)
     except (TypeError, ValueError):
-        hard_cap_per_group = 0
+        legacy_hard_cap_per_group = 0
+    try:
+        seed_cap_per_group = int(policy.get("seed_cap_per_inferred_group", 0) or 0)
+    except (TypeError, ValueError):
+        seed_cap_per_group = 0
+    try:
+        standalone_cap_per_group = int(policy.get("standalone_cap_per_inferred_group", 0) or 0)
+    except (TypeError, ValueError):
+        standalone_cap_per_group = 0
+    if standalone_cap_per_group <= 0:
+        standalone_cap_per_group = legacy_hard_cap_per_group
+    group_sample_mode = _normalize_group_sample_mode(policy.get("group_sample_mode"))
 
     valid_items: List[Tuple[int, Dict[str, Any]]] = [
         (idx, row) for idx, row in enumerate(items) if isinstance(row, dict)
     ]
     forced_names = _extract_columns_from_value_filter(value_filter, filter_keys)
     seeded_names = _extract_string_list_from_value_filter(value_filter, seed_filter_keys)
-    selected: List[Tuple[int, Dict[str, Any]]] = []
-    selected_idx: Set[int] = set()
-    selected_group_counts: Dict[str, int] = {}
     pair_by_name: Dict[str, Tuple[int, Dict[str, Any]]] = {}
     for pair in valid_items:
         _, row = pair
         pair_by_name.setdefault(str(row.get(name_field, "")), pair)
-
-    def _take(pair: Tuple[int, Dict[str, Any]], *, ignore_cap: bool = False) -> bool:
-        idx, _row = pair
-        if idx in selected_idx:
-            return False
-        if not ignore_cap and len(selected) >= hard_cap:
-            return False
-        if idx not in selected_idx:
-            selected_idx.add(idx)
-            selected.append(pair)
-            group_key = _infer_column_group_key(_row.get(name_field, ""))
-            if group_key:
-                selected_group_counts[group_key] = selected_group_counts.get(group_key, 0) + 1
-            return True
-        return False
 
     def _matches(row: Dict[str, Any]) -> bool:
         for field in bool_true_fields:
@@ -7625,44 +7754,84 @@ def _apply_column_scope_selector_policy(
                 continue
         return False
 
-    for pair in _sorted_columns_for_bucket(valid_items, name_field):
-        _, row = pair
-        if str(row.get(name_field, "")) in forced_names:
-            _take(pair, ignore_cap=True)
+    ordered_pairs = _sorted_columns_for_bucket(valid_items, name_field)
+    forced_pairs = [
+        pair for pair in ordered_pairs
+        if str(pair[1].get(name_field, "")) in forced_names
+    ]
+    forced_idx = {idx for idx, _ in forced_pairs}
+    forced_name_set = {str(row.get(name_field, "")) for _, row in forced_pairs}
+    effective_cap = max(hard_cap, len(forced_pairs))
 
-    # Seeded rows get priority within the normal cap; unlike hard includes they never expand it.
+    seeded_candidates: List[Tuple[int, Dict[str, Any]]] = []
+    seeded_seen: Set[int] = set()
     for seeded_name in seeded_names:
         pair = pair_by_name.get(seeded_name)
-        if pair is not None:
-            _take(pair)
+        if pair is None:
+            continue
+        idx, row = pair
+        if idx in forced_idx or idx in seeded_seen:
+            continue
+        seeded_seen.add(idx)
+        seeded_candidates.append((idx, row))
 
-    effective_cap = max(hard_cap, len(selected))
-    for pair in _sorted_columns_for_bucket(valid_items, name_field):
-        if len(selected) >= effective_cap:
-            break
-        _, row = pair
-        column_name = str(row.get(name_field, ""))
-        if _matches(row):
-            if hard_cap_per_group > 0 and column_name not in forced_names:
-                group_key = _infer_column_group_key(column_name)
-                if group_key and selected_group_counts.get(group_key, 0) >= hard_cap_per_group:
-                    continue
-            _take(pair)
+    compacted_seeded = _compact_pairs_by_inferred_group(
+        seeded_candidates,
+        name_field=name_field,
+        cap_per_group=seed_cap_per_group,
+        group_sample_mode=group_sample_mode,
+        score_fn=lambda row: _column_scope_match_severity(
+            row,
+            bool_true_fields=bool_true_fields,
+            nonempty_fields=nonempty_fields,
+            numeric_gte=numeric_gte,
+            numeric_lte=numeric_lte,
+        ),
+    )
+    remaining_budget = max(0, effective_cap - len(forced_pairs))
+    seeded_pairs = compacted_seeded[:remaining_budget]
+    seeded_idx = {idx for idx, _ in seeded_pairs}
 
-    final_selected = [row for _, row in selected]
+    standalone_candidates = [
+        pair for pair in ordered_pairs
+        if pair[0] not in forced_idx and pair[0] not in seeded_idx and _matches(pair[1])
+    ]
+    compacted_standalone = _compact_pairs_by_inferred_group(
+        standalone_candidates,
+        name_field=name_field,
+        cap_per_group=standalone_cap_per_group,
+        group_sample_mode=group_sample_mode,
+        score_fn=lambda row: _column_scope_match_severity(
+            row,
+            bool_true_fields=bool_true_fields,
+            nonempty_fields=nonempty_fields,
+            numeric_gte=numeric_gte,
+            numeric_lte=numeric_lte,
+        ),
+    )
+    remaining_budget = max(0, effective_cap - len(forced_pairs) - len(seeded_pairs))
+    standalone_pairs = compacted_standalone[:remaining_budget]
+
+    final_selected = [row for _, row in (forced_pairs + seeded_pairs + standalone_pairs)]
     report.setdefault("column_scope_policies", []).append({
         "input": len(items),
         "output": len(final_selected),
         "forced_includes": sorted(forced_names),
         "include_from_filter_keys": filter_keys,
-        "seeded_includes": [name for name in seeded_names if name in pair_by_name],
+        "seeded_includes": [name for name in seeded_names if name in pair_by_name and name not in forced_name_set],
         "seed_from_filter_keys": seed_filter_keys,
         "bool_true_fields": bool_true_fields,
         "nonempty_fields": nonempty_fields,
         "numeric_gte": numeric_gte,
         "numeric_lte": numeric_lte,
         "hard_cap_total": hard_cap,
-        "hard_cap_per_inferred_group": hard_cap_per_group,
+        "hard_cap_per_inferred_group": legacy_hard_cap_per_group,
+        "seed_cap_per_inferred_group": seed_cap_per_group,
+        "standalone_cap_per_inferred_group": standalone_cap_per_group,
+        "group_sample_mode": group_sample_mode,
+        "forced_output": len(forced_pairs),
+        "seeded_output": len(seeded_pairs),
+        "standalone_output": len(standalone_pairs),
     })
     return final_selected
 
@@ -9843,6 +10012,120 @@ def _run_pruning_smoke_checks() -> None:
         "reviewer_focus_columns": ["Mjr2", "A2_Q1", "M1_Q14", "Q1"],
     }
 
+    grouped_selector_items = [
+        {"column": "A1_Q1", "flag": False},
+        {"column": "A1_Q2", "flag": False},
+        {"column": "A1_Q3", "flag": False},
+        {"column": "A1_Q4", "flag": True},
+        {"column": "A1_Q5", "flag": True},
+        {"column": "A1_Q6", "flag": True},
+        {"column": "A1_Q7", "flag": True},
+    ]
+    grouped_selector_policy = {
+        "name_field": "column",
+        "seed_from_filter_keys": ["reviewer_focus_columns"],
+        "include_bool_true_fields": ["flag"],
+        "seed_cap_per_inferred_group": 2,
+        "standalone_cap_per_inferred_group": 2,
+        "group_sample_mode": "all",
+        "hard_cap_total": 10,
+    }
+    grouped_selector_report: Dict[str, Any] = {}
+    grouped_selector_pruned = _apply_column_scope_selector_policy(
+        grouped_selector_items,
+        grouped_selector_policy,
+        {
+            "force_include_columns": ["A1_Q2"],
+            "reviewer_focus_columns": ["A1_Q1", "A1_Q2", "A1_Q3"],
+        },
+        grouped_selector_report,
+    )
+    assert [row.get("column") for row in grouped_selector_pruned if isinstance(row, dict)] == [
+        "A1_Q2",
+        "A1_Q1",
+        "A1_Q3",
+        "A1_Q4",
+        "A1_Q5",
+    ]
+    grouped_selector_meta = grouped_selector_report.get("column_scope_policies", [])[-1]
+    assert grouped_selector_meta.get("forced_output") == 1
+    assert grouped_selector_meta.get("seeded_output") == 2
+    assert grouped_selector_meta.get("standalone_output") == 2
+
+    representative_selector_items = [
+        {"column": "A1_Q1", "quality": 0.70},
+        {"column": "A1_Q2", "quality": 0.69},
+        {"column": "A1_Q3", "quality": 0.68},
+        {"column": "A1_Q4", "quality": 0.67},
+        {"column": "A1_Q5", "quality": 0.10},
+    ]
+    representative_selector_pruned = _apply_column_scope_selector_policy(
+        representative_selector_items,
+        {
+            "name_field": "column",
+            "include_numeric_lte": {"quality": 0.7},
+            "standalone_cap_per_inferred_group": 3,
+            "group_sample_mode": "representative_plus_worst_outlier",
+            "hard_cap_total": 10,
+        },
+        None,
+        {},
+    )
+    assert [row.get("column") for row in representative_selector_pruned if isinstance(row, dict)] == [
+        "A1_Q1",
+        "A1_Q2",
+        "A1_Q5",
+    ]
+
+    unique_group_selector_pruned = _apply_column_scope_selector_policy(
+        [
+            {"column": "Age", "flag": True},
+            {"column": "Grad_Country", "flag": True},
+            {"column": "ID", "flag": True},
+        ],
+        {
+            "name_field": "column",
+            "include_bool_true_fields": ["flag"],
+            "standalone_cap_per_inferred_group": 1,
+            "group_sample_mode": "representative_plus_worst_outlier",
+            "hard_cap_total": 10,
+        },
+        None,
+        {},
+    )
+    assert [row.get("column") for row in unique_group_selector_pruned if isinstance(row, dict)] == [
+        "Age",
+        "Grad_Country",
+        "ID",
+    ]
+
+    role_bucket_pruned = _apply_a9_columns_policy(
+        [
+            {"column": f"A1_Q{idx}", "primary_role": "measure", "review_required": idx == 12}
+            for idx in range(1, 13)
+        ],
+        {
+            "name_field": "column",
+            "role_field": "primary_role",
+            "review_field": "review_required",
+            "include_roles_all": [{"role": "measure", "cap": 12}],
+            "selection_cap_per_inferred_group": 6,
+            "group_sample_mode": "representative_plus_worst_outlier",
+            "hard_cap_total": 20,
+        },
+        {"force_include_columns": ["A1_Q2"]},
+        {},
+    )
+    assert [row.get("column") for row in role_bucket_pruned if isinstance(row, dict)] == [
+        "A1_Q2",
+        "A1_Q1",
+        "A1_Q10",
+        "A1_Q11",
+        "A1_Q12",
+        "A1_Q3",
+        "A1_Q4",
+    ]
+
     reviewer_a1_columns = [f"A1_Q{idx}" for idx in range(1, 61)]
     reviewer_a2_columns = [f"A2_Q{idx}" for idx in range(1, 61)]
     reviewer_m1_columns = [f"M1_Q{idx}" for idx in range(1, 31)]
@@ -10065,9 +10348,18 @@ def _run_pruning_smoke_checks() -> None:
     assert "A1_Q60" not in reviewer_a4_names
     assert "A1_Q60" not in reviewer_a14_names
     assert "A2_Q60" not in reviewer_a17_names
+    assert sum(1 for name in reviewer_a2_names if name.startswith("A1_Q")) <= 6
+    assert sum(1 for name in reviewer_a2_names if name.startswith("A2_Q")) <= 7
+    assert sum(1 for name in reviewer_a4_names if name.startswith("A1_Q")) <= 6
+    assert sum(1 for name in reviewer_a4_names if name.startswith("A2_Q")) <= 7
+    assert sum(1 for name in reviewer_a14_names if name.startswith("A1_Q")) <= 10
+    assert sum(1 for name in reviewer_a14_names if name.startswith("A2_Q")) <= 11
+    assert sum(1 for name in reviewer_a17_names if name.startswith("A1_Q")) <= 10
+    assert sum(1 for name in reviewer_a17_names if name.startswith("A2_Q")) <= 11
     assert len(reviewer_a2_names) < len(reviewer_all_columns)
     assert len(reviewer_a4_names) < len(reviewer_all_columns)
     assert len(reviewer_a14_names) < len(reviewer_all_columns)
+    assert len(json.dumps(reviewer_bundle, sort_keys=True).encode("utf-8")) < 195724
 
     light_contract_override_rows = []
     for default in DEFAULT_OVERRIDE_FIELDS:

@@ -253,11 +253,16 @@ Rules:
 - They are not transforms.
 - Use them when the caution matters to later specialists.
 
-## 6) ARTIFACT / CONTEXT QUICK GUIDE
+## 6) ARTIFACT / INPUT SEMANTICS
 
 light_contract_decisions:
 - What it is: the human-reviewed structural checkpoint containing finalized grain, family, and override decisions.
 - Why it matters: this is the authoritative structural context and outranks raw artifact heuristics. If it conflicts with an artifact, keep the light-contract structure and flag the contradiction rather than overriding it.
+
+semantic_context_json:
+- What it is: reviewed user-provided semantic guidance or a structured skip sentinel.
+- Why it matters: when present and not skipped, it can clarify code meaning, business identifiers, or collection semantics that raw artifacts alone cannot prove.
+- What not to use it for: do not invent semantic guidance when the payload contains only a skip sentinel.
 
 A2 (Column Dictionary):
 - What it is: base column-level profile facts and dictionary-like field summaries.

@@ -30,7 +30,9 @@
           "include_nonempty_fields": [
             "missing_tokens_observed"
           ],
-          "hard_cap_per_inferred_group": 4,
+          "seed_cap_per_inferred_group": 6,
+          "standalone_cap_per_inferred_group": 4,
+          "group_sample_mode": "representative_plus_worst_outlier",
           "hard_cap_total": 120
         }
       },
@@ -102,7 +104,9 @@
           "include_nonempty_fields": [
             "token_breakdown"
           ],
-          "hard_cap_per_inferred_group": 4,
+          "seed_cap_per_inferred_group": 6,
+          "standalone_cap_per_inferred_group": 4,
+          "group_sample_mode": "representative_plus_worst_outlier",
           "hard_cap_total": 120
         }
       },
@@ -188,6 +192,8 @@
             }
           ],
           "include_review_required_topk": 40,
+          "selection_cap_per_inferred_group": 6,
+          "group_sample_mode": "representative_plus_worst_outlier",
           "hard_cap_total": 100
         }
       }
@@ -234,6 +240,9 @@
           "include_numeric_lte": {
             "global_quality_score": 0.7
           },
+          "seed_cap_per_inferred_group": 6,
+          "standalone_cap_per_inferred_group": 4,
+          "group_sample_mode": "representative_plus_worst_outlier",
           "hard_cap_total": 96
         }
       }
@@ -275,6 +284,9 @@
             "confidence": 0.65,
             "quality_score": 0.7
           },
+          "seed_cap_per_inferred_group": 6,
+          "standalone_cap_per_inferred_group": 4,
+          "group_sample_mode": "representative_plus_worst_outlier",
           "hard_cap_total": 120
         }
       }

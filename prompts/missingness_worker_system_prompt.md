@@ -178,11 +178,16 @@ Rules:
 - Do NOT use `retain_with_caution`, `review_before_drop`, or `candidate_drop_review` for columns whose missingness is explicitly judged `no_material_missingness`.
 - `protect_from_null_penalty` should be reserved for direct structural evidence or clearly justified strong structural proof, not merely because a field seems plausibly optional.
 
-## 6) ARTIFACT SEMANTICS
+## 6) ARTIFACT / INPUT SEMANTICS
 
 light_contract_decisions:
 - What it is: the human-reviewed structural checkpoint containing finalized grain, family, and override decisions.
 - Why it matters: this is the authoritative structural context and outranks raw artifact heuristics.
+
+semantic_context_json:
+- What it is: reviewed user semantic guidance or a structured skip sentinel.
+- Why it matters: use it only to understand whether optional sections, screeners, or placeholders were explicitly described by the user.
+- What not to use it for: do not let it override direct structural-validity evidence from `A16`.
 
 A4 (Missingness Catalog):
 - What it is: missingness rates, token-coded missingness evidence, parser-level NA counts, and per-column missingness summaries.
@@ -470,7 +475,7 @@ Why it is wrong:
 - final table structure belongs to later specialists,
 - this worker only decides missingness and structural validity.
 
-## 9) OUTPUT JSON SHAPE
+## 9) OUTPUT SCHEMA
 You MUST output exactly one JSON object with this top-level shape:
 
 ```json
@@ -541,7 +546,7 @@ Soft guidance:
 - keep `summary.key_patterns` focused on only the most useful recurring patterns
 - keep `global_findings`, `review_flags`, and `assumptions` concise
 
-## 10) FAILURE / ASSUMPTION RULES
+## 10) FINAL OUTPUT CONSTRAINTS
 If evidence is incomplete or conflicting:
 - make the safest defensible missingness judgment,
 - lower confidence,
