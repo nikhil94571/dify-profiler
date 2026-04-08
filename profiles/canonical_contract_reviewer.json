@@ -16,11 +16,13 @@
           "target_array": "__root__",
           "name_field": "column",
           "include_from_filter_keys": [
-            "force_include_columns",
-            "review_columns",
             "structural_columns",
             "skip_trigger_columns",
             "skip_affected_preview_columns"
+          ],
+          "seed_from_filter_keys": [
+            "reviewer_focus_columns",
+            "review_columns"
           ],
           "include_bool_true_fields": [
             "high_missingness"
@@ -28,8 +30,8 @@
           "include_nonempty_fields": [
             "missing_tokens_observed"
           ],
-          "hard_cap_per_inferred_group": 10,
-          "hard_cap_total": 160
+          "hard_cap_per_inferred_group": 4,
+          "hard_cap_total": 120
         }
       },
       "transforms": {
@@ -86,11 +88,13 @@
           "target_array": "per_column",
           "name_field": "column",
           "include_from_filter_keys": [
-            "force_include_columns",
-            "review_columns",
             "structural_columns",
             "skip_trigger_columns",
             "skip_affected_preview_columns"
+          ],
+          "seed_from_filter_keys": [
+            "reviewer_focus_columns",
+            "review_columns"
           ],
           "include_numeric_gte": {
             "missing_pct": 20
@@ -98,8 +102,8 @@
           "include_nonempty_fields": [
             "token_breakdown"
           ],
-          "hard_cap_per_inferred_group": 10,
-          "hard_cap_total": 160
+          "hard_cap_per_inferred_group": 4,
+          "hard_cap_total": 120
         }
       },
       "transforms": {
@@ -197,16 +201,11 @@
           "type": "column_scope_selector",
           "target_array": "columns",
           "name_field": "column",
-          "include_from_filter_keys": [
-            "force_include_columns",
-            "review_columns",
-            "skip_trigger_columns",
-            "skip_affected_preview_columns"
-          ],
+          "include_from_filter_keys": [],
           "include_nonempty_fields": [
             "detected_anchors"
           ],
-          "hard_cap_total": 60
+          "hard_cap_total": 40
         }
       }
     },
@@ -221,19 +220,21 @@
           "target_array": "columns",
           "name_field": "column",
           "include_from_filter_keys": [
-            "force_include_columns",
-            "review_columns",
             "structural_columns",
             "skip_trigger_columns",
             "skip_affected_preview_columns"
+          ],
+          "seed_from_filter_keys": [
+            "reviewer_focus_columns",
+            "review_columns"
           ],
           "include_bool_true_fields": [
             "drift_detected"
           ],
           "include_numeric_lte": {
-            "global_quality_score": 0.9
+            "global_quality_score": 0.7
           },
-          "hard_cap_total": 140
+          "hard_cap_total": 96
         }
       }
     },
@@ -258,22 +259,23 @@
           "target_array": "columns",
           "name_field": "column",
           "include_from_filter_keys": [
-            "force_include_columns",
-            "review_columns",
             "structural_columns",
             "skip_trigger_columns",
             "skip_affected_preview_columns"
           ],
+          "seed_from_filter_keys": [
+            "reviewer_focus_columns",
+            "review_columns"
+          ],
           "include_bool_true_fields": [
             "skip_logic_protected",
-            "type_review_required",
-            "missingness_review_required",
-            "needs_human_review"
+            "drift_detected"
           ],
           "include_numeric_lte": {
-            "confidence": 0.9
+            "confidence": 0.65,
+            "quality_score": 0.7
           },
-          "hard_cap_total": 160
+          "hard_cap_total": 120
         }
       }
     }

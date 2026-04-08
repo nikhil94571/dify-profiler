@@ -7566,7 +7566,11 @@ def _apply_column_scope_selector_policy(
         for field, threshold in (policy.get("include_numeric_lte") or {}).items()
         if str(field).strip()
     }
-    filter_keys = [str(field) for field in (policy.get("include_from_filter_keys") or ["force_include_columns"]) if str(field).strip()]
+    raw_filter_keys = policy.get("include_from_filter_keys", None)
+    if raw_filter_keys is None:
+        raw_filter_keys = ["force_include_columns"]
+    filter_keys = [str(field) for field in (raw_filter_keys or []) if str(field).strip()]
+    seed_filter_keys = [str(field) for field in (policy.get("seed_from_filter_keys") or []) if str(field).strip()]
     try:
         hard_cap_per_group = int(policy.get("hard_cap_per_inferred_group", 0) or 0)
     except (TypeError, ValueError):
@@ -7576,18 +7580,29 @@ def _apply_column_scope_selector_policy(
         (idx, row) for idx, row in enumerate(items) if isinstance(row, dict)
     ]
     forced_names = _extract_columns_from_value_filter(value_filter, filter_keys)
+    seeded_names = _extract_string_list_from_value_filter(value_filter, seed_filter_keys)
     selected: List[Tuple[int, Dict[str, Any]]] = []
     selected_idx: Set[int] = set()
     selected_group_counts: Dict[str, int] = {}
+    pair_by_name: Dict[str, Tuple[int, Dict[str, Any]]] = {}
+    for pair in valid_items:
+        _, row = pair
+        pair_by_name.setdefault(str(row.get(name_field, "")), pair)
 
-    def _take(pair: Tuple[int, Dict[str, Any]]) -> None:
+    def _take(pair: Tuple[int, Dict[str, Any]], *, ignore_cap: bool = False) -> bool:
         idx, _row = pair
+        if idx in selected_idx:
+            return False
+        if not ignore_cap and len(selected) >= hard_cap:
+            return False
         if idx not in selected_idx:
             selected_idx.add(idx)
             selected.append(pair)
             group_key = _infer_column_group_key(_row.get(name_field, ""))
             if group_key:
                 selected_group_counts[group_key] = selected_group_counts.get(group_key, 0) + 1
+            return True
+        return False
 
     def _matches(row: Dict[str, Any]) -> bool:
         for field in bool_true_fields:
@@ -7613,6 +7628,12 @@ def _apply_column_scope_selector_policy(
     for pair in _sorted_columns_for_bucket(valid_items, name_field):
         _, row = pair
         if str(row.get(name_field, "")) in forced_names:
+            _take(pair, ignore_cap=True)
+
+    # Seeded rows get priority within the normal cap; unlike hard includes they never expand it.
+    for seeded_name in seeded_names:
+        pair = pair_by_name.get(seeded_name)
+        if pair is not None:
             _take(pair)
 
     effective_cap = max(hard_cap, len(selected))
@@ -7634,6 +7655,8 @@ def _apply_column_scope_selector_policy(
         "output": len(final_selected),
         "forced_includes": sorted(forced_names),
         "include_from_filter_keys": filter_keys,
+        "seeded_includes": [name for name in seeded_names if name in pair_by_name],
+        "seed_from_filter_keys": seed_filter_keys,
         "bool_true_fields": bool_true_fields,
         "nonempty_fields": nonempty_fields,
         "numeric_gte": numeric_gte,
@@ -9811,6 +9834,241 @@ def _run_pruning_smoke_checks() -> None:
         "country_code",
     ]
 
+    ordered_merge = _merge_value_filter_column_bucket(
+        {"reviewer_focus_columns": ["Mjr2", "A2_Q1"]},
+        "reviewer_focus_columns",
+        ["M1_Q14", "A2_Q1", "Q1"],
+    )
+    assert ordered_merge == {
+        "reviewer_focus_columns": ["Mjr2", "A2_Q1", "M1_Q14", "Q1"],
+    }
+
+    reviewer_a1_columns = [f"A1_Q{idx}" for idx in range(1, 61)]
+    reviewer_a2_columns = [f"A2_Q{idx}" for idx in range(1, 61)]
+    reviewer_m1_columns = [f"M1_Q{idx}" for idx in range(1, 31)]
+    reviewer_q_columns = [f"Q{idx}" for idx in range(1, 31)]
+    reviewer_anchor_columns = reviewer_a1_columns[:24] + reviewer_a2_columns[:16]
+    reviewer_all_columns = reviewer_a1_columns + reviewer_a2_columns + reviewer_m1_columns + reviewer_q_columns + ["Mjr2", "ID", "ANXATT"]
+    reviewer_fixture_payloads: Dict[str, Tuple[str, Any, Dict[str, Any]]] = {
+        "A2": (
+            "json",
+            [
+                {
+                    "column": column,
+                    "high_missingness": False,
+                    "missing_tokens_observed": [],
+                    "a2_samples": {
+                        "head": [f"{column}_v1", f"{column}_v2", f"{column}_v3"],
+                        "tail": [f"{column}_v4"],
+                        "random": [f"{column}_v5"],
+                    },
+                }
+                for column in reviewer_all_columns
+            ],
+            {},
+        ),
+        "A3-T": ("json", {"items": []}, {}),
+        "A3-V": ("json", {"items": []}, {}),
+        "A4": (
+            "json",
+            {
+                "per_column": [
+                    {
+                        "column": column,
+                        "missing_pct": 0.0,
+                        "token_breakdown": {},
+                    }
+                    for column in reviewer_all_columns
+                ]
+            },
+            {},
+        ),
+        "A9": (
+            "json",
+            {
+                "columns": [
+                    {"column": "ID", "primary_role": "id_key", "review_required": False},
+                    {"column": "ANXATT", "primary_role": "measure", "review_required": True},
+                ]
+            },
+            {},
+        ),
+        "A13": (
+            "json",
+            {
+                "columns": (
+                    [
+                        {
+                            "column": column,
+                            "technical_type": "categorical",
+                            "detected_anchors": [
+                                {
+                                    "anchor": "SURVEY_ITEM",
+                                    "confidence": 0.91,
+                                    "implication": "REVIEW_CONTEXT",
+                                }
+                            ],
+                        }
+                        for column in reviewer_anchor_columns
+                    ]
+                    + [
+                        {
+                            "column": "ID",
+                            "technical_type": "numeric",
+                            "detected_anchors": [],
+                        }
+                    ]
+                )
+            },
+            {},
+        ),
+        "A14": (
+            "json",
+            {
+                "columns": [
+                    {
+                        "column": column,
+                        "global_quality_score": (
+                            0.65 if column == "Mjr2"
+                            else 0.8 if column in {"M1_Q14", "M1_Q18", "Q30"}
+                            else 0.75 if column in set(reviewer_a1_columns[:20] + reviewer_a2_columns[:20])
+                            else 0.95
+                        ),
+                        "drift_detected": column in set(reviewer_a1_columns[:20] + reviewer_a2_columns[:20] + ["Mjr2"]),
+                        "interpretation": "Moderate drift detected across segments." if column in set(reviewer_a1_columns[:20] + reviewer_a2_columns[:20] + ["Mjr2"]) else "Stable",
+                    }
+                    for column in reviewer_all_columns
+                ]
+            },
+            {},
+        ),
+        "A16": (
+            "json",
+            {
+                "detected_skip_logic": [
+                    {
+                        "trigger_column": "ANXATT",
+                        "sample_affected_columns": ["A2_Q1"],
+                    }
+                ],
+                "master_switch_candidates": [
+                    {"trigger_column": "ANXATT"}
+                ],
+            },
+            {},
+        ),
+        "A17": (
+            "json",
+            {
+                "columns": [
+                    {
+                        "column": column,
+                        "skip_logic_protected": column == "A2_Q1",
+                        "type_review_required": (
+                            column in set(reviewer_a1_columns[:20] + reviewer_a2_columns[:20] + ["Mjr2", "M1_Q14", "M1_Q18"] + reviewer_q_columns[:8])
+                        ),
+                        "missingness_review_required": (
+                            column in set(reviewer_a1_columns[:20] + reviewer_a2_columns[:20] + ["Mjr2"])
+                        ),
+                        "needs_human_review": (
+                            column in set(reviewer_a1_columns[:20] + reviewer_a2_columns[:20] + ["Mjr2", "M1_Q14", "M1_Q18"] + reviewer_q_columns[:8])
+                        ),
+                        "drift_detected": column in set(reviewer_a2_columns[:8] + ["Mjr2"]),
+                        "confidence": (
+                            0.6 if column == "A2_Q1"
+                            else 0.65 if column == "Mjr2"
+                            else 0.55 if column in {"M1_Q14", "M1_Q18"}
+                            else 0.76 if column in set(reviewer_a1_columns[:20] + reviewer_a2_columns[:20] + reviewer_q_columns[:8])
+                            else 0.96
+                        ),
+                        "quality_score": (
+                            0.4 if column == "Mjr2"
+                            else 0.65 if column == "A2_Q1"
+                            else 0.68 if column in {"M1_Q14", "M1_Q18"}
+                            else 0.82 if column in set(reviewer_a1_columns[:20] + reviewer_a2_columns[:20] + reviewer_q_columns[:8])
+                            else 0.97
+                        ),
+                    }
+                    for column in reviewer_all_columns
+                ]
+            },
+            {},
+        ),
+    }
+    original_get_decoded_payload = globals()["_get_decoded_payload"]
+
+    def _fake_reviewer_payload(run_id: str, artifact_id: str) -> Tuple[str, Any, Dict[str, Any]]:
+        if artifact_id not in reviewer_fixture_payloads:
+            raise HTTPException(status_code=404, detail=f"missing fixture artifact {artifact_id}")
+        return reviewer_fixture_payloads[artifact_id]
+
+    globals()["_get_decoded_payload"] = _fake_reviewer_payload
+    try:
+        reviewer_buckets = _build_post_contract_auto_scope_buckets("run_pruning_smoke")
+        reviewer_bundle = _artifact_bundle_view(
+            req=ArtifactBundleRequest(
+                run_id="run_pruning_smoke",
+                mode="canonical_contract_reviewer",
+                global_scope=ArtifactBundleScope(
+                    mode="canonical_contract_reviewer",
+                    value_filter={"force_include_columns": reviewer_all_columns},
+                ),
+            ),
+            response=Response(),
+        )
+    finally:
+        globals()["_get_decoded_payload"] = original_get_decoded_payload
+
+    assert reviewer_buckets["reviewer_focus_columns"][0] == "A2_Q1"
+    assert reviewer_buckets["reviewer_focus_columns"][1] == "Mjr2"
+    assert len(reviewer_buckets["reviewer_focus_columns"]) == 28
+    assert sum(1 for name in reviewer_buckets["reviewer_focus_columns"][:15] if name.startswith("A1_Q")) <= 4
+    assert sum(1 for name in reviewer_buckets["reviewer_focus_columns"][:15] if name.startswith("A2_Q")) <= 4
+    assert sum(1 for name in reviewer_buckets["reviewer_focus_columns"][:15] if re.match(r"^Q\d+$", name)) <= 4
+    assert "Q30" not in reviewer_buckets["reviewer_focus_columns"]
+
+    reviewer_a2_names = [row.get("column") for row in reviewer_bundle.get("artifacts", {}).get("A2", []) if isinstance(row, dict)]
+    reviewer_a4_names = [row.get("column") for row in reviewer_bundle.get("artifacts", {}).get("A4", {}).get("per_column", []) if isinstance(row, dict)]
+    reviewer_a13_rows = [row for row in reviewer_bundle.get("artifacts", {}).get("A13", {}).get("columns", []) if isinstance(row, dict)]
+    reviewer_a13_names = [row.get("column") for row in reviewer_a13_rows]
+    reviewer_a14_names = [row.get("column") for row in reviewer_bundle.get("artifacts", {}).get("A14", {}).get("columns", []) if isinstance(row, dict)]
+    reviewer_a17_names = [row.get("column") for row in reviewer_bundle.get("artifacts", {}).get("A17", {}).get("columns", []) if isinstance(row, dict)]
+    assert reviewer_bundle.get("artifacts", {}).get("A3-T", {}).get("items") == []
+    assert reviewer_bundle.get("artifacts", {}).get("A3-V", {}).get("items") == []
+    assert len(reviewer_a2_names) <= 120
+    assert len(reviewer_a4_names) <= 120
+    assert len(reviewer_a13_names) <= 40
+    assert len(reviewer_a14_names) <= 96
+    assert len(reviewer_a17_names) <= 120
+    assert "A1_Q1" in reviewer_a2_names
+    assert "A1_Q1" in reviewer_a4_names
+    assert "A1_Q1" in reviewer_a13_names
+    assert "A1_Q1" in reviewer_a14_names
+    assert "A1_Q1" in reviewer_a17_names
+    assert "Mjr2" in reviewer_a14_names
+    assert "Mjr2" in reviewer_a17_names
+    assert "M1_Q14" in reviewer_a14_names
+    assert "M1_Q18" in reviewer_a14_names
+    assert "M1_Q14" in reviewer_a17_names
+    assert "M1_Q18" in reviewer_a17_names
+    assert "ID" in reviewer_a2_names
+    assert "ANXATT" in reviewer_a2_names
+    assert "A2_Q1" in reviewer_a2_names
+    assert "ID" in reviewer_a17_names
+    assert "ANXATT" in reviewer_a17_names
+    assert "A2_Q1" in reviewer_a17_names
+    assert "ID" not in reviewer_a13_names
+    assert all(_is_nonempty_field_value(row.get("detected_anchors")) for row in reviewer_a13_rows)
+    assert "Q30" not in reviewer_a14_names
+    assert "Q30" not in reviewer_a17_names
+    assert "A1_Q60" not in reviewer_a2_names
+    assert "A1_Q60" not in reviewer_a4_names
+    assert "A1_Q60" not in reviewer_a14_names
+    assert "A2_Q60" not in reviewer_a17_names
+    assert len(reviewer_a2_names) < len(reviewer_all_columns)
+    assert len(reviewer_a4_names) < len(reviewer_all_columns)
+    assert len(reviewer_a14_names) < len(reviewer_all_columns)
+
     light_contract_override_rows = []
     for default in DEFAULT_OVERRIDE_FIELDS:
         row = {
@@ -9886,9 +10144,6 @@ def _run_pruning_smoke_checks() -> None:
     assert parsed_handoff.get("override_notes", {}).get("semantic_codebook_and_important_variables") == "Q12 is the master switch. StatusCode values 1=active, 2=paused."
 
 
-if os.getenv("RUN_PRUNING_SMOKE_TESTS", "").strip().lower() in {"1", "true", "yes"}:
-    _run_pruning_smoke_checks()
-
 def _get_decoded_payload(run_id: str, artifact_id: str) -> Tuple[str, Any, Dict[str, Any]]:
     content_type, data, artifact_meta = load_artifact_bytes(run_id=run_id, artifact_id=artifact_id)
     digest = sha256_hex(data)
@@ -9913,7 +10168,7 @@ def _merge_value_filter_column_bucket(
     bucket_key: str,
     extra_columns: Iterable[Any],
 ) -> Optional[Any]:
-    extra = _sorted_nonempty_strings(extra_columns)
+    extra = _ordered_nonempty_strings(extra_columns)
     if not extra:
         return value_filter
 
@@ -9922,16 +10177,25 @@ def _merge_value_filter_column_bucket(
 
     if isinstance(value_filter, dict):
         merged = dict(value_filter)
-        combined = _extract_columns_from_value_filter(merged, [bucket_key])
-        combined.update(extra)
-        merged[bucket_key] = sorted(combined)
+        combined = _ordered_nonempty_strings(_extract_string_list_from_value_filter(merged, [bucket_key]) + extra)
+        merged[bucket_key] = combined
         return merged
 
     if isinstance(value_filter, list):
-        merged_items = list(value_filter)
-        combined = _extract_columns_from_value_filter(merged_items, [bucket_key])
-        combined.update(extra)
-        merged_items.append({bucket_key: sorted(combined)})
+        merged_items: List[Any] = []
+        combined = _ordered_nonempty_strings(_extract_string_list_from_value_filter(value_filter, [bucket_key]) + extra)
+        bucket_written = False
+        for item in value_filter:
+            if isinstance(item, dict) and bucket_key in item:
+                if not bucket_written:
+                    replacement = dict(item)
+                    replacement[bucket_key] = combined
+                    merged_items.append(replacement)
+                    bucket_written = True
+                continue
+            merged_items.append(item)
+        if not bucket_written:
+            merged_items.append({bucket_key: combined})
         return merged_items
 
     return {bucket_key: extra}
@@ -9966,11 +10230,96 @@ def _light_contract_force_include_columns(decisions: Dict[str, Any]) -> List[str
     return _sorted_nonempty_strings(columns)
 
 
+def _coerce_float(value: Any, default: float = 1.0) -> float:
+    try:
+        return float(value if value is not None else default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _reviewer_focus_severity(row: Dict[str, Any]) -> Tuple[int, float, float]:
+    confidence = _coerce_float(row.get("confidence"), 1.0)
+    quality_score = _coerce_float(row.get("quality_score"), 1.0)
+    type_review_required = bool(row.get("type_review_required", False))
+    missingness_review_required = bool(row.get("missingness_review_required", False))
+
+    severity = 0
+    if bool(row.get("skip_logic_protected", False)):
+        severity += 40
+    if bool(row.get("drift_detected", False)):
+        severity += 30
+    if confidence < 0.8:
+        severity += 20
+    if confidence < 0.7:
+        severity += 10
+    if quality_score <= 0.85:
+        severity += 20
+    if quality_score <= 0.7:
+        severity += 10
+    if type_review_required:
+        severity += 15
+    if missingness_review_required:
+        severity += 15
+    if type_review_required and missingness_review_required:
+        severity += 10
+
+    return severity, confidence, quality_score
+
+
+def _build_ranked_reviewer_focus_columns(rows: Iterable[Any]) -> List[str]:
+    candidates: List[Tuple[int, float, float, str]] = []
+    total_columns = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        col = str(row.get("column") or "").strip()
+        if not col:
+            continue
+        total_columns += 1
+        severity, confidence, quality_score = _reviewer_focus_severity(row)
+        if severity >= 40:
+            candidates.append((severity, confidence, quality_score, col))
+
+    if not candidates:
+        return []
+
+    budget = min(64, max(16, int(math.ceil(total_columns * 0.15))))
+    ranked = sorted(candidates, key=lambda item: (-item[0], item[1], item[2], item[3]))
+    selected: List[str] = []
+    selected_seen: Set[str] = set()
+    selected_group_counts: Dict[str, int] = {}
+
+    def _take(column_name: str) -> None:
+        if column_name in selected_seen or len(selected) >= budget:
+            return
+        selected_seen.add(column_name)
+        selected.append(column_name)
+        group_key = _infer_column_group_key(column_name)
+        if group_key:
+            selected_group_counts[group_key] = selected_group_counts.get(group_key, 0) + 1
+
+    for _, _, _, column_name in ranked:
+        group_key = _infer_column_group_key(column_name)
+        if group_key and selected_group_counts.get(group_key, 0) >= 4:
+            continue
+        _take(column_name)
+        if len(selected) >= budget:
+            return selected
+
+    for _, _, _, column_name in ranked:
+        _take(column_name)
+        if len(selected) >= budget:
+            break
+
+    return selected
+
+
 def _build_post_contract_auto_scope_buckets(run_id: str) -> Dict[str, List[str]]:
     review_columns: Set[str] = set()
     structural_columns: Set[str] = set()
     skip_trigger_columns: Set[str] = set()
     skip_affected_preview_columns: Set[str] = set()
+    reviewer_focus_columns: List[str] = []
 
     try:
         kind, payload, _ = _get_decoded_payload(run_id=run_id, artifact_id="A3-T")
@@ -10029,11 +10378,19 @@ def _build_post_contract_auto_scope_buckets(run_id: str) -> Dict[str, List[str]]
     except HTTPException:
         pass
 
+    try:
+        kind, payload, _ = _get_decoded_payload(run_id=run_id, artifact_id="A17")
+        if kind == "json" and isinstance(payload, dict):
+            reviewer_focus_columns = _build_ranked_reviewer_focus_columns(payload.get("columns") or [])
+    except HTTPException:
+        pass
+
     return {
         "review_columns": sorted(review_columns),
         "structural_columns": sorted(structural_columns),
         "skip_trigger_columns": sorted(skip_trigger_columns),
         "skip_affected_preview_columns": sorted(skip_affected_preview_columns),
+        "reviewer_focus_columns": reviewer_focus_columns,
     }
 
 
@@ -12898,3 +13255,7 @@ def build_canonical_column_contract(
         table_layout_worker_json=table_layout_worker_json,
         support=support,
     )
+
+
+if os.getenv("RUN_PRUNING_SMOKE_TESTS", "").strip().lower() in {"1", "true", "yes"}:
+    _run_pruning_smoke_checks()

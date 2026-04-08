@@ -88,7 +88,8 @@ Current view surfaces:
 
 For workers that need request-scoped pruning inputs, use `POST /artifact-bundles/view`. This now matters for `type_transform_worker`, `missingness_worker`, `semantic_context_worker`, `family_worker`, `table_layout_worker`, `analysis_layout_worker`, and `canonical_contract_reviewer`.
 
-- `type_transform_worker`, `missingness_worker`, `semantic_context_worker`, `table_layout_worker`, `analysis_layout_worker`, and `canonical_contract_reviewer` can accept `global.value_filter.force_include_columns` so finalized grain, reference, and family linkage columns are always retained in a scoped bundle.
+- `type_transform_worker`, `missingness_worker`, `semantic_context_worker`, `table_layout_worker`, and `analysis_layout_worker` can accept `global.value_filter.force_include_columns` so finalized grain, reference, and family linkage columns are always retained in a scoped bundle.
+- `canonical_contract_reviewer` can also accept `global.value_filter.force_include_columns`, but the reviewer bundle is now risk-scoped. Keep that list narrow to structural carry-through columns; do not pass the full reviewed contract column list.
 - `family_worker` can additionally accept `global.value_filter.force_include_family_ids` so `A8` and `B1` are reduced to just the accepted families under review.
 - `table_layout_worker` can additionally accept `global.value_filter.preferred_primary_grain_keys` so `A12` layout candidates are re-ranked toward the accepted primary grain before projection.
 
@@ -97,8 +98,9 @@ The post-light-contract worker path also applies server-side auto-scope buckets 
 - `review_columns` from `A3-T` and `A3-V`
 - `structural_columns` from `A9` role evidence
 - `skip_trigger_columns` and `skip_affected_preview_columns` from `A16`
+- `reviewer_focus_columns` from ranked `A17` reviewer-risk signals, ordered by corroborated severity and budgeted before merge
 
-Those buckets are then consumed selectively per artifact, rather than being merged into one broad force-include list.
+Those buckets are then consumed selectively per artifact, rather than being merged into one broad force-include list. Merged bucket values preserve insertion order, so ranked reviewer focus survives into seeded pruning.
 
 Example:
 
@@ -385,6 +387,7 @@ For a local synthesis + validator smoke check, run:
 The intended next stage after the canonical-column contract is a canonical-contract reviewer:
 
 1. request `POST /artifact-bundles/view` with `mode = "canonical_contract_reviewer"`
+   If you pass `global.value_filter.force_include_columns`, keep it limited to structural keys or screening columns that must survive into the reviewer context. Do not pass the full canonical contract column list.
 2. combine the returned bundle with:
    - `canonical_column_contract_json`
    - `light_contract_decisions`
@@ -411,6 +414,14 @@ For repair-node use, use:
 
 For a local reviewer-validator smoke check, run:
 - `python scripts/canonical_contract_reviewer_smoke.py`
+
+For a local reviewer bundle-pruning regression smoke check, run:
+- `python scripts/canonical_contract_reviewer_pruning_smoke.py`
+
+The canonical reviewer bundle is intentionally risk-scoped:
+- `reviewer_focus_columns` is an ordered, risk-ranked bucket built from corroborated `A17` evidence rather than broad review flags alone
+- `A13` is anchor-only, so empty-anchor rows are not retained just because they were risky elsewhere
+- strong standalone reviewer heuristics in `A14` and `A17` are limited to drift, skip protection, and materially low confidence / quality
 
 The intended next stage after the canonical-contract reviewer remains an analysis-layout worker:
 
