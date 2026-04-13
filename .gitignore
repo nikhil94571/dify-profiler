@@ -45,8 +45,11 @@ downloaded_*.xlsx
 Patch/
 
 #Folders
+Outputs/
 schemas/
 scripts/*
 !scripts/canonical_contract_reviewer_smoke.py
+!scripts/canonical_column_contract_smoke.py
+!scripts/validator_normalization_smoke.py
 !scripts/audit_system_prompts.py
 scripts/__pycache__/

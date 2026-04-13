@@ -91,12 +91,22 @@ MISSINGNESS_DISPOSITIONS = {
     "mixed_missingness_risk",
 }
 
+FAMILY_DEFAULT_ALLOWED_MISSINGNESS_DISPOSITIONS = {
+    "structurally_valid_missingness",
+    "partially_structural_missingness",
+}
+
 MISSINGNESS_HANDLING = {
     "no_action_needed",
     "protect_from_null_penalty",
     "retain_with_caution",
     "review_before_drop",
     "candidate_drop_review",
+}
+
+MISSINGNESS_DISPOSITION_TO_ALLOWED_HANDLING = {
+    "structurally_valid_missingness": {"protect_from_null_penalty", "retain_with_caution"},
+    "partially_structural_missingness": {"retain_with_caution", "review_before_drop"},
 }
 
 REQUIRED_TOP_LEVEL = [
@@ -265,7 +275,6 @@ def _validate_member_defaults(member_defaults, errors):
         "missingness_disposition",
         "missingness_handling",
         "skip_logic_protected",
-        "normalization_notes",
     ]
     if not any(field in member_defaults for field in substantive_fields):
         _add_error(errors, "member_defaults must include at least one defaultable field.")
@@ -294,7 +303,7 @@ def _validate_member_defaults(member_defaults, errors):
         _require_enum(
             member_defaults["missingness_disposition"],
             "member_defaults.missingness_disposition",
-            MISSINGNESS_DISPOSITIONS,
+            FAMILY_DEFAULT_ALLOWED_MISSINGNESS_DISPOSITIONS,
             errors,
         )
     if "missingness_handling" in member_defaults:
@@ -312,6 +321,35 @@ def _validate_member_defaults(member_defaults, errors):
         _require_number_between_0_and_1(member_defaults["confidence"], "member_defaults.confidence", errors)
     if "needs_human_review" in member_defaults:
         _require_bool(member_defaults["needs_human_review"], "member_defaults.needs_human_review", errors)
+
+    disposition = member_defaults.get("missingness_disposition")
+    handling = member_defaults.get("missingness_handling")
+    skip_logic_protected = member_defaults.get("skip_logic_protected")
+
+    if ("missingness_handling" in member_defaults or "skip_logic_protected" in member_defaults) and disposition not in FAMILY_DEFAULT_ALLOWED_MISSINGNESS_DISPOSITIONS:
+        _add_error(
+            errors,
+            "member_defaults.missingness_disposition is required when member_defaults.missingness_handling or member_defaults.skip_logic_protected is provided.",
+        )
+
+    if disposition in FAMILY_DEFAULT_ALLOWED_MISSINGNESS_DISPOSITIONS and handling in MISSINGNESS_HANDLING:
+        allowed_handling = MISSINGNESS_DISPOSITION_TO_ALLOWED_HANDLING.get(disposition, set())
+        if allowed_handling and handling not in allowed_handling:
+            _add_error(
+                errors,
+                f"member_defaults.missingness_handling must be one of {sorted(allowed_handling)} when member_defaults.missingness_disposition is {disposition}.",
+            )
+
+    if handling == "protect_from_null_penalty" and skip_logic_protected is not True:
+        _add_error(
+            errors,
+            "member_defaults.skip_logic_protected must be true when member_defaults.missingness_handling is protect_from_null_penalty.",
+        )
+    if skip_logic_protected is True and disposition not in FAMILY_DEFAULT_ALLOWED_MISSINGNESS_DISPOSITIONS:
+        _add_error(
+            errors,
+            "member_defaults.skip_logic_protected can only be true when member_defaults.missingness_disposition is structurally_valid_missingness or partially_structural_missingness.",
+        )
 
 
 def _validate_family_result(root_family_id, family_result, errors):

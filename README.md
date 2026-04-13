@@ -292,7 +292,8 @@ After semantic, type, and missingness workers have produced validated JSON outpu
    - matched `A8` and `B1` family evidence
 4. run [`prompts/family_worker_system_prompt.md`](/Users/nikhil/Automations/dify-profiler/prompts/family_worker_system_prompt.md) once per family
 5. validate each family JSON item, repair once if needed, then aggregate into one `family_worker_json`
-   - each family item may optionally include `member_defaults` for safe family-wide type or missingness defaults that should propagate to sibling columns later
+   - each family item may optionally include `member_defaults` for safe family-wide type defaults and structural-only missingness defaults that should propagate to sibling columns later
+   - for repair-node use, use [`prompts/REPAIR_family.md`](/Users/nikhil/Automations/dify-profiler/prompts/REPAIR_family.md)
 
 The intended next stage after family is a single-pass canonical table-layout proposal worker:
 
@@ -367,6 +368,12 @@ Its job is to:
 - leave semantic enrichment blank when no structured evidence exists
 - expose provenance for type, structure, missingness, and semantic decisions
 
+For missingness specifically, deterministic synthesis now treats the reviewed missingness contract as structured input, not prose:
+- `missingness_worker_json.global_contract.token_missing_placeholders_detected` is the machine-readable global token-missingness signal
+- `missingness_worker_json.global_findings` remains human-readable support text only
+- `family_worker_json.member_defaults` may not push non-structural missingness outcomes such as `token_missingness_present` or `no_material_missingness`
+- final row states are reconciled through shared missingness invariants before validation
+
 The canonical merge order is:
 1. structure from `table_layout_worker_json` plus light-contract fallbacks
 2. semantic enrichment from `semantic_context_json`
@@ -375,11 +382,22 @@ The canonical merge order is:
 5. reviewed missingness overrides from `missingness_worker_json`
 6. `A17` for all remaining non-structural gaps
 
+Within missingness resolution, the deterministic precedence is:
+1. reviewed per-column missingness from `missingness_worker_json.column_decisions`
+2. deterministic baseline missingness from `A17` / `A4` / `A16`
+3. family defaults, but only for structural missingness categories
+4. final deterministic invariant reconciliation
+
 For Dify structured-output or contract documentation, use:
 - [`schemas/canonical_column_contract.response.schema.json`](/Users/nikhil/Automations/dify-profiler/schemas/canonical_column_contract.response.schema.json)
 
 For validator-node use, use:
 - [`JSON validators/canonical_column_contract_validator.json`](/Users/nikhil/Automations/dify-profiler/JSON%20validators/canonical_column_contract_validator.json)
+  - this validator now accepts:
+    - `canonical_column_contract_output`
+    - `expected_source_columns_json`
+    - optional `missingness_worker_json`
+  - pass `missingness_worker_json` when you want the validator to enforce `global_contract.token_missing_placeholders_detected`
 
 For a local synthesis + validator smoke check, run:
 - `python scripts/canonical_column_contract_smoke.py`
@@ -426,13 +444,24 @@ For validator-node use, use:
 For deterministic apply-node use, use:
 - [`canonical_contract_reviewer_apply_patch_node.py`](/Users/nikhil/Automations/dify-profiler/canonical_contract_reviewer_apply_patch_node.py)
 
+The Dify apply node should remain self-contained. Do not rely on repo-local Python imports inside the deployed code-node body unless your Dify runtime explicitly packages those helper modules.
+
 For repair-node use, use:
 - [`prompts/REPAIR_canonical_contract_reviewer.md`](/Users/nikhil/Automations/dify-profiler/prompts/REPAIR_canonical_contract_reviewer.md)
+
+Upstream repair-node prompts that must stay aligned with the current worker contracts:
+- [`prompts/REPAIR_missingness.md`](/Users/nikhil/Automations/dify-profiler/prompts/REPAIR_missingness.md)
+- [`prompts/REPAIR_family.md`](/Users/nikhil/Automations/dify-profiler/prompts/REPAIR_family.md)
 
 Repair payload guidance:
 - send the original invalid reviewer JSON plus the first validator's `validation_errors_json`
 - do not resend the full reviewer input bundle
 - during rollout only, you may also pass a compact `column_index_map_json` derived from the current `canon_contract_json`; treat it as lookup metadata, not evidence
+- run repair in an isolated node session or subworkflow with no prior assistant/user history carry-over
+- use response format `json_object` and temperature `0`
+- treat the repair path as miswired unless repair prompt tokens are both:
+  - `< 15,000`
+  - `< 15%` of first-pass reviewer prompt tokens
 
 Debug artifact guidance for local review:
 - prefer unwrapped payload artifacts such as `canon_contract.payload.json`, `canon_review_patch.payload.json`, and `canon_review.payload.json`
@@ -440,6 +469,7 @@ Debug artifact guidance for local review:
 - the Dify workflow capture rename is still a manual rollout step because no workflow export is checked into this repo
 - to unwrap legacy mixed-format reviewer artifacts in-place, run:
   - `python scripts/unwrap_canonical_reviewer_artifacts.py Outputs/Placeholder`
+- keep tracked regression fixtures under [`testdata/canonical_reviewer/`](/Users/nikhil/Automations/dify-profiler/testdata/canonical_reviewer) rather than relying on ignored `Outputs/Placeholder` runs as the only corpus
 
 For a local reviewer-validator smoke check, run:
 - `python scripts/canonical_contract_reviewer_smoke.py`

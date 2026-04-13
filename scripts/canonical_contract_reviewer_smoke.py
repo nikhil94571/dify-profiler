@@ -5,6 +5,7 @@ from copy import deepcopy
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+FIXTURES = ROOT / "testdata" / "canonical_reviewer"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -28,6 +29,10 @@ def _load_unwrap_helpers():
     code = Path("scripts/unwrap_canonical_reviewer_artifacts.py").read_text()
     exec(code, namespace)
     return namespace["unwrap_known_artifacts"]
+
+
+def _load_fixture_json(name):
+    return json.loads((FIXTURES / name).read_text())
 
 
 def _base_contract():
@@ -342,7 +347,8 @@ def _validate_patch(name, reviewer_output, original_contract, expected_ok, expec
     actual_ok = result["validation_ok"] == "true"
     if actual_ok != expected_ok:
         raise AssertionError(f"{name} expected validation_ok={expected_ok}, got {result}")
-    if expected_error_substring and expected_error_substring not in result["validation_error"]:
+    error_haystack = f"{result.get('validation_error', '')}\n{result.get('validation_errors_json', '')}"
+    if expected_error_substring and expected_error_substring not in error_haystack:
         raise AssertionError(f"{name} expected error containing {expected_error_substring!r}, got {result}")
     print(f"PASS: {name}")
     return result
@@ -479,26 +485,19 @@ def main():
         expected_error_substring="field points to a forbidden field",
     )
 
-    no_op_patch = _build_patch_envelope(
-        [
-            _build_patch(
-                "chg_030",
-                "Q2",
-                "recommended_logical_type",
-                "ordinal_category",
-                "Invalid fixture.",
-                "Invalid fixture.",
-            )
-        ],
-        "Invalid no-op fixture.",
-    )
-    _validate_patch(
-        "no-op patch fails",
+    no_op_patch = _load_fixture_json("reviewer_patch_noop.json")
+    no_op_result = _validate_patch(
+        "no-op patch normalizes away",
         no_op_patch,
         original,
-        expected_ok=False,
-        expected_error_substring="is a no-op change entry",
+        expected_ok=True,
     )
+    _assert(no_op_result["normalization_applied"] == "true", no_op_result)
+    _assert(
+        any("no_op_change_entry" in item["defaulted_to"] for item in json.loads(no_op_result["normalization_log_json"])),
+        no_op_result,
+    )
+    _assert(json.loads(no_op_result["canon_review_patch"])["change_set"] == [], no_op_result)
 
     unknown_column_patch = _build_patch_envelope(
         [
@@ -677,6 +676,46 @@ def main():
         expected_error_substring="cannot add or remove skip_logic_protected in interpretation_hints",
     )
 
+    _validate_patch(
+        "missingness pair incoherence fails",
+        _build_patch_envelope(
+            [
+                _build_patch(
+                    "chg_stats_006b",
+                    "Final_Grade",
+                    "missingness_handling",
+                    "retain_with_caution",
+                    "Invalid missingness pair fixture.",
+                    "Invalid missingness pair fixture.",
+                )
+            ],
+            "Invalid missingness pair fixture.",
+        ),
+        stats_original,
+        expected_ok=False,
+        expected_error_substring="missingness_handling must be one of ['no_action_needed'] when missingness_disposition is no_material_missingness",
+    )
+
+    _validate_patch(
+        "family default non-structural missingness fails",
+        _build_patch_envelope(
+            [
+                _build_patch(
+                    "chg_stats_006c",
+                    "A1_Q2",
+                    "missingness_disposition",
+                    "token_missingness_present",
+                    "Invalid family-default missingness fixture.",
+                    "Invalid family-default missingness fixture.",
+                )
+            ],
+            "Invalid family-default missingness fixture.",
+        ),
+        stats_original,
+        expected_ok=False,
+        expected_error_substring="missingness_decision_source may not be family_default for non-structural missingness_disposition token_missingness_present",
+    )
+
     child_hint_patch = _build_patch_envelope(
         [
             _build_patch(
@@ -705,8 +744,14 @@ def main():
         "apply rejects finalized child hint if validator is bypassed",
         json.dumps(child_hint_patch),
         stats_original,
-        "reviewed_contract.column_contracts[1].structural_transform_hints must not contain requires_child_table_review when canonical_modeling_status is child_repeat_member.",
+        "reviewed_contract.column_contracts[1].structural_transform_hints must not contain requires_child_table_review when canonical_modeling_status is child_repeat_member",
     )
+
+    stale_metadata_fixture = _load_fixture_json("reviewer_patch_stale_metadata_after_deletion.json")
+    _assert(stale_metadata_fixture["review_flags"], stale_metadata_fixture)
+    _assert(stale_metadata_fixture["assumptions"], stale_metadata_fixture)
+    repair_prompt = (ROOT / "prompts" / "REPAIR_canonical_contract_reviewer.md").read_text()
+    _assert("remove that stale metadata too" in repair_prompt, repair_prompt)
 
     unwrap_known_artifacts = _load_unwrap_helpers()
     with tempfile.TemporaryDirectory() as temp_dir:

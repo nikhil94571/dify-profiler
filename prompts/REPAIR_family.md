@@ -29,6 +29,7 @@ Hard structure:
 - `recommended_parent_key` and `recommended_repeat_index_name` must be strings and may be blank
 - `confidence` must be numeric and between 0 and 1
 - if present, `member_defaults` must stay an object and must only contain family-shared non-structural defaults
+- if present, `member_defaults` may only use structural missingness defaults
 - `review_flags` and `assumptions` must be arrays
 - `needs_human_review` must be boolean
 
@@ -51,6 +52,9 @@ Hard invariants:
 - `recommended_handling` must use only allowed enum values
 - if `recommended_handling = retain_as_child_table`, then `recommended_parent_key` and `recommended_repeat_index_name` must both be usable non-empty strings
 - if `recommended_handling = retain_with_review` or `needs_manual_confirmation`, preserve blank linkage fields when the original JSON already indicates reference-style or unresolved linkage semantics
+- if `member_defaults.missingness_disposition` is present, it may only be `structurally_valid_missingness` or `partially_structural_missingness`
+- if `member_defaults.missingness_handling` or `member_defaults.skip_logic_protected` is present, `member_defaults.missingness_disposition` must also be present
+- if `member_defaults.missingness_handling = protect_from_null_penalty`, then `member_defaults.skip_logic_protected` must be `true`
 
 Repair strategy:
 - if the validation error points to a specific field, minimally repair that field while preserving the rest
@@ -58,3 +62,4 @@ Repair strategy:
 - if `recommended_handling = retain_as_child_table` and linkage is blank, first try to recover linkage from the existing invalid JSON; only relax handling if the validation error or the original content clearly requires it
 - preserve accepted family identity and table naming unless a listed validation error requires a change
 - preserve `member_defaults` when present unless a listed validation error requires repairing or removing a specific invalid field
+- if `member_defaults` contains non-structural missingness defaults, delete or narrow only the invalid missingness fields instead of inventing a broader family default

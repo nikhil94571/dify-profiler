@@ -113,6 +113,7 @@ FAMILY-SHARED DEFAULTS:
 - Optional non-structural defaults that can safely apply across sibling members in the same family.
 - Examples include shared type/storage guidance or shared reviewed missingness handling.
 - They must never invent table structure, linkage, or free-form semantics.
+- Any shared missingness default must stay structural-only; do not emit family-wide defaults for token missingness, unexplained missingness, or generic low-missingness states.
 
 BLANK LINKAGE:
 - An intentional blank `recommended_parent_key` or `recommended_repeat_index_name`.
@@ -222,12 +223,8 @@ You MUST use only values from this list:
 
 ### Optional `member_defaults.missingness_disposition`
 You MUST use exactly one of:
-- `no_material_missingness`
-- `token_missingness_present`
 - `structurally_valid_missingness`
 - `partially_structural_missingness`
-- `unexplained_high_missingness`
-- `mixed_missingness_risk`
 
 ### Optional `member_defaults.missingness_handling`
 You MUST use exactly one of:
@@ -244,6 +241,8 @@ You MUST use exactly one of:
 - `recommended_parent_key` and `recommended_repeat_index_name` must be strings and may be blank only when the accepted semantics justify that absence
 - if `recommended_handling = retain_as_child_table`, both linkage fields must be usable non-empty strings
 - if present, `member_defaults` must include at least one substantive defaultable field
+- if present, `member_defaults.missingness_disposition` may only describe structural missingness shared safely across siblings
+- if you emit `member_defaults.missingness_handling` or `member_defaults.skip_logic_protected`, you must also emit a structural `member_defaults.missingness_disposition`
 - omit `member_defaults` entirely when no safe family-wide default exists
 
 ## 6) ARTIFACT / INPUT SEMANTICS

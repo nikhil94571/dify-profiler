@@ -15,6 +15,12 @@ from datetime import timedelta
 from uuid import uuid4
 from urllib.parse import urlencode
 from manifest_export import upload_and_sign_text
+from canonical_contract_invariants import (
+    FAMILY_DEFAULT_ALLOWED_MISSINGNESS_DISPOSITIONS,
+    POST_CANONICAL_CHILD_FORBIDDEN_STRUCTURAL_HINTS as SHARED_POST_CANONICAL_CHILD_FORBIDDEN_STRUCTURAL_HINTS,
+    find_row_invariant_errors as _find_canonical_row_invariant_errors,
+    normalize_missingness_decision as _normalize_canonical_missingness_decision,
+)
 
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Request
@@ -11195,10 +11201,7 @@ TYPE_STRUCTURAL_HINTS = {
     "requires_codebook_or_label_mapping_review",
 }
 
-POST_CANONICAL_CHILD_FORBIDDEN_STRUCTURAL_HINTS = {
-    "requires_child_table_review",
-    "requires_wide_to_long_review",
-}
+POST_CANONICAL_CHILD_FORBIDDEN_STRUCTURAL_HINTS = set(SHARED_POST_CANONICAL_CHILD_FORBIDDEN_STRUCTURAL_HINTS)
 
 TYPE_INTERPRETATION_HINTS = {
     "leading_zero_risk",
@@ -12227,13 +12230,32 @@ def _normalize_type_output(payload: Dict[str, Any]) -> Tuple[Dict[str, Dict[str,
     return decisions, deduped_rules
 
 
-def _normalize_missingness_output(payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+def _normalize_missingness_output(payload: Dict[str, Any]) -> Dict[str, Any]:
     decisions: Dict[str, Dict[str, Any]] = {}
     for item in _coerce_list_of_dicts(payload.get("column_decisions")):
         col = str(item.get("column") or "").strip()
         if col:
             decisions[col] = item
-    return decisions
+
+    global_contract_raw = payload.get("global_contract") if isinstance(payload, dict) else {}
+    global_contract = {
+        "token_missing_placeholders_detected": (
+            global_contract_raw.get("token_missing_placeholders_detected")
+            if isinstance(global_contract_raw, dict) and isinstance(global_contract_raw.get("token_missing_placeholders_detected"), bool)
+            else None
+        ),
+        "notes": (
+            str(global_contract_raw.get("notes") or "").strip()
+            if isinstance(global_contract_raw, dict)
+            else ""
+        ),
+    }
+
+    return {
+        "column_decisions": decisions,
+        "global_contract": global_contract,
+        "global_findings": _coerce_list_of_dicts(payload.get("global_findings")),
+    }
 
 
 def _extract_family_results(payload: Any) -> Dict[str, Dict[str, Any]]:
@@ -12302,13 +12324,15 @@ def _normalize_family_member_defaults(payload: Any) -> Dict[str, Dict[str, Any]]
                 hint for hint in raw_defaults.get("interpretation_hints") or [] if str(hint or "").strip() in TYPE_INTERPRETATION_HINTS
             )
             provided_fields.append("interpretation_hints")
-        if str(raw_defaults.get("missingness_disposition") or "").strip() in MISSINGNESS_DISPOSITIONS:
-            normalized["missingness_disposition"] = str(raw_defaults.get("missingness_disposition")).strip()
+        raw_missingness_disposition = str(raw_defaults.get("missingness_disposition") or "").strip()
+        family_missingness_allowed = raw_missingness_disposition in FAMILY_DEFAULT_ALLOWED_MISSINGNESS_DISPOSITIONS
+        if family_missingness_allowed:
+            normalized["missingness_disposition"] = raw_missingness_disposition
             provided_fields.append("missingness_disposition")
-        if str(raw_defaults.get("missingness_handling") or "").strip() in MISSINGNESS_HANDLING:
+        if family_missingness_allowed and str(raw_defaults.get("missingness_handling") or "").strip() in MISSINGNESS_HANDLING:
             normalized["missingness_handling"] = str(raw_defaults.get("missingness_handling")).strip()
             provided_fields.append("missingness_handling")
-        if "skip_logic_protected" in raw_defaults and isinstance(raw_defaults.get("skip_logic_protected"), bool):
+        if family_missingness_allowed and "skip_logic_protected" in raw_defaults and isinstance(raw_defaults.get("skip_logic_protected"), bool):
             normalized["skip_logic_protected"] = bool(raw_defaults.get("skip_logic_protected"))
             provided_fields.append("skip_logic_protected")
         if "normalization_notes" in raw_defaults:
@@ -12595,7 +12619,14 @@ def _apply_family_type_defaults(base_decision: Dict[str, Any], family_defaults: 
         "interpretation_hints",
         "normalization_notes",
     }
-    if not (provided & type_fields):
+    type_substantive_fields = {
+        "recommended_logical_type",
+        "recommended_storage_type",
+        "transform_actions",
+        "structural_transform_hints",
+        "interpretation_hints",
+    }
+    if not (provided & type_substantive_fields):
         return dict(base_decision), False
 
     merged = dict(base_decision)
@@ -12619,7 +12650,12 @@ def _apply_family_type_defaults(base_decision: Dict[str, Any], family_defaults: 
     return merged, True
 
 
-def _apply_family_missingness_defaults(base_decision: Dict[str, Any], family_defaults: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+def _apply_family_missingness_defaults(
+    base_decision: Dict[str, Any],
+    family_defaults: Dict[str, Any],
+    *,
+    global_token_missing_placeholders_detected: Optional[bool] = None,
+) -> Tuple[Dict[str, Any], bool]:
     if not family_defaults:
         return dict(base_decision), False
 
@@ -12630,7 +12666,12 @@ def _apply_family_missingness_defaults(base_decision: Dict[str, Any], family_def
         "skip_logic_protected",
         "normalization_notes",
     }
-    if not (provided & missingness_fields):
+    missingness_substantive_fields = {
+        "missingness_disposition",
+        "missingness_handling",
+        "skip_logic_protected",
+    }
+    if not (provided & missingness_substantive_fields):
         return dict(base_decision), False
 
     merged = dict(base_decision)
@@ -12647,7 +12688,19 @@ def _apply_family_missingness_defaults(base_decision: Dict[str, Any], family_def
     merged["missingness_review_required"] = bool(family_defaults.get("needs_human_review", merged.get("missingness_review_required", False)))
     merged["confidence"] = round(max(_safe_float(merged.get("confidence"), 0.0), _safe_float(family_defaults.get("confidence"), 0.74)), 6)
     merged["applied_sources"] = list(family_defaults.get("applied_sources") or ["family_worker.member_defaults"])
+    merged, _, _ = _normalize_canonical_missingness_decision(
+        merged,
+        base_decision=base_decision,
+        global_token_missing_placeholders_detected=global_token_missing_placeholders_detected,
+    )
     return merged, True
+
+
+def _sync_skip_logic_interpretation_hints(interpretation_hints: List[str], skip_logic_protected: bool) -> List[str]:
+    cleaned = [hint for hint in interpretation_hints if hint != "skip_logic_protected"]
+    if skip_logic_protected:
+        cleaned.append("skip_logic_protected")
+    return _dedupe_preserve_order(cleaned)
 
 
 def _fallback_type_decision(
@@ -13176,7 +13229,12 @@ def _resolve_contract_confidence(
     return round(max(0.0, min(1.0, base)), 6)
 
 
-def _validate_canonical_column_contract_output(payload: Dict[str, Any], expected_source_columns: List[str]) -> List[str]:
+def _validate_canonical_column_contract_output(
+    payload: Dict[str, Any],
+    expected_source_columns: List[str],
+    *,
+    global_token_missing_placeholders_detected: Optional[bool] = None,
+) -> List[str]:
     errors: List[str] = []
     required_top_level = [
         "worker",
@@ -13335,15 +13393,12 @@ def _validate_canonical_column_contract_output(payload: Dict[str, Any], expected
 
         if not isinstance(row.get("skip_logic_protected"), bool):
             errors.append(f"{path}.skip_logic_protected must be boolean")
-        elif row.get("missingness_handling") == "protect_from_null_penalty" and row.get("skip_logic_protected") is not True:
-            errors.append(f"{path}.skip_logic_protected must be true when missingness_handling is protect_from_null_penalty")
-        elif row.get("skip_logic_protected") is True and row.get("missingness_disposition") not in {
-            "structurally_valid_missingness",
-            "partially_structural_missingness",
-        }:
-            errors.append(
-                f"{path}.skip_logic_protected can only be true for structurally_valid_missingness or partially_structural_missingness"
-            )
+        for invariant_error in _find_canonical_row_invariant_errors(
+            row,
+            path,
+            global_token_missing_placeholders_detected=global_token_missing_placeholders_detected,
+        ):
+            errors.append(invariant_error)
         if not isinstance(row.get("needs_human_review"), bool):
             errors.append(f"{path}.needs_human_review must be boolean")
         if not isinstance(row.get("confidence"), (int, float)) or isinstance(row.get("confidence"), bool):
@@ -13388,7 +13443,10 @@ def _synthesize_canonical_column_contract(
 
     light_contract_maps = _normalize_light_contract_maps(light_contract_decisions)
     type_by_col, global_rules = _normalize_type_output(type_transform_worker_json)
-    missingness_by_col = _normalize_missingness_output(missingness_worker_json)
+    missingness_context = _normalize_missingness_output(missingness_worker_json)
+    missingness_by_col = missingness_context["column_decisions"]
+    missingness_global_contract = missingness_context["global_contract"]
+    global_token_missing_placeholders_detected = missingness_global_contract.get("token_missing_placeholders_detected")
     family_results_by_id = _extract_family_results(family_worker_json)
     family_defaults_by_id = _normalize_family_member_defaults(family_worker_json)
     assignments_by_col, tables_by_name = _normalize_table_layout_output(table_layout_worker_json)
@@ -13472,8 +13530,13 @@ def _synthesize_canonical_column_contract(
                 "applied_sources": ["type_transform_worker"],
             }
 
-        missingness_decision = _baseline_row_to_missingness_decision(baseline_row)
-        missingness_decision, family_missingness_used = _apply_family_missingness_defaults(missingness_decision, family_defaults)
+        baseline_missingness_decision = _baseline_row_to_missingness_decision(baseline_row)
+        missingness_decision = dict(baseline_missingness_decision)
+        missingness_decision, family_missingness_used = _apply_family_missingness_defaults(
+            missingness_decision,
+            family_defaults,
+            global_token_missing_placeholders_detected=global_token_missing_placeholders_detected,
+        )
         reviewed_missingness = missingness_by_col.get(column)
         if reviewed_missingness:
             missingness_decision = {
@@ -13488,8 +13551,10 @@ def _synthesize_canonical_column_contract(
             }
 
         interpretation_hints = list(type_decision["interpretation_hints"])
-        if missingness_decision["skip_logic_protected"]:
-            interpretation_hints = _dedupe_preserve_order(interpretation_hints + ["skip_logic_protected"])
+        interpretation_hints = _sync_skip_logic_interpretation_hints(
+            interpretation_hints,
+            bool(missingness_decision["skip_logic_protected"]),
+        )
 
         structural_transform_hints = _cleanup_structural_hints(
             type_decision["structural_transform_hints"],
@@ -13545,11 +13610,34 @@ def _synthesize_canonical_column_contract(
             "needs_human_review": False,
         }
 
-        if row["missingness_handling"] == "protect_from_null_penalty":
-            row["skip_logic_protected"] = True
-        if row["skip_logic_protected"]:
-            row["interpretation_hints"] = _dedupe_preserve_order(
-                list(row["interpretation_hints"]) + ["skip_logic_protected"]
+        normalized_missingness, reconciliation_notes, invariant_errors = _normalize_canonical_missingness_decision(
+            {
+                "canonical_modeling_status": row["canonical_modeling_status"],
+                "structural_transform_hints": row["structural_transform_hints"],
+                "missingness_disposition": row["missingness_disposition"],
+                "missingness_handling": row["missingness_handling"],
+                "missingness_decision_source": row["missingness_decision_source"],
+                "skip_logic_protected": row["skip_logic_protected"],
+            },
+            base_decision=baseline_missingness_decision,
+            global_token_missing_placeholders_detected=global_token_missing_placeholders_detected,
+        )
+        row["missingness_disposition"] = str(normalized_missingness["missingness_disposition"])
+        row["missingness_handling"] = str(normalized_missingness["missingness_handling"])
+        row["skip_logic_protected"] = bool(normalized_missingness["skip_logic_protected"])
+        row["interpretation_hints"] = _sync_skip_logic_interpretation_hints(
+            list(row["interpretation_hints"]),
+            row["skip_logic_protected"],
+        )
+        row["normalization_notes"] = _merge_notes(
+            row.get("normalization_notes"),
+            "Deterministic invariant reconciliation applied."
+            if reconciliation_notes
+            else "",
+        )
+        if invariant_errors:
+            raise ValueError(
+                f"Canonical column contract row for {column} is not safely reconcilable: {invariant_errors[0]}"
             )
 
         row_conflicts = _build_conflict_flags(
@@ -13672,7 +13760,11 @@ def _synthesize_canonical_column_contract(
         "assumptions": assumptions,
     }
 
-    validation_errors = _validate_canonical_column_contract_output(output, expected_source_columns=a2_order)
+    validation_errors = _validate_canonical_column_contract_output(
+        output,
+        expected_source_columns=a2_order,
+        global_token_missing_placeholders_detected=global_token_missing_placeholders_detected,
+    )
     if validation_errors:
         raise HTTPException(
             status_code=500,

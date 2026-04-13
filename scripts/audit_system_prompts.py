@@ -163,7 +163,7 @@ PROMPT_SPECS: dict[str, PromptSpec] = {
                     "TYPE_TRANSFORM_ACTIONS",
                     "TYPE_STRUCTURAL_HINTS",
                     "TYPE_INTERPRETATION_HINTS",
-                    "MISSINGNESS_DISPOSITIONS",
+                    "FAMILY_DEFAULT_ALLOWED_MISSINGNESS_DISPOSITIONS",
                     "MISSINGNESS_HANDLING",
                 ),
             ),
@@ -269,6 +269,23 @@ PROMPT_SPECS: dict[str, PromptSpec] = {
 }
 
 
+REPAIR_PROMPT_REQUIREMENTS: dict[str, tuple[str, ...]] = {
+    "REPAIR_missingness.md": (
+        "global_contract",
+        "token_missing_placeholders_detected",
+        "do not leave any repaired column at `missingness_disposition = token_missingness_present`",
+        "do not move machine-critical token-missingness state into `global_findings`",
+    ),
+    "REPAIR_family.md": (
+        "structurally_valid_missingness",
+        "partially_structural_missingness",
+        "member_defaults.missingness_disposition",
+        "member_defaults.missingness_handling",
+        "member_defaults.skip_logic_protected",
+    ),
+}
+
+
 def load_validator_sets(path: Path) -> dict[str, set[str]]:
     tree = ast.parse(path.read_text())
     result: dict[str, set[str]] = {}
@@ -357,6 +374,16 @@ def main() -> int:
         errors = audit_prompt(path, spec)
         for error in errors:
             failures.append(f"{filename}: {error}")
+
+    for filename, required_terms in REPAIR_PROMPT_REQUIREMENTS.items():
+        path = PROMPTS_DIR / filename
+        if not path.exists():
+            failures.append(f"{filename}: file is missing")
+            continue
+        text = path.read_text()
+        for term in required_terms:
+            if term not in text:
+                failures.append(f"{filename}: missing required repair-term '{term}'")
 
     if failures:
         print("Prompt audit failed:\n")

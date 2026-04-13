@@ -138,6 +138,25 @@ MISSINGNESS_HANDLING = {
     "candidate_drop_review",
 }
 
+MISSINGNESS_DISPOSITION_TO_ALLOWED_HANDLING = {
+    "no_material_missingness": {"no_action_needed"},
+    "token_missingness_present": {"retain_with_caution", "review_before_drop"},
+    "structurally_valid_missingness": {"protect_from_null_penalty", "retain_with_caution"},
+    "partially_structural_missingness": {"retain_with_caution", "review_before_drop"},
+    "unexplained_high_missingness": {"review_before_drop", "candidate_drop_review"},
+    "mixed_missingness_risk": {"retain_with_caution", "review_before_drop"},
+}
+
+SKIP_LOGIC_TRUE_ALLOWED_DISPOSITIONS = {
+    "structurally_valid_missingness",
+    "partially_structural_missingness",
+}
+
+FAMILY_DEFAULT_ALLOWED_MISSINGNESS_DISPOSITIONS = {
+    "structurally_valid_missingness",
+    "partially_structural_missingness",
+}
+
 TYPE_DECISION_SOURCES = {
     "reviewed_type_worker",
     "family_default",
@@ -324,6 +343,50 @@ def _normalize_patch_output(parsed):
     _default_in_dict(parsed, "assumptions", [], "assumptions", normalization_log)
 
     return parsed, normalization_log
+
+
+def _normalize_noop_change_entries(parsed, original_contract, normalization_log):
+    if not isinstance(parsed, dict):
+        return parsed
+
+    change_set = parsed.get("change_set")
+    rows = original_contract.get("column_contracts")
+    if not isinstance(change_set, list) or not isinstance(rows, list):
+        return parsed
+
+    column_index_map = {}
+    for row_index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        column = str(row.get("column") or "").strip()
+        if column and column not in column_index_map:
+            column_index_map[column] = row_index
+
+    normalized_change_set = []
+    for index, item in enumerate(change_set):
+        if not isinstance(item, dict):
+            normalized_change_set.append(item)
+            continue
+        column_name = str(item.get("column") or "").strip()
+        field_name = str(item.get("field") or "").strip()
+        row_index = column_index_map.get(column_name)
+        if (
+            row_index is not None
+            and field_name in PATCHABLE_FIELDS
+            and isinstance(rows[row_index], dict)
+            and field_name in rows[row_index]
+            and rows[row_index].get(field_name) == item.get("after_value")
+        ):
+            _log_normalization(
+                normalization_log,
+                f"change_set[{index}]",
+                {"removed": "no_op_change_entry"},
+            )
+            continue
+        normalized_change_set.append(item)
+
+    parsed["change_set"] = normalized_change_set
+    return parsed
 
 
 def _validate_review_summary(review_summary, errors):
@@ -533,13 +596,28 @@ def _validate_row_coherence(row, row_prefix, errors):
     if row.get("missingness_handling") == "protect_from_null_penalty" and row.get("skip_logic_protected") is not True:
         _add_error(errors, f"{row_prefix}.skip_logic_protected must be true when missingness_handling is protect_from_null_penalty.")
 
-    if row.get("skip_logic_protected") is True and row.get("missingness_disposition") not in {
-        "structurally_valid_missingness",
-        "partially_structural_missingness",
-    }:
+    disposition = row.get("missingness_disposition")
+    handling = row.get("missingness_handling")
+    allowed_handling = MISSINGNESS_DISPOSITION_TO_ALLOWED_HANDLING.get(disposition)
+    if allowed_handling and handling not in allowed_handling:
+        _add_error(
+            errors,
+            f"{row_prefix}.missingness_handling must be one of {sorted(allowed_handling)} when missingness_disposition is {disposition}.",
+        )
+
+    if row.get("skip_logic_protected") is True and disposition not in SKIP_LOGIC_TRUE_ALLOWED_DISPOSITIONS:
         _add_error(
             errors,
             f"{row_prefix}.skip_logic_protected can only be true for structurally_valid_missingness or partially_structural_missingness.",
+        )
+
+    if (
+        row.get("missingness_decision_source") == "family_default"
+        and disposition not in FAMILY_DEFAULT_ALLOWED_MISSINGNESS_DISPOSITIONS
+    ):
+        _add_error(
+            errors,
+            f"{row_prefix}.missingness_decision_source may not be family_default for non-structural missingness_disposition {disposition}.",
         )
 
 
@@ -623,10 +701,6 @@ def _validate_change_set(change_set, original_contract, errors):
         if len(errors) != before_error_count:
             continue
 
-        if row.get(field_name) == item.get("after_value"):
-            _add_error(errors, f"{path} is a no-op change entry.")
-            continue
-
         if field_name == "interpretation_hints":
             before_has_skip_hint = "skip_logic_protected" in (row.get("interpretation_hints") or [])
             after_has_skip_hint = "skip_logic_protected" in (item.get("after_value") or [])
@@ -692,6 +766,10 @@ def _validate_strict(reviewer_output: str, canon_contract_json: str):
             "normalization_applied": normalization_applied,
             "normalization_log_json": normalization_log_json,
         }
+
+    patch_output = _normalize_noop_change_entries(patch_output, original_contract, normalization_log)
+    normalization_log_json = json.dumps(normalization_log, separators=(",", ":"))
+    normalization_applied = "true" if normalization_log else "false"
 
     extra_keys = set(patch_output.keys()) - set(REQUIRED_TOP_LEVEL)
     if extra_keys:

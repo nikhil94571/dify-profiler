@@ -329,6 +329,7 @@ Patch only when the draft row conflicts with:
 Do not generalize reviewed column-level evidence from one reviewed column to sibling columns unless the field you are patching is itself substantively owned by family-level reviewed evidence.
 Do not patch a row based only on family-wide intuition when the field in question is code-owned or provenance-like.
 Do not treat upstream type/family hints that merely restate already-finalized child placement as contradictions that require reviewer edits.
+Do not bulk-correct family-default non-structural missingness drift that belongs to builder merge logic; flag the upstream contradiction in `review_flags` instead.
 
 ### STEP 3 - Prefer minimal row-field patches
 Patch only the exact leaf fields that need correction.

@@ -46,6 +46,7 @@ REQUIRED_TOP_LEVEL = [
     "worker",
     "summary",
     "column_decisions",
+    "global_contract",
     "global_findings",
     "review_flags",
     "assumptions",
@@ -84,6 +85,10 @@ def _normalize_missingness_output(parsed):
     _default_in_dict(parsed, "global_findings", [], "global_findings", normalization_log)
     _default_in_dict(parsed, "review_flags", [], "review_flags", normalization_log)
     _default_in_dict(parsed, "assumptions", [], "assumptions", normalization_log)
+
+    global_contract = parsed.get("global_contract")
+    if isinstance(global_contract, dict):
+        _default_in_dict(global_contract, "notes", "", "global_contract.notes", normalization_log)
 
     column_decisions = parsed.get("column_decisions")
     if isinstance(column_decisions, list):
@@ -306,6 +311,21 @@ def _validate_global_findings(global_findings, errors):
                 _require_non_empty_string(item[key], f"{field_prefix}.{key}", errors)
 
 
+def _validate_global_contract(global_contract, errors):
+    if not _require_dict(global_contract, "global_contract", errors):
+        return
+
+    if "token_missing_placeholders_detected" not in global_contract:
+        _add_error(errors, "global_contract.token_missing_placeholders_detected is required.")
+    elif not isinstance(global_contract["token_missing_placeholders_detected"], bool):
+        _add_error(errors, "global_contract.token_missing_placeholders_detected must be boolean.")
+
+    if "notes" not in global_contract:
+        _add_error(errors, "global_contract.notes is required.")
+    elif not isinstance(global_contract["notes"], str):
+        _add_error(errors, "global_contract.notes must be a string.")
+
+
 def _validate_review_flags(review_flags, errors):
     if not _require_list(review_flags, "review_flags", errors):
         return
@@ -403,6 +423,9 @@ def _validate_strict(missingness_output: str):
 
     if "column_decisions" in parsed:
         _validate_column_decisions(parsed["column_decisions"], errors)
+
+    if "global_contract" in parsed:
+        _validate_global_contract(parsed["global_contract"], errors)
 
     if "global_findings" in parsed:
         _validate_global_findings(parsed["global_findings"], errors)

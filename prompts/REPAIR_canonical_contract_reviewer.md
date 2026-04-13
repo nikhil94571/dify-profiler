@@ -75,4 +75,5 @@ Repair priorities:
 - do not convert a frozen-field concern into a different semantic patch unless that replacement edit is already clearly supported by the original reviewer output
 - do not convert stale upstream child-placement hints into a `structural_transform_hints` patch when canonical placement is already finalized on the row
 - if a patch field is invalid and cannot be repaired safely, delete only that bad patch entry rather than inventing a different edit
+- if deleting a bad patch entry leaves a `review_flags` or `assumptions` item supported only by that deleted edit, remove that stale metadata too
 - preserve the intended reviewer correction whenever it can be made valid

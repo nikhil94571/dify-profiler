@@ -14,9 +14,30 @@ SUMMARY_COUNT_KEYS = [
     "fallback_type_count",
 ]
 
+# Keep this node self-contained because Dify code nodes cannot reliably import
+# repo-local helper modules at runtime.
 POST_CANONICAL_CHILD_FORBIDDEN_STRUCTURAL_HINTS = {
     "requires_child_table_review",
     "requires_wide_to_long_review",
+}
+
+MISSINGNESS_DISPOSITION_TO_ALLOWED_HANDLING = {
+    "no_material_missingness": {"no_action_needed"},
+    "token_missingness_present": {"retain_with_caution", "review_before_drop"},
+    "structurally_valid_missingness": {"protect_from_null_penalty", "retain_with_caution"},
+    "partially_structural_missingness": {"retain_with_caution", "review_before_drop"},
+    "unexplained_high_missingness": {"review_before_drop", "candidate_drop_review"},
+    "mixed_missingness_risk": {"retain_with_caution", "review_before_drop"},
+}
+
+SKIP_LOGIC_TRUE_ALLOWED_DISPOSITIONS = {
+    "structurally_valid_missingness",
+    "partially_structural_missingness",
+}
+
+FAMILY_DEFAULT_ALLOWED_MISSINGNESS_DISPOSITIONS = {
+    "structurally_valid_missingness",
+    "partially_structural_missingness",
 }
 
 PATCHABLE_FIELDS = {
@@ -120,28 +141,52 @@ def _recompute_summary_counts(reviewed_contract):
 
 
 def _require_row_coherence(row, row_prefix):
-    structural_hints = row.get("structural_transform_hints") or []
+    for error in _find_canonical_row_invariant_errors(row, row_prefix):
+        _require(False, error)
+
+
+def _find_canonical_row_invariant_errors(row, row_prefix):
+    errors = []
+
     if row.get("canonical_modeling_status") == "child_repeat_member":
-        for hint in structural_hints:
-            _require(
-                hint not in POST_CANONICAL_CHILD_FORBIDDEN_STRUCTURAL_HINTS,
-                f"{row_prefix}.structural_transform_hints must not contain {hint} when canonical_modeling_status is child_repeat_member.",
-            )
+        for hint in row.get("structural_transform_hints") or []:
+            if hint in POST_CANONICAL_CHILD_FORBIDDEN_STRUCTURAL_HINTS:
+                errors.append(
+                    f"{row_prefix}.structural_transform_hints must not contain {hint} "
+                    "when canonical_modeling_status is child_repeat_member"
+                )
 
-    if row.get("missingness_handling") == "protect_from_null_penalty":
-        _require(
-            row.get("skip_logic_protected") is True,
-            f"{row_prefix}.skip_logic_protected must be true when missingness_handling is protect_from_null_penalty.",
+    disposition = row.get("missingness_disposition")
+    handling = row.get("missingness_handling")
+    decision_source = row.get("missingness_decision_source")
+    skip_logic_protected = row.get("skip_logic_protected")
+
+    allowed_handling = MISSINGNESS_DISPOSITION_TO_ALLOWED_HANDLING.get(disposition)
+    if allowed_handling and handling not in allowed_handling:
+        errors.append(
+            f"{row_prefix}.missingness_handling must be one of "
+            f"{sorted(allowed_handling)} when missingness_disposition is {disposition}"
         )
 
-    if row.get("skip_logic_protected") is True:
-        _require(
-            row.get("missingness_disposition") in {
-                "structurally_valid_missingness",
-                "partially_structural_missingness",
-            },
-            f"{row_prefix}.skip_logic_protected can only be true for structurally_valid_missingness or partially_structural_missingness.",
+    if handling == "protect_from_null_penalty" and skip_logic_protected is not True:
+        errors.append(
+            f"{row_prefix}.skip_logic_protected must be true when missingness_handling "
+            "is protect_from_null_penalty"
         )
+
+    if skip_logic_protected is True and disposition not in SKIP_LOGIC_TRUE_ALLOWED_DISPOSITIONS:
+        errors.append(
+            f"{row_prefix}.skip_logic_protected can only be true for "
+            "structurally_valid_missingness or partially_structural_missingness"
+        )
+
+    if decision_source == "family_default" and disposition not in FAMILY_DEFAULT_ALLOWED_MISSINGNESS_DISPOSITIONS:
+        errors.append(
+            f"{row_prefix}.missingness_decision_source may not be family_default for "
+            f"non-structural missingness_disposition {disposition}"
+        )
+
+    return errors
 
 
 def _stamp_review_summary_metadata(reviewed_contract, change_count, changed_column_count):

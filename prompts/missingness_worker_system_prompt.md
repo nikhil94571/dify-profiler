@@ -35,6 +35,7 @@ Your job is to:
 
 This worker produces a reviewed missingness override layer, not a final keep/drop contract.
 Later synthesis will merge your reviewed missingness decisions with other specialist outputs.
+Deterministic code will consume your structured `global_contract` block directly; do not rely on prose-only `global_findings` to carry machine-critical contract state.
 
 ## 0.5) WORKFLOW POSITION
 You run after the finalized light contract and in parallel with the type/value specialist.
@@ -501,6 +502,10 @@ You MUST output exactly one JSON object with this top-level shape:
       "needs_human_review": false
     }
   ],
+  "global_contract": {
+    "token_missing_placeholders_detected": false,
+    "notes": "No dataset-wide token placeholder pattern was confirmed."
+  },
   "global_findings": [
     {
       "finding": "string",
@@ -528,6 +533,8 @@ Hard structure:
 - `summary.overview` must be a non-empty string
 - `summary.key_patterns` must be an array of strings and may be empty when there is no useful cross-column pattern to summarize
 - `column_decisions` must be an array of objects and may be empty when no reviewed columns require explicit missingness adjudication
+- `global_contract.token_missing_placeholders_detected` must be a boolean
+- `global_contract.notes` must be a string
 - every populated `column_decisions[].normalization_notes` value must be a non-empty string
 - every populated `column_decisions[].reasoning` value must be a non-empty string
 - every `confidence` must be a valid JSON numeric literal between `0` and `1`
@@ -542,6 +549,7 @@ Hard invariants:
 - if `recommended_handling = protect_from_null_penalty`, then `skip_logic_protected` must be `true`
 - if `structural_validity = confirmed_structural`, then `skip_logic_protected` must be `true`
 - if `skip_logic_protected = true`, then `structural_validity` must be `confirmed_structural` or `plausible_structural`
+- if `global_contract.token_missing_placeholders_detected = false`, do not leave any reviewed column at `missingness_disposition = token_missingness_present`
 
 Soft guidance:
 - if `column_decisions` is empty, make `summary.overview` explicitly say that no reviewed columns required explicit missingness adjudication

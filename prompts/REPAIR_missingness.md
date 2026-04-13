@@ -16,6 +16,7 @@ Required top-level keys:
 - `worker`
 - `summary`
 - `column_decisions`
+- `global_contract`
 - `global_findings`
 - `review_flags`
 - `assumptions`
@@ -25,6 +26,9 @@ Hard structure:
 - `summary.overview` must be a non-empty string
 - `summary.key_patterns` must be an array of strings and may be empty
 - `column_decisions` must be an array and may be empty
+- `global_contract` must be an object
+- `global_contract.token_missing_placeholders_detected` must be boolean
+- `global_contract.notes` must be a string
 - `global_findings`, `review_flags`, and `assumptions` must be arrays
 - every populated `normalization_notes` and `reasoning` field in `column_decisions` must be non-empty
 - `confidence` must be numeric and between 0 and 1
@@ -59,10 +63,12 @@ Hard invariants:
 - `protect_from_null_penalty` requires `skip_logic_protected = true`
 - `confirmed_structural` requires `skip_logic_protected = true`
 - `skip_logic_protected = true` is only allowed when `structural_validity` is `confirmed_structural` or `plausible_structural`
+- if `global_contract.token_missing_placeholders_detected = false`, do not leave any repaired column at `missingness_disposition = token_missingness_present`
 - do not create a new compatibility violation while fixing the old one
 
 Repair strategy:
 - if the validation error points to a specific field, minimally repair that field while preserving the rest
 - if `column_decisions` is empty, keep the summary consistent with “no explicit reviewed-column missingness adjudication was required”
 - if the only issue is `skip_logic_protected = true` with `structural_validity = not_applicable` or `not_structurally_explained`, prefer setting `skip_logic_protected = false`
+- preserve `global_contract` and repair it directly if the validation error points there; do not move machine-critical token-missingness state into `global_findings`
 - do not change `no_material_missingness` into a structural disposition unless the original JSON already clearly requires it
