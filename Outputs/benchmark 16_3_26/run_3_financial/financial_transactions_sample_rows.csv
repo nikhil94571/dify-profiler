@@ -1,0 +1,31 @@
+Transaction_ID,Transaction_Date,Customer_ID,Product_Name,Quantity,Price,Payment_Method,Transaction_Status
+T0001,2024-08-02,C2205,Headphones,-5.0,$420.21,pay pal,
+T0002,2020-02-10,C3156,Coffee ,469.0,-445.34202525395585,creditcard,Pending
+T0003,2025-02-30,C2919,Tablet,-4.0,810.9930123946459,credit card,completed
+T0004,2020-08-17,C3009,Tab,-7.0,868.6083413217348,PayPal,Pending
+T0005,2025-02-30,C3488,Coffee Machine,-10.0,-763.1224490039416,PayPal,completed
+T0006,2021-10-26,C4241,Smartphone,598.0,,PayPal,Completed
+,2025-02-30,C1313,Laptop,10.0,,credit card,Completed
+T0008,2023-13-01,C4736,Headphones,669.0,-86.92126929493884,Cash,
+T0009,,C3387,Tablet,10.0,461.70198437439694,PayPal,
+T0010,2025-02-30,C2846,Laptop,-1.0,404.8907066405689,creditcard,Pending
+T83821,2023-09-24,C4515,Tablet,245.0,-587.3442477617125,Credit Card,completed
+T14603,2024-06-05,C3867,Laptop,-6.0,,credit card,
+T3289,2023-13-01,C752,Laptop,-4.0,229.60061824710667,Credit Card,Pending
+T97207,2023-13-01,C2758,Laptop,7.0,-301.4235337343482,creditcard,Pending
+T36059,2023-04-30,C2292,Laptop,-9.0,268.88590960563033,Credit Card,
+T32109,2023-13-01,C1145,Tabl,-3.0,-225.06212534869587,credit card,Completed
+T29267,2025-02-30,C1250,Laptop,,258.0631864278247,creditcard,
+T18300,2025-02-30,C3949,Tablet,6.0,-678.6848469234692,credit card,complete
+T96541,2025-02-30,C823,Laptop,854.0,621.7171979930213,Cash,Completed
+T13445,2025-01-06,C3326,Laptop,4.0,-772.4703527945317,PayPal,Failed
+T99991,2023-13-01,C4555,Tab,2.0,131.0368687292207,pay pal,Failed
+T99992,2022-11-25,C836,Coffee Machine,3.0,312.0263010265676,creditcard,completed
+T99993,2025-02-30,C1285,Laptop,9.0,-765.1747864640138,credit card,Completed
+T99994,2024-11-24,C3391,Tablet,911.0,$-627.09,Cash,Pending
+T99995,2025-02-30,C2153,Smartphone,741.0,,PayPal,complete
+,2021-10-06,C1743,Headphones,-8.0,240.0032380562687,PayPal ,complete
+T99997,2024-08-25,C4830,Smartphone,,503.82951729633896,credit card,Completed
+T99998,2023-13-01,C280,Laptop,-10.0,,PayPal ,completed
+T99999,2020-07-12,C4059,Headphones,10.0,,PayPal ,Completed
+T100000,2023-10-04,C1805,Tablet,2.0,89.37402345793535,PayPal ,Failed

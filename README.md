@@ -323,7 +323,7 @@ For direct API / HTTP-node usage, use:
   - do not paste this file into Dify's `json_schema` box
 
 For prompt regression checks, use:
-- [`prompts/table_layout_worker_regression_cases.md`](/Users/nikhil/Automations/dify-profiler/prompts/table_layout_worker_regression_cases.md)
+- [`prompts/regression_cases/table_layout_worker_regression_cases.md`](/Users/nikhil/Automations/dify-profiler/prompts/regression_cases/table_layout_worker_regression_cases.md)
 
 For a local validator smoke check of the exclude/unresolved assignment contract, run:
 - `python scripts/table_layout_validator_smoke.py`
@@ -388,29 +388,58 @@ The intended next stage after the canonical-column contract is a canonical-contr
 
 1. request `POST /artifact-bundles/view` with `mode = "canonical_contract_reviewer"`
    If you pass `global.value_filter.force_include_columns`, keep it limited to structural keys or screening columns that must survive into the reviewer context. Do not pass the full canonical contract column list.
-2. combine the returned bundle with:
-   - `canonical_column_contract_json`
+2. rebuild `canon_contract_json` with the latest canonical-column synthesis code and validate it before reviewer execution
+3. combine the returned bundle with:
+   - `canon_contract_json`
    - `light_contract_decisions`
    - `semantic_context_json`
    - `type_transform_worker_json`
    - `missingness_worker_json`
    - `family_worker_json`
    - `table_layout_worker_json`
-3. run [`prompts/canonical_contract_reviewer_system_prompt.md`](/Users/nikhil/Automations/dify-profiler/prompts/canonical_contract_reviewer_system_prompt.md)
-4. validate the returned JSON, repair once if needed, then resolve one authoritative reviewer envelope containing:
+4. run [`prompts/canonical_contract_reviewer_system_prompt.md`](/Users/nikhil/Automations/dify-profiler/prompts/canonical_contract_reviewer_system_prompt.md)
+5. validate the returned patch JSON, repair once if needed, then resolve one authoritative `canon_review_patch`
+6. apply the resolved patch deterministically to `canon_contract_json`
+7. emit one final `canon_review_json` containing:
    - `review_summary`
    - `reviewed_contract`
    - `change_log`
-   - `review_flags`
-   - `assumptions`
+   - `reviewer_flags`
+   - `reviewer_assumptions`
+   - deprecated compatibility aliases: `review_flags`, `assumptions`
 
-This reviewer is intentionally not a patch-only node. It returns the full edited contract plus an exhaustive change ledger, and the validator enforces that every substantive diff from the draft contract is logged.
+This reviewer is now intentionally patch-only. The LLM no longer returns the full edited contract. It returns a compact `change_set`, and deterministic code applies those row-level edits, recomputes summary counts, and builds the final ledger.
+
+Reviewer patch entries are now LLM-facing `column + field + after_value` edits. The LLM does not emit row indices or `target_path`. Deterministic code resolves the matching row index from `canon_contract_json.column_contracts[*].column` and derives the final `target_path` only for the applied `change_log`.
+
+Post-canonical child-placement hints are builder-owned. If a row is already `child_repeat_member`, neither the builder nor the reviewer should carry `requires_child_table_review` or `requires_wide_to_long_review` in `structural_transform_hints`. Those are pre-placement planning hints, not finalized child-row metadata.
+
+The nested `reviewed_contract` is intended to be standalone. Its `summary` now includes:
+- `review_applied`
+- `review_change_count`
+- `review_changed_column_count`
+- a post-review `overview`
 
 For validator-node use, use:
 - [`JSON validators/canonical_contract_reviewer_validator.json`](/Users/nikhil/Automations/dify-profiler/JSON%20validators/canonical_contract_reviewer_validator.json)
 
+For deterministic apply-node use, use:
+- [`canonical_contract_reviewer_apply_patch_node.py`](/Users/nikhil/Automations/dify-profiler/canonical_contract_reviewer_apply_patch_node.py)
+
 For repair-node use, use:
 - [`prompts/REPAIR_canonical_contract_reviewer.md`](/Users/nikhil/Automations/dify-profiler/prompts/REPAIR_canonical_contract_reviewer.md)
+
+Repair payload guidance:
+- send the original invalid reviewer JSON plus the first validator's `validation_errors_json`
+- do not resend the full reviewer input bundle
+- during rollout only, you may also pass a compact `column_index_map_json` derived from the current `canon_contract_json`; treat it as lookup metadata, not evidence
+
+Debug artifact guidance for local review:
+- prefer unwrapped payload artifacts such as `canon_contract.payload.json`, `canon_review_patch.payload.json`, and `canon_review.payload.json`
+- keep transport wrappers only as optional `*.transport.json` sidecars when HTTP diagnostics are needed
+- the Dify workflow capture rename is still a manual rollout step because no workflow export is checked into this repo
+- to unwrap legacy mixed-format reviewer artifacts in-place, run:
+  - `python scripts/unwrap_canonical_reviewer_artifacts.py Outputs/Placeholder`
 
 For a local reviewer-validator smoke check, run:
 - `python scripts/canonical_contract_reviewer_smoke.py`

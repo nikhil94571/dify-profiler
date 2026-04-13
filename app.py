@@ -11195,6 +11195,11 @@ TYPE_STRUCTURAL_HINTS = {
     "requires_codebook_or_label_mapping_review",
 }
 
+POST_CANONICAL_CHILD_FORBIDDEN_STRUCTURAL_HINTS = {
+    "requires_child_table_review",
+    "requires_wide_to_long_review",
+}
+
 TYPE_INTERPRETATION_HINTS = {
     "leading_zero_risk",
     "identifier_not_measure",
@@ -13080,7 +13085,7 @@ def _cleanup_structural_hints(hints: Iterable[Any], canonical_modeling_status: s
         cleaned = [
             hint
             for hint in cleaned
-            if hint not in {"requires_child_table_review", "requires_wide_to_long_review"}
+            if hint not in POST_CANONICAL_CHILD_FORBIDDEN_STRUCTURAL_HINTS
         ]
     return cleaned
 
@@ -13306,6 +13311,13 @@ def _validate_canonical_column_contract_output(payload: Dict[str, Any], expected
             for item in row.get("structural_transform_hints") or []:
                 if item not in TYPE_STRUCTURAL_HINTS:
                     errors.append(f"{path}.structural_transform_hints contains invalid value: {item}")
+                elif (
+                    row.get("canonical_modeling_status") == "child_repeat_member"
+                    and item in POST_CANONICAL_CHILD_FORBIDDEN_STRUCTURAL_HINTS
+                ):
+                    errors.append(
+                        f"{path}.structural_transform_hints must not contain {item} when canonical_modeling_status is child_repeat_member"
+                    )
 
         if not isinstance(row.get("interpretation_hints"), list):
             errors.append(f"{path}.interpretation_hints must be an array")
@@ -13323,6 +13335,15 @@ def _validate_canonical_column_contract_output(payload: Dict[str, Any], expected
 
         if not isinstance(row.get("skip_logic_protected"), bool):
             errors.append(f"{path}.skip_logic_protected must be boolean")
+        elif row.get("missingness_handling") == "protect_from_null_penalty" and row.get("skip_logic_protected") is not True:
+            errors.append(f"{path}.skip_logic_protected must be true when missingness_handling is protect_from_null_penalty")
+        elif row.get("skip_logic_protected") is True and row.get("missingness_disposition") not in {
+            "structurally_valid_missingness",
+            "partially_structural_missingness",
+        }:
+            errors.append(
+                f"{path}.skip_logic_protected can only be true for structurally_valid_missingness or partially_structural_missingness"
+            )
         if not isinstance(row.get("needs_human_review"), bool):
             errors.append(f"{path}.needs_human_review must be boolean")
         if not isinstance(row.get("confidence"), (int, float)) or isinstance(row.get("confidence"), bool):
@@ -13523,6 +13544,13 @@ def _synthesize_canonical_column_contract(
             "confidence": 0.0,
             "needs_human_review": False,
         }
+
+        if row["missingness_handling"] == "protect_from_null_penalty":
+            row["skip_logic_protected"] = True
+        if row["skip_logic_protected"]:
+            row["interpretation_hints"] = _dedupe_preserve_order(
+                list(row["interpretation_hints"]) + ["skip_logic_protected"]
+            )
 
         row_conflicts = _build_conflict_flags(
             column=column,

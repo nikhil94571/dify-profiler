@@ -228,7 +228,7 @@ PROMPT_SPECS: dict[str, PromptSpec] = {
     "canonical_contract_reviewer_system_prompt.md": PromptSpec(
         min_example_headers=6,
         semantics_terms=(
-            "canonical_column_contract_json",
+            "canon_contract_json",
             "light_contract_decisions",
             "semantic_context_json",
             "type_transform_worker_json",
