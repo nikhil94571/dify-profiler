@@ -33,6 +33,11 @@ SOURCE_KINDS = {
     "residual_grouping",
 }
 
+FAMILY_LIKE_CHILD_SOURCE_KINDS = {
+    "accepted_family",
+    "residual_grouping",
+}
+
 BUILD_STRATEGIES = {
     "direct_select",
     "wide_to_long_family",
@@ -325,16 +330,20 @@ def _validate_table_suggestions(table_suggestions, errors):
                 if tbl["grain_columns"] != expected_grain:
                     _add_error(errors, f"{path}.grain_columns must equal parent_key + repeat_index_name.")
 
-        is_accepted_family = source_basis_valid and tbl["source_basis"]["kind"] == "accepted_family"
+        is_family_like_child = (
+            source_basis_valid
+            and tbl["source_basis"]["kind"] in FAMILY_LIKE_CHILD_SOURCE_KINDS
+            and tbl.get("kind") == "child_repeat"
+        )
 
-        if is_accepted_family:
+        if is_family_like_child:
             if "source_family_id" not in tbl:
-                _add_error(errors, f"{path}.source_family_id is required for accepted-family tables.")
+                _add_error(errors, f"{path}.source_family_id is required for family-like child tables.")
             else:
                 _require_str(tbl["source_family_id"], f"{path}.source_family_id", errors)
 
             if "included_column_count" not in tbl:
-                _add_error(errors, f"{path}.included_column_count is required for accepted-family tables.")
+                _add_error(errors, f"{path}.included_column_count is required for family-like child tables.")
             else:
                 if not isinstance(tbl["included_column_count"], int):
                     _add_error(errors, f"{path}.included_column_count must be an integer.")
@@ -342,12 +351,12 @@ def _validate_table_suggestions(table_suggestions, errors):
                     _add_error(errors, f"{path}.included_column_count must be > 0.")
 
             if "included_columns_preview" not in tbl:
-                _add_error(errors, f"{path}.included_columns_preview is required for accepted-family tables.")
+                _add_error(errors, f"{path}.included_columns_preview is required for family-like child tables.")
             else:
                 _require_string_list(tbl["included_columns_preview"], f"{path}.included_columns_preview", errors, allow_empty=False)
 
             if "included_columns" in tbl and tbl["included_columns"]:
-                _add_error(errors, f"{path}.included_columns must be omitted or empty for accepted-family compact summaries.")
+                _add_error(errors, f"{path}.included_columns must be omitted or empty for family-like child compact summaries.")
         else:
             if "source_family_id" in tbl and tbl["source_family_id"] not in ("", None):
                 _add_error(errors, f"{path}.source_family_id must be omitted or blank for non-family tables.")

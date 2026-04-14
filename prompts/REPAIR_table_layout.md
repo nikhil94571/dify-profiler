@@ -71,8 +71,9 @@ Allowed enums:
 
 Hard invariants:
 - if `kind = child_repeat` and `build_strategy = wide_to_long_family`, `grain_columns` must equal `parent_key + repeat_index_name`
-- accepted-family tables must use compact membership fields: `source_family_id`, `included_column_count`, and `included_columns_preview`
-- accepted-family compact summaries must not restate a full non-empty `included_columns` list
+- family-like child tables must use compact membership fields: `source_family_id`, `included_column_count`, and `included_columns_preview`
+- this applies to `accepted_family` tables and also to `residual_grouping` tables when `kind = child_repeat`
+- family-like child compact summaries must not restate a full non-empty `included_columns` list
 - each `column_table_assignments[].column` must be unique
 - `assigned_table` may be blank only when `assignment_role` is `exclude_from_outputs` or `unresolved`
 - every non-blank `assigned_table` for table-bound roles must match a `table_name` in `table_suggestions`
@@ -80,7 +81,8 @@ Hard invariants:
 
 Repair strategy:
 - if the validation error points to a specific field, minimally repair that field while preserving the rest
-- if an accepted-family table restates the full member inventory, replace it with compact preview/count fields while preserving family identity and assignments
+- if a family-like child table restates the full member inventory, replace it with compact preview/count fields while preserving family identity and assignments
+- if residual child-repeat matrix groupings are missing `source_family_id`, synthesize a stable family id and reuse it consistently on the matching `melt_member` rows
 - if a `wide_to_long_family` child table omits the derived repeat index from `grain_columns`, add it
 - if `assignment_role` is `exclude_from_outputs` or `unresolved`, preserve a blank `assigned_table` instead of inventing a pseudo-table name
 - prefer fixing schema and enumeration issues before changing substantive layout decisions

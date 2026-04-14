@@ -221,11 +221,14 @@ You MUST use exactly one of:
 - `assigned_table` may be blank only when `assignment_role` is `exclude_from_outputs` or `unresolved`
 - every non-blank `assigned_table` for table-bound roles must match a `table_name` in `table_suggestions`
 - if `kind = child_repeat` and `build_strategy = wide_to_long_family`, `grain_columns` must equal `parent_key + repeat_index_name`
-- for `source_basis.kind = accepted_family`, use compact family summary fields:
+- for family-like child tables, use compact family summary fields:
+  - applies to `source_basis.kind = accepted_family`
+  - also applies to `source_basis.kind = residual_grouping` when `kind = child_repeat`
   - `source_family_id`
   - `included_column_count`
   - `included_columns_preview`
-- for accepted families, `included_columns` must be omitted or empty
+- for family-like child tables, `included_columns` must be omitted or empty
+- residual child-repeat matrix groupings must synthesize a stable `source_family_id` (for example `q_15_main_cell_group`) and use that same id on every related `melt_member` assignment
 
 ## 6) ARTIFACT / INPUT SEMANTICS
 
