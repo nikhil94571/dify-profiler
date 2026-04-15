@@ -52,4 +52,5 @@ scripts/*
 !scripts/canonical_column_contract_smoke.py
 !scripts/validator_normalization_smoke.py
 !scripts/audit_system_prompts.py
+!scripts/scale_mapping_smoke.py
 scripts/__pycache__/

@@ -12,6 +12,7 @@ CANONICAL_MODELING_STATUSES = {
 
 CANONICAL_TYPE_DECISION_SOURCES = {
     "reviewed_type_worker",
+    "scale_mapping_resolver",
     "family_default",
     "a17_baseline",
     "unresolved_no_a2_evidence",
@@ -33,6 +34,7 @@ CANONICAL_MISSINGNESS_DECISION_SOURCES = {
 CANONICAL_SEMANTIC_DECISION_SOURCES = {
     "semantic_context_worker",
     "family_worker",
+    "scale_mapping_resolver",
     "unknown",
 }
 

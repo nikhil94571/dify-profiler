@@ -735,6 +735,7 @@ def main():
         missingness_worker_json=inputs["missingness_worker_json"],
         family_worker_json=inputs["family_worker_json"],
         table_layout_worker_json=inputs["table_layout_worker_json"],
+        scale_mapping_json={},
         support=support,
     )
 
@@ -763,6 +764,7 @@ def main():
         missingness_worker_json=inputs["missingness_worker_json"],
         family_worker_json=inputs["family_worker_json"],
         table_layout_worker_json=inputs["table_layout_worker_json"],
+        scale_mapping_json={},
         support=support,
     )
     skipped_validation = app_validator(
@@ -889,6 +891,7 @@ def main():
         missingness_worker_json=family_default_leak_inputs["missingness_worker_json"],
         family_worker_json=family_default_leak_inputs["family_worker_json"],
         table_layout_worker_json=family_default_leak_inputs["table_layout_worker_json"],
+        scale_mapping_json={},
         support=support,
     )
     q18_family_leak_row = _row_by_column(family_default_leak_result["column_contracts"], "Q18Main_cell_groupRow2")

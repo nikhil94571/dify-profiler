@@ -34,6 +34,7 @@ from google.auth import impersonated_credentials
 
 from xlsx_export import (
     DEFAULT_OVERRIDE_FIELDS,
+    DEFAULT_SCALE_MAPPING_HEADERS,
     build_light_contract_xlsx_bytes,
     build_xlsx_bytes,
     parse_light_contract_xlsx_bytes,
@@ -44,6 +45,11 @@ try:
     from dateutil import parser as dateparser  # optional fallback
 except Exception:
     dateparser = None
+
+try:
+    from pypdf import PdfReader  # optional for codebook extraction
+except Exception:
+    PdfReader = None
 
 app = FastAPI()
 bearer = HTTPBearer(auto_error=True)
@@ -2702,6 +2708,15 @@ class CanonicalColumnContractRequest(BaseModel):
     missingness_worker_json: Any
     family_worker_json: Any
     table_layout_worker_json: Any
+    scale_mapping_json: Any = None
+    debug: bool = False
+
+
+class ScaleMappingResolverRequest(BaseModel):
+    run_id: str
+    light_contract_decisions: Any
+    family_worker_json: Any
+    scale_mapping_extractor_json: Any = None
     debug: bool = False
 
 
@@ -2781,6 +2796,20 @@ def _upload_json_to_run_object(run_id: str, object_name: str, payload: Dict[str,
         raise HTTPException(status_code=500, detail=f"Failed to persist light contract context: {exc}") from exc
 
 
+def _upload_bytes_to_run_object(run_id: str, object_name: str, payload: bytes, *, content_type: str) -> str:
+    bucket_name = os.getenv("EXPORT_BUCKET")
+    if not bucket_name:
+        raise HTTPException(status_code=500, detail="Missing EXPORT_BUCKET env var")
+    try:
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(f"runs/{run_id}/{object_name}")
+        blob.upload_from_string(payload, content_type=content_type)
+        return blob.name
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to persist run object: {exc}") from exc
+
+
 def _load_json_from_run_object(run_id: str, object_name: str) -> Dict[str, Any]:
     bucket_name = os.getenv("EXPORT_BUCKET")
     if not bucket_name:
@@ -2798,6 +2827,69 @@ def _load_json_from_run_object(run_id: str, object_name: str) -> Dict[str, Any]:
         raise HTTPException(status_code=503, detail=f"Failed to load light contract context: {exc}") from exc
 
 
+def _load_bytes_from_run_object(run_id: str, object_name: str) -> bytes:
+    bucket_name = os.getenv("EXPORT_BUCKET")
+    if not bucket_name:
+        raise HTTPException(status_code=500, detail="Missing EXPORT_BUCKET env var")
+    try:
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(f"runs/{run_id}/{object_name}")
+        if not blob.exists(client):
+            raise HTTPException(status_code=404, detail=f"{object_name} not found for run_id")
+        return blob.download_as_bytes()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to load run object: {exc}") from exc
+
+
+def _sign_run_object_download(
+    run_id: str,
+    object_name: str,
+    *,
+    filename: str,
+    content_type: str,
+) -> str:
+    bucket_name = os.getenv("EXPORT_BUCKET")
+    if not bucket_name:
+        raise HTTPException(status_code=500, detail="Missing EXPORT_BUCKET env var")
+
+    ttl_minutes = int(os.getenv("EXPORT_SIGNED_URL_TTL_MINUTES", "30"))
+    object_path = f"runs/{run_id}/{object_name}"
+    try:
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(object_path)
+        if not blob.exists(client):
+            raise HTTPException(status_code=404, detail=f"{object_name} not found for run_id")
+
+        signing_sa = os.getenv("EXPORT_SIGNER_SERVICE_ACCOUNT")
+        if not signing_sa:
+            raise HTTPException(status_code=500, detail="Missing EXPORT_SIGNER_SERVICE_ACCOUNT env var")
+
+        source_creds, _ = google.auth.default()
+        signing_creds = impersonated_credentials.Credentials(
+            source_credentials=source_creds,
+            target_principal=signing_sa,
+            target_scopes=["https://www.googleapis.com/auth/devstorage.read_only"],
+            lifetime=3600,
+        )
+
+        return blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(minutes=ttl_minutes),
+            method="GET",
+            response_disposition=f'attachment; filename="{filename}"',
+            response_type=content_type,
+            credentials=signing_creds,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to sign run object download: {exc}") from exc
+
+
 def _persist_light_contract_decisions(run_id: str, handoff: Dict[str, Any], source: str) -> Tuple[Dict[str, Any], str]:
     decisions = dict(handoff)
     decisions["run_id"] = run_id
@@ -2806,6 +2898,444 @@ def _persist_light_contract_decisions(run_id: str, handoff: Dict[str, Any], sour
     decisions.setdefault("parse_validation", {})
     object_path = _upload_json_to_run_object(run_id, "light_contract_decisions.json", decisions)
     return decisions, object_path
+
+
+def _load_optional_json_from_run_object(run_id: str, object_name: str) -> Optional[Dict[str, Any]]:
+    try:
+        return _load_json_from_run_object(run_id, object_name)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            return None
+        raise
+
+
+def _extract_codebook_pages(pdf_bytes: bytes) -> List[Dict[str, Any]]:
+    if PdfReader is None:
+        raise HTTPException(
+            status_code=500,
+            detail="pypdf is not installed, so PDF codebook extraction is unavailable",
+        )
+
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to parse codebook PDF: {exc}") from exc
+
+    pages: List[Dict[str, Any]] = []
+    for idx, page in enumerate(reader.pages, start=1):
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            text = ""
+        normalized = re.sub(r"\s+", " ", text).strip()
+        pages.append(
+            {
+                "page_number": idx,
+                "text": normalized,
+                "char_count": len(normalized),
+            }
+        )
+    return pages
+
+
+def _preview_values_from_a2_row(a2_row: Dict[str, Any], *, limit: int = 8) -> List[str]:
+    values: List[str] = []
+    for value in (a2_row.get("top_levels") or []):
+        text = str(value).strip()
+        if text:
+            values.append(text)
+    sample_groups = a2_row.get("a2_samples") or {}
+    if isinstance(sample_groups, dict):
+        for bucket in ("head", "random", "tail"):
+            for value in sample_groups.get(bucket) or []:
+                text = str(value).strip()
+                if text:
+                    values.append(text)
+    return _dedupe_preserve_order(values)[:max(0, limit)]
+
+
+def _semantic_text_has_mapping_cues(text: Any) -> bool:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return False
+    cues = [
+        "likert",
+        "familiarity scale",
+        "agreement scale",
+        "frequency scale",
+        "rating scale",
+        "ordered labels",
+        "strongly agree",
+        "strongly disagree",
+        "very familiar",
+        "never heard",
+        "label mapping",
+        "1=",
+        "2=",
+        "3=",
+    ]
+    return any(cue in lowered for cue in cues)
+
+
+def _reverse_family_column_map(family_by_column: Dict[str, str]) -> Dict[str, List[str]]:
+    reverse: Dict[str, List[str]] = {}
+    for column, family_id in family_by_column.items():
+        if not family_id:
+            continue
+        reverse.setdefault(family_id, []).append(column)
+    for family_id in reverse:
+        reverse[family_id] = sorted(reverse[family_id])
+    return reverse
+
+
+def _looks_scale_like_values(values: Iterable[Any]) -> bool:
+    cleaned = [str(value).strip() for value in values if str(value).strip()]
+    if not cleaned:
+        return False
+    lowered = [value.lower() for value in cleaned]
+    return (
+        any(any(token in value for token in LIKERT_TOKENS) for value in lowered)
+        or any(re.search(r"\b(?:never heard|very familiar|strongly agree|strongly disagree|neutral|somewhat)\b", value) for value in lowered)
+        or any(re.search(r"\b\d+\b", value) for value in cleaned)
+    )
+
+
+def _infer_scale_kind(values: Iterable[Any], semantic_text: str) -> str:
+    blob = f"{semantic_text or ''} {' '.join(str(v) for v in values)}".lower()
+    if "familiar" in blob or "never heard" in blob:
+        return "familiarity_scale"
+    if "agree" in blob or "disagree" in blob:
+        return "agreement_scale"
+    if "frequency" in blob or "often" in blob or "rarely" in blob or "never" in blob:
+        return "frequency_scale"
+    if "satisf" in blob or "rating" in blob:
+        return "rating_scale"
+    return "ordinal_scale"
+
+
+def _extract_numeric_suffix(value: str) -> Optional[float]:
+    match = re.search(r"([+-]?\d+(?:\.\d+)?)\s*$", str(value or "").strip())
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _deterministic_scale_inference(
+    *,
+    target_kind: str,
+    target_id: str,
+    observed_values: List[str],
+    semantic_text: str,
+) -> Optional[Dict[str, Any]]:
+    values = _dedupe_preserve_order(observed_values)
+    if len(values) < 2 or not _looks_scale_like_values(values):
+        return None
+
+    numeric_pairs: List[Tuple[float, str]] = []
+    for value in values:
+        numeric = _extract_numeric_suffix(value)
+        if numeric is None:
+            numeric_pairs = []
+            break
+        numeric_pairs.append((numeric, value))
+
+    ordered_labels = values
+    label_to_numeric_score: Dict[str, float] = {}
+    if numeric_pairs and len({pair[0] for pair in numeric_pairs}) == len(values):
+        ordered_labels = [label for _, label in sorted(numeric_pairs, key=lambda item: item[0])]
+        label_to_numeric_score = {label: score for score, label in sorted(numeric_pairs, key=lambda item: item[0])}
+
+    return {
+        "target_kind": target_kind,
+        "target_id": target_id,
+        "mapping_status": "deterministic_inferred",
+        "response_scale_kind": _infer_scale_kind(ordered_labels, semantic_text),
+        "ordered_labels": ordered_labels,
+        "label_to_ordinal_position": {label: idx + 1 for idx, label in enumerate(ordered_labels)},
+        "label_to_numeric_score": label_to_numeric_score,
+        "numeric_score_semantics_confirmed": False,
+        "source": "deterministic_safe_inference",
+        "notes": "Deterministic inference from observed ordered labels; numeric scoring remains advisory until human or codebook confirmation.",
+        "confidence": 0.72 if label_to_numeric_score else 0.64,
+    }
+
+
+def _normalize_scale_mapping_contract(
+    payload: Any,
+    *,
+    known_columns: Set[str],
+    known_family_ids: Set[str],
+) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {"mappings": [], "by_target": {}, "extra_targets": set()}
+
+    by_target: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    extra_targets: Set[str] = set()
+    mappings: List[Dict[str, Any]] = []
+
+    for mapping in _coerce_list_of_dicts(payload.get("mappings")):
+        target_kind = str(mapping.get("target_kind") or "").strip()
+        target_id = str(mapping.get("target_id") or "").strip()
+        if target_kind not in {"family", "column"} or not target_id:
+            continue
+        if target_kind == "family" and target_id not in known_family_ids:
+            extra_targets.add(f"family:{target_id}")
+            continue
+        if target_kind == "column" and target_id not in known_columns:
+            extra_targets.add(f"column:{target_id}")
+            continue
+
+        ordered_labels = [
+            str(label).strip()
+            for label in (mapping.get("ordered_labels") or [])
+            if str(label or "").strip()
+        ]
+        ordinal_map = mapping.get("label_to_ordinal_position") if isinstance(mapping.get("label_to_ordinal_position"), dict) else {}
+        numeric_map = mapping.get("label_to_numeric_score") if isinstance(mapping.get("label_to_numeric_score"), dict) else {}
+
+        normalized = {
+            "target_kind": target_kind,
+            "target_id": target_id,
+            "mapping_status": str(mapping.get("mapping_status") or "unresolved").strip(),
+            "response_scale_kind": str(mapping.get("response_scale_kind") or "").strip(),
+            "ordered_labels": ordered_labels,
+            "label_to_ordinal_position": {
+                str(label).strip(): int(position)
+                for label, position in ordinal_map.items()
+                if str(label or "").strip() and isinstance(position, (int, float)) and not isinstance(position, bool)
+            },
+            "label_to_numeric_score": {
+                str(label).strip(): float(score)
+                for label, score in numeric_map.items()
+                if str(label or "").strip() and isinstance(score, (int, float)) and not isinstance(score, bool)
+            },
+            "numeric_score_semantics_confirmed": bool(mapping.get("numeric_score_semantics_confirmed", False)),
+            "source": str(mapping.get("source") or "").strip(),
+            "notes": str(mapping.get("notes") or "").strip(),
+            "confidence": round(max(0.0, min(1.0, _safe_float(mapping.get("confidence"), 0.0))), 6),
+        }
+        mappings.append(normalized)
+        by_target[(target_kind, target_id)] = normalized
+
+    return {
+        "mappings": mappings,
+        "by_target": by_target,
+        "extra_targets": extra_targets,
+    }
+
+
+def _validate_scale_mapping_contract(
+    payload: Any,
+    *,
+    known_columns: Set[str],
+    known_family_ids: Set[str],
+) -> List[str]:
+    errors: List[str] = []
+    if not isinstance(payload, dict):
+        return ["scale mapping payload must be an object"]
+
+    for key in ("worker", "summary", "mappings", "review_flags", "assumptions"):
+        if key not in payload:
+            errors.append(f"Missing required top-level key: {key}")
+    if payload.get("worker") != "scale_mapping_extractor" and payload.get("worker") != "scale_mapping_resolver":
+        errors.append("worker must be 'scale_mapping_extractor' or 'scale_mapping_resolver'")
+
+    mappings = payload.get("mappings")
+    if not isinstance(mappings, list):
+        errors.append("mappings must be an array")
+        return errors
+
+    seen: Set[Tuple[str, str]] = set()
+    for idx, mapping in enumerate(mappings):
+        path = f"mappings[{idx}]"
+        if not isinstance(mapping, dict):
+            errors.append(f"{path} must be an object")
+            continue
+        for key in (
+            "target_kind",
+            "target_id",
+            "mapping_status",
+            "response_scale_kind",
+            "ordered_labels",
+            "label_to_ordinal_position",
+            "label_to_numeric_score",
+            "numeric_score_semantics_confirmed",
+            "source",
+            "notes",
+            "confidence",
+        ):
+            if key not in mapping:
+                errors.append(f"{path}.{key} is required")
+        target_kind = str(mapping.get("target_kind") or "").strip()
+        target_id = str(mapping.get("target_id") or "").strip()
+        if target_kind not in {"family", "column"}:
+            errors.append(f"{path}.target_kind must be family or column")
+        if not target_id:
+            errors.append(f"{path}.target_id must be non-empty")
+        target_key = (target_kind, target_id)
+        if target_key in seen:
+            errors.append(f"Duplicate mapping target: {target_kind}:{target_id}")
+        else:
+            seen.add(target_key)
+        if target_kind == "family" and target_id and target_id not in known_family_ids:
+            errors.append(f"{path}.target_id does not resolve to a known family_id")
+        if target_kind == "column" and target_id and target_id not in known_columns:
+            errors.append(f"{path}.target_id does not resolve to a known source column")
+        if str(mapping.get("mapping_status") or "").strip() not in {
+            "human_confirmed",
+            "codebook_confirmed",
+            "deterministic_inferred",
+            "unresolved",
+        }:
+            errors.append(f"{path}.mapping_status is invalid")
+        ordered_labels = mapping.get("ordered_labels")
+        if not isinstance(ordered_labels, list):
+            errors.append(f"{path}.ordered_labels must be an array")
+        elif ordered_labels:
+            for label_idx, label in enumerate(ordered_labels):
+                if not isinstance(label, str) or not label.strip():
+                    errors.append(f"{path}.ordered_labels[{label_idx}] must be a non-empty string")
+        ordinal_map = mapping.get("label_to_ordinal_position")
+        if not isinstance(ordinal_map, dict):
+            errors.append(f"{path}.label_to_ordinal_position must be an object")
+        numeric_map = mapping.get("label_to_numeric_score")
+        if not isinstance(numeric_map, dict):
+            errors.append(f"{path}.label_to_numeric_score must be an object")
+        if not isinstance(mapping.get("numeric_score_semantics_confirmed"), bool):
+            errors.append(f"{path}.numeric_score_semantics_confirmed must be boolean")
+        confidence = mapping.get("confidence")
+        if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
+            errors.append(f"{path}.confidence must be numeric")
+        elif not (0.0 <= float(confidence) <= 1.0):
+            errors.append(f"{path}.confidence must be between 0 and 1")
+    return errors
+
+
+def _build_scale_mapping_bundle(
+    *,
+    run_id: str,
+    light_contract_decisions: Dict[str, Any],
+    family_worker_json: Any,
+) -> Dict[str, Any]:
+    support = _load_canonical_support_artifacts(run_id)
+    family_results_by_id = _extract_family_results(family_worker_json)
+    light_contract_maps = _normalize_light_contract_maps(light_contract_decisions)
+    family_by_column = dict(support["family_by_column"])
+    reverse_family_map = _reverse_family_column_map(family_by_column)
+
+    structured_human_mappings = _normalize_light_contract_scale_mapping_input(
+        light_contract_decisions.get("scale_mapping_input") or light_contract_decisions.get("scale_mapping_rows") or []
+    )
+    semantic_context_input = light_contract_decisions.get("semantic_context_input") or {}
+    raw_semantic_notes = {
+        "dataset_context_and_collection_notes": str(semantic_context_input.get("dataset_context_and_collection_notes") or "").strip(),
+        "semantic_codebook_and_important_variables": str(semantic_context_input.get("semantic_codebook_and_important_variables") or "").strip(),
+    }
+
+    accepted_family_ids = _dedupe_preserve_order(
+        list(family_results_by_id.keys())
+        + list((light_contract_maps.get("family_by_id") or {}).keys())
+        + list(reverse_family_map.keys())
+    )
+
+    accepted_families: List[Dict[str, Any]] = []
+    for family_id in accepted_family_ids:
+        family_result = family_results_by_id.get(family_id) or {}
+        member_columns = reverse_family_map.get(family_id, [])
+        observed_values: List[str] = []
+        for column in member_columns[:6]:
+            a2_row = support["a2_by_col"].get(column) or {}
+            observed_values.extend(_preview_values_from_a2_row(a2_row, limit=4))
+        accepted_families.append(
+            {
+                "family_id": family_id,
+                "recommended_family_role": str(family_result.get("recommended_family_role") or "").strip(),
+                "member_semantics_notes": str(family_result.get("member_semantics_notes") or "").strip(),
+                "member_columns_preview": member_columns[:8],
+                "member_column_count": len(member_columns),
+                "observed_value_preview": _dedupe_preserve_order(observed_values)[:12],
+            }
+        )
+
+    candidate_standalone_columns: List[Dict[str, Any]] = []
+    for a2_row in support["a2_rows"]:
+        column = str(a2_row.get("column") or "").strip()
+        if not column or column in family_by_column:
+            continue
+        preview_values = _preview_values_from_a2_row(a2_row, limit=8)
+        unique_count = int(a2_row.get("unique_count") or 0)
+        if unique_count > 12 or not _looks_scale_like_values(preview_values):
+            continue
+        candidate_standalone_columns.append(
+            {
+                "column": column,
+                "observed_value_preview": preview_values,
+                "unique_count": unique_count,
+                "top_candidate_type": str((a2_row.get("top_candidate") or {}).get("type") or "").strip(),
+            }
+        )
+        if len(candidate_standalone_columns) >= 24:
+            break
+
+    codebook_document = _load_optional_json_from_run_object(run_id, "codebook_document.json") or {}
+    codebook_pages = _load_optional_json_from_run_object(run_id, "codebook_pages.json") or {}
+    page_records = _coerce_list_of_dicts(codebook_pages.get("pages"))
+
+    query_terms = _dedupe_preserve_order(
+        [mapping.get("target_id") for mapping in structured_human_mappings]
+        + [mapping.get("response_scale_kind") for mapping in structured_human_mappings]
+        + [label for mapping in structured_human_mappings for label in (mapping.get("ordered_labels") or [])]
+        + [family.get("family_id") for family in accepted_families]
+        + [column.get("column") for column in candidate_standalone_columns]
+        + _split_mapping_text_list(raw_semantic_notes.get("semantic_codebook_and_important_variables"), allow_comma_fallback=False)
+    )
+
+    relevant_page_snippets: List[Dict[str, Any]] = []
+    if page_records and query_terms:
+        scored_pages: List[Tuple[int, Dict[str, Any], List[str]]] = []
+        for page in page_records:
+            text = str(page.get("text") or "")
+            lowered = text.lower()
+            matched_terms = [term for term in query_terms if term and term.lower() in lowered]
+            if matched_terms:
+                scored_pages.append((len(matched_terms), page, matched_terms[:8]))
+        for _, page, matched_terms in sorted(scored_pages, key=lambda item: (-item[0], int(item[1].get("page_number") or 0)))[:6]:
+            text = str(page.get("text") or "")
+            snippet = text[:1600]
+            relevant_page_snippets.append(
+                {
+                    "page_number": int(page.get("page_number") or 0),
+                    "matched_terms": matched_terms,
+                    "snippet": snippet,
+                }
+            )
+
+    codebook_present = bool(codebook_document.get("object_path"))
+    has_mapping_evidence = bool(
+        structured_human_mappings
+        or codebook_present
+        or _semantic_text_has_mapping_cues(raw_semantic_notes.get("semantic_codebook_and_important_variables"))
+    )
+
+    return {
+        "bundle_version": "1",
+        "has_mapping_evidence": has_mapping_evidence,
+        "structured_human_mappings": structured_human_mappings,
+        "raw_semantic_notes": raw_semantic_notes,
+        "accepted_families": accepted_families,
+        "candidate_standalone_columns": candidate_standalone_columns,
+        "codebook_context": {
+            "present": codebook_present,
+            "document_filename": str(codebook_document.get("filename") or "").strip(),
+            "document_object_path": str(codebook_document.get("object_path") or "").strip(),
+            "document_signed_url": str(codebook_document.get("signed_url") or "").strip(),
+            "page_count": int(codebook_document.get("page_count") or 0),
+            "relevant_page_snippets": relevant_page_snippets,
+        },
+    }
 
 
 def _first_non_empty(items: List[Any]) -> str:
@@ -3164,6 +3694,27 @@ def _build_override_rows(grain_worker_output: Dict[str, Any]) -> List[Dict[str, 
     return rows
 
 
+def _build_scale_mapping_rows(column_guide_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    seen_family_ids: Set[str] = set()
+    for row in column_guide_rows:
+        family_id = str(row.get("family_id") or "").strip()
+        if not family_id or family_id in seen_family_ids:
+            continue
+        seen_family_ids.add(family_id)
+        rows.append(
+            {
+                "target_kind": "family",
+                "target_id": family_id,
+                "response_scale_kind": "",
+                "ordered_labels_low_to_high": "",
+                "numeric_scores_low_to_high": "",
+                "notes": "",
+            }
+        )
+    return rows
+
+
 def _keys_from_row(row: Dict[str, Any], prefix: str) -> List[str]:
     return [
         str(row.get(f"{prefix}_key_{idx}") or "").strip()
@@ -3184,9 +3735,85 @@ def _extract_semantic_context_input(override_rows: List[Dict[str, Any]]) -> Dict
     }
 
 
+def _split_mapping_text_list(raw_value: Any, *, allow_comma_fallback: bool = False) -> List[str]:
+    text = str(raw_value or "").strip()
+    if not text:
+        return []
+    if "|" in text:
+        parts = text.split("|")
+    elif "\n" in text:
+        parts = text.splitlines()
+    elif ";" in text:
+        parts = text.split(";")
+    elif allow_comma_fallback and "," in text:
+        parts = text.split(",")
+    else:
+        parts = [text]
+    return [str(part).strip() for part in parts if str(part).strip()]
+
+
+def _normalize_light_contract_scale_mapping_input(scale_mapping_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    seen_targets: Set[Tuple[str, str]] = set()
+    for row in scale_mapping_rows or []:
+        if not isinstance(row, dict):
+            continue
+
+        target_kind = str(row.get("target_kind") or "").strip().lower()
+        target_id = str(row.get("target_id") or "").strip()
+        response_scale_kind = str(row.get("response_scale_kind") or "").strip()
+        if isinstance(row.get("ordered_labels"), list):
+            ordered_labels = [str(value).strip() for value in (row.get("ordered_labels") or []) if str(value or "").strip()]
+        else:
+            ordered_labels = _split_mapping_text_list(row.get("ordered_labels_low_to_high"))
+        if isinstance(row.get("numeric_scores"), list):
+            numeric_scores_raw = [str(value).strip() for value in (row.get("numeric_scores") or []) if str(value or "").strip()]
+        else:
+            numeric_scores_raw = _split_mapping_text_list(
+                row.get("numeric_scores_low_to_high"),
+                allow_comma_fallback=True,
+            )
+        notes = str(row.get("notes") or "").strip()
+
+        if not target_id and not ordered_labels and not numeric_scores_raw and not response_scale_kind and not notes:
+            continue
+        if target_kind not in {"family", "column"} or not target_id:
+            continue
+
+        numeric_scores: List[float] = []
+        numeric_scores_valid = True
+        for score in numeric_scores_raw:
+            try:
+                numeric_scores.append(float(score))
+            except (TypeError, ValueError):
+                numeric_scores_valid = False
+                break
+        if not numeric_scores_valid:
+            numeric_scores = []
+        if numeric_scores and ordered_labels and len(numeric_scores) != len(ordered_labels):
+            numeric_scores = []
+
+        dedupe_key = (target_kind, target_id)
+        if dedupe_key in seen_targets:
+            continue
+        seen_targets.add(dedupe_key)
+        normalized.append(
+            {
+                "target_kind": target_kind,
+                "target_id": target_id,
+                "response_scale_kind": response_scale_kind,
+                "ordered_labels": ordered_labels,
+                "numeric_scores": numeric_scores,
+                "notes": notes,
+            }
+        )
+    return normalized
+
+
 def _build_accepted_light_contract_handoff(contract_payload: Dict[str, Any]) -> Dict[str, Any]:
     primary_row = (contract_payload.get("primary_grain_rows") or [{}])[0] if contract_payload.get("primary_grain_rows") else {}
     override_rows = contract_payload.get("override_rows") or []
+    scale_mapping_rows = contract_payload.get("scale_mapping_rows") or []
     override_notes = {
         str(row.get("field") or ""): str(row.get("user_input") or "")
         for row in override_rows
@@ -3216,6 +3843,7 @@ def _build_accepted_light_contract_handoff(contract_payload: Dict[str, Any]) -> 
         ],
         "override_notes": override_notes,
         "semantic_context_input": _extract_semantic_context_input(override_rows),
+        "scale_mapping_input": _normalize_light_contract_scale_mapping_input(scale_mapping_rows),
         "parse_validation": {
             "source": "stored_recommendation",
             "run_id_match": True,
@@ -3265,6 +3893,7 @@ def _build_parsed_light_contract_handoff(run_id: str, parsed_workbook: Dict[str,
         })
 
     override_rows = parsed_workbook.get("override_rows") or []
+    scale_mapping_rows = parsed_workbook.get("scale_mapping_rows") or []
     override_notes = {
         str(row.get("field") or ""): str(row.get("user_input") or "")
         for row in override_rows
@@ -3284,6 +3913,7 @@ def _build_parsed_light_contract_handoff(run_id: str, parsed_workbook: Dict[str,
         "family_decisions": family_decisions,
         "override_notes": override_notes,
         "semantic_context_input": _extract_semantic_context_input(override_rows),
+        "scale_mapping_input": _normalize_light_contract_scale_mapping_input(scale_mapping_rows),
         "parse_validation": {
             "source": "uploaded_workbook",
             "workbook_run_id": workbook_run_id,
@@ -3317,6 +3947,7 @@ def _normalize_light_contract_payload(run_id: str, grain_worker_output: Dict[str
         "reference_rows": _build_reference_rows(grain_worker_output),
         "repeat_family_rows": _build_repeat_family_rows(grain_worker_output, structural_gate_rows),
         "structural_gate_rows": structural_gate_rows,
+        "scale_mapping_rows": _build_scale_mapping_rows(column_guide_rows),
         "override_rows": _build_override_rows(grain_worker_output),
     }
 
@@ -3467,6 +4098,80 @@ async def finalize_modified_light_contract(
         "light_contract_decisions": decisions,
         "object_path": object_path,
         "parsed_workbook": parsed,
+    }
+
+
+@app.post("/codebooks/upload")
+async def upload_codebook(
+    run_id: str = Form(...),
+    file: UploadFile = File(...),
+    _: None = Depends(require_token),
+):
+    filename = str(file.filename or "").strip() or "codebook.pdf"
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=415, detail="Expected a PDF codebook upload")
+
+    payload = await file.read()
+    if not payload:
+        raise HTTPException(status_code=400, detail="Uploaded codebook is empty")
+
+    object_name = "codebook.pdf"
+    object_path = _upload_bytes_to_run_object(
+        run_id,
+        object_name,
+        payload,
+        content_type="application/pdf",
+    )
+    pages = _extract_codebook_pages(payload)
+    pages_payload = {
+        "run_id": run_id,
+        "filename": filename,
+        "page_count": len(pages),
+        "pages": pages,
+    }
+    pages_object_path = _upload_json_to_run_object(run_id, "codebook_pages.json", pages_payload)
+    signed_url = _sign_run_object_download(
+        run_id,
+        object_name,
+        filename=filename,
+        content_type="application/pdf",
+    )
+    document_payload = {
+        "run_id": run_id,
+        "filename": filename,
+        "object_name": object_name,
+        "object_path": object_path,
+        "page_count": len(pages),
+        "pages_object_path": pages_object_path,
+        "signed_url": signed_url,
+        "uploaded_at": pd.Timestamp.utcnow().isoformat(),
+    }
+    _upload_json_to_run_object(run_id, "codebook_document.json", document_payload)
+
+    return {
+        "run_id": run_id,
+        "filename": filename,
+        "object_path": object_path,
+        "pages_object_path": pages_object_path,
+        "page_count": len(pages),
+        "signed_url": signed_url,
+    }
+
+
+@app.get("/codebooks/context")
+def get_codebook_context(
+    run_id: str,
+    _: None = Depends(require_token),
+):
+    document = _load_json_from_run_object(run_id, "codebook_document.json")
+    pages = _load_optional_json_from_run_object(run_id, "codebook_pages.json") or {"pages": []}
+    return {
+        "run_id": run_id,
+        "codebook_document": document,
+        "codebook_pages": {
+            "page_count": int(document.get("page_count") or 0),
+            "pages_preview": _coerce_list_of_dicts(pages.get("pages"))[:3],
+        },
     }
 
 
@@ -6503,6 +7208,8 @@ class ArtifactBundleRequest(BaseModel):
     artifact_ids: Optional[List[str]] = None
     global_scope: ArtifactBundleScope = Field(default_factory=lambda: ArtifactBundleScope(mode="raw"), alias="global")
     per_artifact: Optional[Dict[str, ArtifactBundleScope]] = None
+    light_contract_decisions: Optional[Any] = None
+    family_worker_json: Optional[Any] = None
     policy_overrides: Optional[Dict[str, Dict[str, Any]]] = None
     replace_policies: Optional[List[str]] = None
     transform_overrides: Optional[Dict[str, Any]] = None
@@ -10538,6 +11245,16 @@ def _run_pruning_smoke_checks() -> None:
         "reference_rows": [],
         "repeat_family_rows": [],
         "structural_gate_rows": [],
+        "scale_mapping_rows": [
+            {
+                "target_kind": "family",
+                "target_id": "q_9_main_cell_group",
+                "response_scale_kind": "familiarity_scale",
+                "ordered_labels_low_to_high": "Never Heard of It 0|Very Familiar 6",
+                "numeric_scores_low_to_high": "",
+                "notes": "Optional structured scale mapping.",
+            }
+        ],
         "override_rows": light_contract_override_rows,
     }
     accepted_handoff = _build_accepted_light_contract_handoff(light_contract_payload)
@@ -10547,6 +11264,7 @@ def _run_pruning_smoke_checks() -> None:
         "dataset_context_and_collection_notes": "Survey of customer onboarding. One row is one submitted response. Form logic changed after wave 2.",
         "semantic_codebook_and_important_variables": "Q12 is the master switch. StatusCode values 1=active, 2=paused.",
     }
+    assert accepted_handoff.get("scale_mapping_input", [])[0].get("target_id") == "q_9_main_cell_group"
 
     legacy_light_contract_payload = dict(light_contract_payload)
     legacy_light_contract_payload.pop("reference_rows", None)
@@ -10575,6 +11293,7 @@ def _run_pruning_smoke_checks() -> None:
     parsed_handoff = _build_parsed_light_contract_handoff("run_smoke", parsed_light_contract)
     assert parsed_handoff.get("reference_decisions") == parsed_handoff.get("dimension_decisions")
     assert parsed_handoff.get("semantic_context_input") == accepted_handoff.get("semantic_context_input")
+    assert parsed_handoff.get("scale_mapping_input") == accepted_handoff.get("scale_mapping_input")
     assert parsed_handoff.get("override_notes", {}).get("semantic_codebook_and_important_variables") == "Q12 is the master switch. StatusCode values 1=active, 2=paused."
 
 
@@ -10863,6 +11582,42 @@ def _build_view_response(kind: str, payload: Any, report: Dict[str, Any], debug:
     raise HTTPException(status_code=415, detail="Artifact view supports only JSON/JSONL. Use /download for raw bytes.")
 
 
+def _coerce_bundle_input_json(value: Any, field_name: str) -> Any:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=422, detail=f"{field_name} must be valid JSON when provided as a string") from exc
+    raise HTTPException(status_code=422, detail=f"{field_name} must be a JSON object, array, stringified JSON, or null")
+
+
+def _build_scale_mapping_worker_bundle_response(req: ArtifactBundleRequest) -> Dict[str, Any]:
+    light_contract_decisions = _coerce_bundle_input_json(req.light_contract_decisions, "light_contract_decisions")
+    if light_contract_decisions is None:
+        light_contract_decisions = _load_json_from_run_object(req.run_id, "light_contract_decisions.json")
+    if not isinstance(light_contract_decisions, dict):
+        raise HTTPException(status_code=422, detail="light_contract_decisions must resolve to a JSON object")
+
+    family_worker_json = _coerce_bundle_input_json(req.family_worker_json, "family_worker_json")
+    bundle = _build_scale_mapping_bundle(
+        run_id=req.run_id,
+        light_contract_decisions=light_contract_decisions,
+        family_worker_json=family_worker_json or {},
+    )
+    return {
+        "run_id": req.run_id,
+        "mode": "scale_mapping_worker",
+        "artifact_ids": ["scale_mapping_bundle"],
+        "artifacts": {
+            "scale_mapping_bundle": bundle,
+        },
+    }
+
+
 @app.get("/artifacts/{artifact_id}")
 def artifact_view_get(
     artifact_id: str,
@@ -10986,6 +11741,10 @@ def _artifact_bundle_view(
     req: ArtifactBundleRequest,
     response: Response,
 ) -> Dict[str, Any]:
+    if str(req.mode or "").strip() == "scale_mapping_worker":
+        response.headers["X-Pruning-Profile"] = "scale_mapping_worker; source=backend_bundle; overrides=none"
+        return _build_scale_mapping_worker_bundle_response(req)
+
     artifacts_out: Dict[str, Any] = {}
     bundle_report: Dict[str, Any] = {}
 
@@ -11109,6 +11868,7 @@ CANONICAL_MODELING_STATUSES = {
 
 CANONICAL_TYPE_DECISION_SOURCES = {
     "reviewed_type_worker",
+    "scale_mapping_resolver",
     "family_default",
     "a17_baseline",
     "unresolved_no_a2_evidence",
@@ -11130,6 +11890,7 @@ CANONICAL_MISSINGNESS_DECISION_SOURCES = {
 CANONICAL_SEMANTIC_DECISION_SOURCES = {
     "semantic_context_worker",
     "family_worker",
+    "scale_mapping_resolver",
     "unknown",
 }
 
@@ -12203,6 +12964,200 @@ def _normalize_light_contract_maps(decisions: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _build_mapping_entry_from_human_input(entry: Dict[str, Any]) -> Dict[str, Any]:
+    ordered_labels = [str(label).strip() for label in (entry.get("ordered_labels") or []) if str(label or "").strip()]
+    numeric_scores = [float(score) for score in (entry.get("numeric_scores") or [])]
+    numeric_map = (
+        {label: score for label, score in zip(ordered_labels, numeric_scores)}
+        if ordered_labels and numeric_scores and len(ordered_labels) == len(numeric_scores)
+        else {}
+    )
+    response_scale_kind = str(entry.get("response_scale_kind") or "").strip() or _infer_scale_kind(ordered_labels, str(entry.get("notes") or ""))
+    mapping_status = "human_confirmed" if ordered_labels or numeric_map or response_scale_kind else "unresolved"
+    return {
+        "target_kind": str(entry.get("target_kind") or "").strip(),
+        "target_id": str(entry.get("target_id") or "").strip(),
+        "mapping_status": mapping_status,
+        "response_scale_kind": response_scale_kind,
+        "ordered_labels": ordered_labels,
+        "label_to_ordinal_position": {label: idx + 1 for idx, label in enumerate(ordered_labels)},
+        "label_to_numeric_score": numeric_map,
+        "numeric_score_semantics_confirmed": bool(numeric_map),
+        "source": "light_contract_scale_mapping",
+        "notes": str(entry.get("notes") or "").strip() or "Structured mapping supplied through the light contract workbook.",
+        "confidence": 0.99 if ordered_labels else 0.85,
+    }
+
+
+def _collect_scale_mapping_candidates(
+    *,
+    support: Dict[str, Any],
+    family_results_by_id: Dict[str, Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    reverse_family_map = _reverse_family_column_map(support["family_by_column"])
+
+    family_candidates: List[Dict[str, Any]] = []
+    for family_id, member_columns in sorted(reverse_family_map.items()):
+        observed_values: List[str] = []
+        for column in member_columns[:6]:
+            observed_values.extend(_preview_values_from_a2_row(support["a2_by_col"].get(column) or {}, limit=4))
+        observed_values = _dedupe_preserve_order(observed_values)
+        if not observed_values or not _looks_scale_like_values(observed_values):
+            continue
+        family_result = family_results_by_id.get(family_id) or {}
+        family_candidates.append(
+            {
+                "target_kind": "family",
+                "target_id": family_id,
+                "observed_values": observed_values,
+                "semantic_text": " ".join(
+                    bit
+                    for bit in [
+                        str(family_result.get("member_semantics_notes") or "").strip(),
+                        str(family_result.get("recommended_family_role") or "").strip(),
+                    ]
+                    if bit
+                ),
+            }
+        )
+
+    column_candidates: List[Dict[str, Any]] = []
+    for a2_row in support["a2_rows"]:
+        column = str(a2_row.get("column") or "").strip()
+        if not column or column in support["family_by_column"]:
+            continue
+        observed_values = _preview_values_from_a2_row(a2_row, limit=8)
+        if not observed_values or not _looks_scale_like_values(observed_values):
+            continue
+        column_candidates.append(
+            {
+                "target_kind": "column",
+                "target_id": column,
+                "observed_values": observed_values,
+                "semantic_text": "",
+            }
+        )
+
+    return family_candidates, column_candidates
+
+
+def _build_scale_mapping_contract(
+    *,
+    run_id: str,
+    light_contract_decisions: Dict[str, Any],
+    family_worker_json: Any,
+    scale_mapping_extractor_json: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    support = _load_canonical_support_artifacts(run_id)
+    light_contract_maps = _normalize_light_contract_maps(light_contract_decisions)
+    family_results_by_id = _extract_family_results(family_worker_json)
+    known_family_ids = set((light_contract_maps.get("family_by_id") or {}).keys()) | set(family_results_by_id.keys()) | set(support["family_by_column"].values())
+    known_columns = set(support["a2_by_col"].keys())
+
+    resolved_by_target: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    review_flags: List[Dict[str, Any]] = []
+
+    human_entries = _normalize_light_contract_scale_mapping_input(light_contract_decisions.get("scale_mapping_input") or [])
+    for entry in human_entries:
+        target_kind = str(entry.get("target_kind") or "").strip()
+        target_id = str(entry.get("target_id") or "").strip()
+        if target_kind == "family" and target_id not in known_family_ids:
+            _add_review_flag(review_flags, target_id, "unknown_scale_mapping_target", "Structured light-contract mapping target does not resolve to a known family id.")
+            continue
+        if target_kind == "column" and target_id not in known_columns:
+            _add_review_flag(review_flags, target_id, "unknown_scale_mapping_target", "Structured light-contract mapping target does not resolve to a known source column.")
+            continue
+        resolved_by_target[(target_kind, target_id)] = _build_mapping_entry_from_human_input(entry)
+
+    extractor_index = _normalize_scale_mapping_contract(
+        scale_mapping_extractor_json or {},
+        known_columns=known_columns,
+        known_family_ids=known_family_ids,
+    )
+    for extra_target in sorted(extractor_index.get("extra_targets") or set()):
+        _add_review_flag(review_flags, extra_target, "scale_mapping_target_not_in_scope", "Extractor proposed a mapping target that does not resolve to a known family id or source column.")
+    for target_key, mapping in (extractor_index.get("by_target") or {}).items():
+        if target_key in resolved_by_target:
+            continue
+        if mapping.get("mapping_status") == "unresolved" and not mapping.get("ordered_labels"):
+            continue
+        resolved_by_target[target_key] = dict(mapping)
+
+    family_candidates, column_candidates = _collect_scale_mapping_candidates(
+        support=support,
+        family_results_by_id=family_results_by_id,
+    )
+    for candidate in family_candidates + column_candidates:
+        target_key = (candidate["target_kind"], candidate["target_id"])
+        if target_key in resolved_by_target:
+            continue
+        inferred = _deterministic_scale_inference(
+            target_kind=candidate["target_kind"],
+            target_id=candidate["target_id"],
+            observed_values=candidate["observed_values"],
+            semantic_text=candidate["semantic_text"],
+        )
+        if inferred:
+            resolved_by_target[target_key] = inferred
+        else:
+            resolved_by_target[target_key] = {
+                "target_kind": candidate["target_kind"],
+                "target_id": candidate["target_id"],
+                "mapping_status": "unresolved",
+                "response_scale_kind": _infer_scale_kind(candidate["observed_values"], candidate["semantic_text"]),
+                "ordered_labels": [],
+                "label_to_ordinal_position": {},
+                "label_to_numeric_score": {},
+                "numeric_score_semantics_confirmed": False,
+                "source": "resolver_unresolved",
+                "notes": "Observed values suggest ordered-scale semantics, but direction or scoring remains ambiguous.",
+                "confidence": 0.45,
+            }
+
+    mappings = sorted(
+        resolved_by_target.values(),
+        key=lambda item: (str(item.get("target_kind") or ""), str(item.get("target_id") or "")),
+    )
+    output = {
+        "worker": "scale_mapping_resolver",
+        "summary": {
+            "overview": f"Resolved {len(mappings)} family- or column-scoped scale mappings before canonical synthesis using light-contract mappings, optional codebook extraction, and deterministic inference.",
+            "mapping_count": len(mappings),
+            "human_confirmed_count": sum(1 for item in mappings if item.get("mapping_status") == "human_confirmed"),
+            "codebook_confirmed_count": sum(1 for item in mappings if item.get("mapping_status") == "codebook_confirmed"),
+            "deterministic_inferred_count": sum(1 for item in mappings if item.get("mapping_status") == "deterministic_inferred"),
+            "unresolved_count": sum(1 for item in mappings if item.get("mapping_status") == "unresolved"),
+            "key_points": [
+                "Scale mappings are reused by canonical synthesis and later analysis derivation planning.",
+                "Raw source response labels remain string-backed in canon even when score mappings are confirmed.",
+                "Unresolved mappings remain non-blocking and preserve later review cues.",
+            ],
+        },
+        "mappings": mappings,
+        "review_flags": review_flags,
+        "assumptions": [
+            {
+                "assumption": "human_codebook_deterministic_precedence",
+                "explanation": "Resolver precedence is light-contract structured mappings first, validated extractor output second, deterministic safe inference third, unresolved last.",
+            }
+        ],
+    }
+    errors = _validate_scale_mapping_contract(
+        output,
+        known_columns=known_columns,
+        known_family_ids=known_family_ids,
+    )
+    if errors:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "scale mapping resolver produced an invalid payload",
+                "errors": errors,
+            },
+        )
+    return output
+
+
 def _normalize_type_output(payload: Dict[str, Any]) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
     decisions: Dict[str, Dict[str, Any]] = {}
     for item in _coerce_list_of_dicts(payload.get("column_decisions")):
@@ -12429,6 +13384,110 @@ def _normalize_semantic_context(
         "codebook_by_column": codebook_by_column,
         "extra_columns": extra_columns,
     }
+
+
+def _resolve_scale_mapping_for_column(
+    column: str,
+    source_family_id: str,
+    scale_mapping_index: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    by_target = scale_mapping_index.get("by_target") or {}
+    column_mapping = by_target.get(("column", column))
+    if column_mapping:
+        return column_mapping
+    if source_family_id:
+        return by_target.get(("family", source_family_id))
+    return None
+
+
+def _rewrite_notes_with_scale_mapping(existing_notes: str, mapping: Dict[str, Any]) -> str:
+    text = str(existing_notes or "").strip()
+    stale_patterns = [
+        r"\bpost-codebook review\b\.?",
+        r"\baplicar validated label->score mapping post-codebook review\b\.?",
+        r"\bvalidate numeric-label mapping before casting to numeric\b\.?",
+        r"\bvalidate numeric-label mapping post-codebook review\b\.?",
+    ]
+    for pattern in stale_patterns:
+        text = re.sub(pattern, "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s{2,}", " ", text).strip(" .")
+
+    label_preview = " | ".join((mapping.get("ordered_labels") or [])[:5])
+    if mapping.get("mapping_status") in {"human_confirmed", "codebook_confirmed"}:
+        suffix = (
+            f"Structured scale mapping confirmed ({mapping.get('mapping_status')}); preserve raw labels in canon"
+            f"{' and defer numeric scoring to derived transforms' if mapping.get('numeric_score_semantics_confirmed') else ''}."
+        )
+        if label_preview:
+            suffix = f"{suffix} Ordered labels: {label_preview}."
+    elif mapping.get("mapping_status") == "deterministic_inferred":
+        suffix = "Deterministic ordered-scale inference is available, but numeric scoring remains advisory until human or codebook confirmation."
+    else:
+        suffix = ""
+
+    return _merge_notes(text, suffix)
+
+
+def _apply_scale_mapping_to_type_and_semantics(
+    *,
+    type_decision: Dict[str, Any],
+    semantic: Dict[str, Any],
+    mapping: Optional[Dict[str, Any]],
+) -> Tuple[Dict[str, Any], Dict[str, Any], bool]:
+    if not mapping:
+        return dict(type_decision), dict(semantic), False
+
+    updated_type = dict(type_decision)
+    updated_semantic = dict(semantic)
+    ordered_labels = [str(label).strip() for label in (mapping.get("ordered_labels") or []) if str(label or "").strip()]
+    mapping_status = str(mapping.get("mapping_status") or "").strip()
+    confirmed = mapping_status in {"human_confirmed", "codebook_confirmed"}
+    materially_applied = False
+
+    if ordered_labels or str(mapping.get("response_scale_kind") or "").strip():
+        updated_type["recommended_logical_type"] = "ordinal_category"
+        updated_type["recommended_storage_type"] = "string"
+        preserved_actions = [
+            action
+            for action in (updated_type.get("transform_actions") or [])
+            if action in {"trim_whitespace", "normalize_missing_tokens", "lowercase_values", "uppercase_values", "titlecase_values"}
+        ]
+        updated_type["transform_actions"] = _dedupe_preserve_order(
+            ["trim_whitespace", "normalize_category_tokens"] + preserved_actions
+        )
+        structural_hints = list(updated_type.get("structural_transform_hints") or [])
+        if confirmed:
+            structural_hints = [hint for hint in structural_hints if hint != "requires_codebook_or_label_mapping_review"]
+        updated_type["structural_transform_hints"] = _dedupe_preserve_order(structural_hints)
+        interpretation_hints = list(updated_type.get("interpretation_hints") or [])
+        if any(re.search(r"\d", label) for label in ordered_labels):
+            interpretation_hints.append("numeric_parse_is_misleading")
+        updated_type["interpretation_hints"] = _dedupe_preserve_order(interpretation_hints)
+        updated_type["normalization_notes"] = _rewrite_notes_with_scale_mapping(
+            str(updated_type.get("normalization_notes") or ""),
+            mapping,
+        )
+        updated_type["confidence"] = round(max(_safe_float(updated_type.get("confidence"), 0.0), _safe_float(mapping.get("confidence"), 0.0)), 6)
+        updated_type["applied_sources"] = _dedupe_preserve_order(list(updated_type.get("applied_sources") or []) + ["scale_mapping_resolver"])
+        updated_type["type_decision_source"] = "scale_mapping_resolver"
+        materially_applied = True
+
+    if ordered_labels:
+        response_scale_kind = str(mapping.get("response_scale_kind") or "").strip().replace("_", " ")
+        if not str(updated_semantic.get("semantic_meaning") or "").strip():
+            updated_semantic["semantic_meaning"] = f"Ordered response scale ({response_scale_kind or 'ordinal scale'}) with labels preserved as raw categories."
+        label_note = f"Ordered labels: {' | '.join(ordered_labels[:6])}."
+        if confirmed:
+            note_prefix = "Confirmed scale mapping."
+        elif mapping_status == "deterministic_inferred":
+            note_prefix = "Deterministically inferred scale ordering."
+        else:
+            note_prefix = "Scale mapping remains unresolved."
+        updated_semantic["codebook_note"] = _merge_notes(str(updated_semantic.get("codebook_note") or ""), f"{note_prefix} {label_note}")
+        updated_semantic["semantic_decision_source"] = "scale_mapping_resolver"
+        materially_applied = True
+
+    return updated_type, updated_semantic, materially_applied
 
 
 def _resolve_structure_for_column(
@@ -13434,6 +14493,7 @@ def _synthesize_canonical_column_contract(
     missingness_worker_json: Dict[str, Any],
     family_worker_json: Any,
     table_layout_worker_json: Dict[str, Any],
+    scale_mapping_json: Dict[str, Any],
     support: Dict[str, Any],
 ) -> Dict[str, Any]:
     a2_by_col = support["a2_by_col"]
@@ -13467,6 +14527,11 @@ def _synthesize_canonical_column_contract(
         known_columns=set(a2_by_col.keys()),
         known_family_ids=known_family_ids,
     )
+    scale_mapping_index = _normalize_scale_mapping_contract(
+        scale_mapping_json,
+        known_columns=set(a2_by_col.keys()),
+        known_family_ids=known_family_ids,
+    )
 
     extra_columns = set(type_by_col.keys()) | set(missingness_by_col.keys()) | set(assignments_by_col.keys()) | set(semantic_index["extra_columns"])
     extra_columns.update(light_contract_maps.get("primary_keys") or [])
@@ -13480,6 +14545,13 @@ def _synthesize_canonical_column_contract(
             extra,
             "reviewed_column_not_in_a2",
             "A reviewed or structural input referenced this column, but it does not exist in the baseline A2 column dictionary for the run.",
+        )
+    for extra_target in sorted(scale_mapping_index.get("extra_targets") or set()):
+        _add_review_flag(
+            top_level_review_flags,
+            extra_target,
+            "scale_mapping_target_not_in_a2_scope",
+            "scale_mapping_json referenced a family or column target that does not resolve against the run's reviewed family inventory or A2 source columns.",
         )
 
     column_contracts: List[Dict[str, Any]] = []
@@ -13529,6 +14601,16 @@ def _synthesize_canonical_column_contract(
                 "confidence": _safe_float(reviewed_type.get("confidence"), 0.0),
                 "applied_sources": ["type_transform_worker"],
             }
+        scale_mapping = _resolve_scale_mapping_for_column(
+            column=column,
+            source_family_id=family_id,
+            scale_mapping_index=scale_mapping_index,
+        )
+        type_decision, semantic, scale_mapping_applied = _apply_scale_mapping_to_type_and_semantics(
+            type_decision=type_decision,
+            semantic=semantic,
+            mapping=scale_mapping,
+        )
 
         baseline_missingness_decision = _baseline_row_to_missingness_decision(baseline_row)
         missingness_decision = dict(baseline_missingness_decision)
@@ -13576,10 +14658,14 @@ def _synthesize_canonical_column_contract(
             applied_sources.append("semantic_context_worker")
         elif semantic.get("semantic_decision_source") == "family_worker":
             applied_sources.append("family_worker.family_result")
+        elif semantic.get("semantic_decision_source") == "scale_mapping_resolver":
+            applied_sources.append("scale_mapping_resolver")
         if family_type_used or family_missingness_used:
             applied_sources.append("family_worker.member_defaults")
         applied_sources.extend(type_decision.get("applied_sources") or [])
         applied_sources.extend(missingness_decision.get("applied_sources") or [])
+        if scale_mapping_applied:
+            applied_sources.append("scale_mapping_resolver")
 
         row = {
             "column": column,
@@ -13684,7 +14770,7 @@ def _synthesize_canonical_column_contract(
     summary = {
         "overview": (
             f"Synthesized a deterministic canonical column contract for {len(column_contracts)} columns by "
-            f"merging structure decisions, semantic context, reviewed overrides, family defaults, and the A17 baseline layer."
+            f"merging structure decisions, semantic context, reviewed overrides, scale mappings, family defaults, and the A17 baseline layer."
         ),
         "total_source_columns": len(column_contracts),
         "included_column_count": sum(1 for row in column_contracts if row["canonical_modeling_status"] not in {"excluded_from_outputs", "unresolved"}),
@@ -13710,6 +14796,7 @@ def _synthesize_canonical_column_contract(
         "key_contract_principles": [
             "Control fields are complete for every contract row; semantic enrichment stays blank unless evidence exists.",
             "Reviewed table layout, semantic context, reviewed specialist outputs, and family defaults outrank the A17 deterministic baseline.",
+            "Structured scale mappings, when present, refine ordinal semantics before canon and are reused downstream for derivation planning.",
             "Raw prose is not allowed to directly override structured contract fields in v1.",
         ],
     }
@@ -13750,6 +14837,13 @@ def _synthesize_canonical_column_contract(
                 "explanation": "Reviewed family defaults were propagated to sibling columns where explicit per-column reviewed overrides were absent.",
             }
         )
+    if any("scale_mapping_resolver" in (row.get("applied_sources") or []) for row in column_contracts):
+        assumptions.append(
+            {
+                "assumption": "scale_mapping_semantics_applied",
+                "explanation": "Resolved scale mappings were applied before canon so ordered response semantics could be confirmed without changing raw canonical storage away from strings.",
+            }
+        )
 
     output = {
         "worker": "canonical_column_contract_builder",
@@ -13777,6 +14871,27 @@ def _synthesize_canonical_column_contract(
     return output
 
 
+@app.post("/contracts/scale-mappings")
+def build_scale_mapping_contract(
+    req: ScaleMappingResolverRequest,
+    _=Depends(require_token),
+) -> Dict[str, Any]:
+    light_contract_decisions = _coerce_json_input(req.light_contract_decisions, "light_contract_decisions")
+    family_worker_json = _coerce_json_input(req.family_worker_json, "family_worker_json", allow_list=True)
+    extractor_json = (
+        _coerce_json_input(req.scale_mapping_extractor_json, "scale_mapping_extractor_json")
+        if req.scale_mapping_extractor_json not in (None, "")
+        else {}
+    )
+
+    return _build_scale_mapping_contract(
+        run_id=req.run_id,
+        light_contract_decisions=light_contract_decisions,
+        family_worker_json=family_worker_json,
+        scale_mapping_extractor_json=extractor_json,
+    )
+
+
 @app.post("/contracts/canonical-columns")
 def build_canonical_column_contract(
     req: CanonicalColumnContractRequest,
@@ -13788,6 +14903,7 @@ def build_canonical_column_contract(
     missingness_worker_json = _coerce_json_input(req.missingness_worker_json, "missingness_worker_json")
     family_worker_json = _coerce_json_input(req.family_worker_json, "family_worker_json", allow_list=True)
     table_layout_worker_json = _coerce_json_input(req.table_layout_worker_json, "table_layout_worker_json")
+    scale_mapping_json = _coerce_json_input(req.scale_mapping_json, "scale_mapping_json") if req.scale_mapping_json is not None else {}
 
     if not isinstance(light_contract_decisions.get("primary_grain_decision"), dict):
         raise HTTPException(status_code=422, detail="light_contract_decisions.primary_grain_decision is required")
@@ -13806,6 +14922,7 @@ def build_canonical_column_contract(
         missingness_worker_json=missingness_worker_json,
         family_worker_json=family_worker_json,
         table_layout_worker_json=table_layout_worker_json,
+        scale_mapping_json=scale_mapping_json,
         support=support,
     )
 

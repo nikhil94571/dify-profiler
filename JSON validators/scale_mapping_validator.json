@@ -1,0 +1,247 @@
+import json
+
+
+ALLOWED_TARGET_KINDS = {
+    "family",
+    "column",
+}
+
+ALLOWED_MAPPING_STATUSES = {
+    "codebook_confirmed",
+    "unresolved",
+}
+
+ALLOWED_SKIP_REASONS = {
+    "no_mapping_evidence",
+}
+
+
+def _normalization_repr(value):
+    return json.dumps(value, separators=(",", ":"))
+
+
+def _log_normalization(normalization_log, path, value):
+    normalization_log.append(
+        {
+            "path": path,
+            "defaulted_to": _normalization_repr(value),
+        }
+    )
+
+
+def _default_in_dict(container, key, value, path, normalization_log):
+    if not isinstance(container, dict):
+        return
+    if key not in container or container[key] is None:
+        container[key] = value
+        _log_normalization(normalization_log, path, value)
+
+
+def _require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def _is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _require_non_empty_string(value, field_name):
+    _require(isinstance(value, str), f"{field_name} must be a string.")
+    _require(value.strip() != "", f"{field_name} must not be blank.")
+
+
+def _require_list(value, field_name):
+    _require(isinstance(value, list), f"{field_name} must be an array.")
+
+
+def _require_dict(value, field_name):
+    _require(isinstance(value, dict), f"{field_name} must be an object.")
+
+
+def _normalize_payload(parsed):
+    normalization_log = []
+    if not isinstance(parsed, dict):
+        return parsed, normalization_log
+
+    if parsed.get("status") == "skipped":
+        return parsed, normalization_log
+
+    summary = parsed.get("summary")
+    if isinstance(summary, dict):
+        _default_in_dict(summary, "key_points", [], "summary.key_points", normalization_log)
+    _default_in_dict(parsed, "review_flags", [], "review_flags", normalization_log)
+    _default_in_dict(parsed, "assumptions", [], "assumptions", normalization_log)
+    return parsed, normalization_log
+
+
+def _validate_summary(summary):
+    _require_dict(summary, "summary")
+    _require("overview" in summary, "summary.overview is required.")
+    _require("key_points" in summary, "summary.key_points is required.")
+    _require_non_empty_string(summary["overview"], "summary.overview")
+    _require_list(summary["key_points"], "summary.key_points")
+    for idx, item in enumerate(summary["key_points"]):
+        _require_non_empty_string(item, f"summary.key_points[{idx}]")
+
+
+def _validate_string_list(items, field_name):
+    _require_list(items, field_name)
+    for idx, item in enumerate(items):
+        _require_non_empty_string(item, f"{field_name}[{idx}]")
+
+
+def _validate_mapping_item(item, idx):
+    path = f"mappings[{idx}]"
+    _require_dict(item, path)
+    for key in (
+        "target_kind",
+        "target_id",
+        "mapping_status",
+        "response_scale_kind",
+        "ordered_labels",
+        "label_to_ordinal_position",
+        "label_to_numeric_score",
+        "numeric_score_semantics_confirmed",
+        "source",
+        "notes",
+        "confidence",
+    ):
+        _require(key in item, f"{path}.{key} is required.")
+
+    _require_non_empty_string(item["target_kind"], f"{path}.target_kind")
+    _require(item["target_kind"] in ALLOWED_TARGET_KINDS, f"{path}.target_kind must be one of: {', '.join(sorted(ALLOWED_TARGET_KINDS))}")
+    _require_non_empty_string(item["target_id"], f"{path}.target_id")
+    _require_non_empty_string(item["mapping_status"], f"{path}.mapping_status")
+    _require(item["mapping_status"] in ALLOWED_MAPPING_STATUSES, f"{path}.mapping_status must be one of: {', '.join(sorted(ALLOWED_MAPPING_STATUSES))}")
+    _require(isinstance(item["response_scale_kind"], str), f"{path}.response_scale_kind must be a string.")
+    _validate_string_list(item["ordered_labels"], f"{path}.ordered_labels")
+    _require_dict(item["label_to_ordinal_position"], f"{path}.label_to_ordinal_position")
+    _require_dict(item["label_to_numeric_score"], f"{path}.label_to_numeric_score")
+    for label, position in item["label_to_ordinal_position"].items():
+        _require_non_empty_string(label, f"{path}.label_to_ordinal_position key")
+        _require(_is_number(position), f"{path}.label_to_ordinal_position[{label}] must be numeric.")
+    for label, score in item["label_to_numeric_score"].items():
+        _require_non_empty_string(label, f"{path}.label_to_numeric_score key")
+        _require(_is_number(score), f"{path}.label_to_numeric_score[{label}] must be numeric.")
+    _require(isinstance(item["numeric_score_semantics_confirmed"], bool), f"{path}.numeric_score_semantics_confirmed must be boolean.")
+    _require(isinstance(item["source"], str), f"{path}.source must be a string.")
+    _require(isinstance(item["notes"], str), f"{path}.notes must be a string.")
+    _require(_is_number(item["confidence"]), f"{path}.confidence must be numeric.")
+    _require(0 <= float(item["confidence"]) <= 1, f"{path}.confidence must be between 0 and 1.")
+
+
+def _validate_review_flags(items):
+    _require_list(items, "review_flags")
+    for idx, item in enumerate(items):
+        path = f"review_flags[{idx}]"
+        _require_dict(item, path)
+        for key in ("item", "issue", "why"):
+            _require(key in item, f"{path}.{key} is required.")
+            _require_non_empty_string(item[key], f"{path}.{key}")
+
+
+def _validate_assumptions(items):
+    _require_list(items, "assumptions")
+    for idx, item in enumerate(items):
+        path = f"assumptions[{idx}]"
+        _require_dict(item, path)
+        for key in ("assumption", "explanation"):
+            _require(key in item, f"{path}.{key} is required.")
+            _require_non_empty_string(item[key], f"{path}.{key}")
+
+
+def main(scale_mapping_output: str):
+    output_key = "scale_mapping_extractor_json"
+
+    if not isinstance(scale_mapping_output, str):
+        error = "scale_mapping_output must be a string."
+        return {
+            output_key: "",
+            "validation_ok": "false",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+    if scale_mapping_output.strip() == "":
+        error = "scale_mapping_output is empty."
+        return {
+            output_key: "",
+            "validation_ok": "false",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    try:
+        parsed = json.loads(scale_mapping_output)
+    except json.JSONDecodeError as exc:
+        error = f"Scale mapping output is not valid JSON: {exc}"
+        return {
+            output_key: "",
+            "validation_ok": "false",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    if not isinstance(parsed, dict):
+        error = "root must be an object."
+        return {
+            output_key: "",
+            "validation_ok": "false",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": "false",
+            "normalization_log_json": "[]",
+        }
+
+    parsed, normalization_log = _normalize_payload(parsed)
+    normalization_log_json = json.dumps(normalization_log, separators=(",", ":"))
+    normalization_applied = "true" if normalization_log else "false"
+
+    try:
+        if parsed.get("status") == "skipped":
+            _require_non_empty_string(parsed.get("reason"), "reason")
+            _require(parsed["reason"] in ALLOWED_SKIP_REASONS, f"reason must be one of: {', '.join(sorted(ALLOWED_SKIP_REASONS))}")
+            return {
+                output_key: json.dumps(parsed, separators=(",", ":")),
+                "validation_ok": "true",
+                "validation_error": "",
+                "validation_errors_json": "[]",
+                "normalization_applied": normalization_applied,
+                "normalization_log_json": normalization_log_json,
+            }
+
+        for key in ("worker", "summary", "mappings", "review_flags", "assumptions"):
+            _require(key in parsed, f"Missing required top-level key: {key}")
+        _require_non_empty_string(parsed["worker"], "worker")
+        _require(parsed["worker"] == "scale_mapping_extractor", "worker must be 'scale_mapping_extractor'.")
+        _validate_summary(parsed["summary"])
+        _require_list(parsed["mappings"], "mappings")
+        for idx, item in enumerate(parsed["mappings"]):
+            _validate_mapping_item(item, idx)
+        _validate_review_flags(parsed["review_flags"])
+        _validate_assumptions(parsed["assumptions"])
+    except ValueError as exc:
+        error = str(exc)
+        return {
+            output_key: "",
+            "validation_ok": "false",
+            "validation_error": error,
+            "validation_errors_json": json.dumps([error], separators=(",", ":")),
+            "normalization_applied": normalization_applied,
+            "normalization_log_json": normalization_log_json,
+        }
+
+    return {
+        output_key: json.dumps(parsed, separators=(",", ":")),
+        "validation_ok": "true",
+        "validation_error": "",
+        "validation_errors_json": "[]",
+        "normalization_applied": normalization_applied,
+        "normalization_log_json": normalization_log_json,
+    }

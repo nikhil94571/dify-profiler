@@ -169,6 +169,28 @@ PROMPT_SPECS: dict[str, PromptSpec] = {
             ),
         ),
     ),
+    "scale_mapping_worker_system_prompt.md": PromptSpec(
+        min_example_headers=5,
+        semantics_terms=(
+            "light_contract_decisions",
+            "family_worker_json",
+            "scale_mapping_bundle.structured_human_mappings",
+            "scale_mapping_bundle.raw_semantic_notes",
+            "scale_mapping_bundle.accepted_families",
+            "scale_mapping_bundle.candidate_standalone_columns",
+            "scale_mapping_bundle.codebook_context.relevant_page_snippets",
+        ),
+        enum_sources=(
+            EnumSource(
+                "scale_mapping_validator.json",
+                (
+                    "ALLOWED_TARGET_KINDS",
+                    "ALLOWED_MAPPING_STATUSES",
+                    "ALLOWED_SKIP_REASONS",
+                ),
+            ),
+        ),
+    ),
     "table_layout_worker_system_prompt.md": PromptSpec(
         min_example_headers=5,
         semantics_terms=(
@@ -202,6 +224,7 @@ PROMPT_SPECS: dict[str, PromptSpec] = {
         semantics_terms=(
             "light_contract_decisions",
             "semantic_context_json",
+            "scale_mapping_json",
             "type_transform_worker_json",
             "missingness_worker_json",
             "family_worker_json",
@@ -282,6 +305,13 @@ REPAIR_PROMPT_REQUIREMENTS: dict[str, tuple[str, ...]] = {
         "member_defaults.missingness_disposition",
         "member_defaults.missingness_handling",
         "member_defaults.skip_logic_protected",
+    ),
+    "REPAIR_scale_mapping.md": (
+        "scale_mapping_extractor",
+        "target_kind",
+        "mapping_status",
+        "numeric_score_semantics_confirmed",
+        "no_mapping_evidence",
     ),
 }
 

@@ -49,6 +49,7 @@ This stage is intentionally post-canonical. It should build analysis-ready plans
 You receive one combined payload containing:
 - `light_contract_decisions`
 - `semantic_context_json`
+- `scale_mapping_json`
 - `type_transform_worker_json`
 - `missingness_worker_json`
 - `family_worker_json`
@@ -66,6 +67,7 @@ The bundle is expected to include:
 Important:
 - `table_layout_worker_json` is the authoritative canonical layout layer.
 - `family_worker_json` is the authoritative family-interpretation layer.
+- `scale_mapping_json` is the authoritative pre-canonical ordered-scale mapping layer.
 - `missingness_worker_json` is authoritative for structural missingness and skip-logic cautions.
 - `type_transform_worker_json` is authoritative for reviewed value semantics and representation cautions.
 - `light_contract_decisions.reference_decisions` is the accepted reference layer. Legacy `dimension_decisions` may appear during migration and should be treated as equivalent.
@@ -77,15 +79,17 @@ ALWAYS favor canonical structure and reviewed worker outputs over raw artifact h
 Precedence for this worker:
 1. `table_layout_worker_json`
 2. `family_worker_json`
-3. `missingness_worker_json`
-4. `type_transform_worker_json`
-5. `light_contract_decisions`
-6. `semantic_context_json`
-7. raw bundle evidence: `A16`, `A8`, `B1`, `A10`, `A2`, `A14`
+3. `scale_mapping_json`
+4. `missingness_worker_json`
+5. `type_transform_worker_json`
+6. `light_contract_decisions`
+7. `semantic_context_json`
+8. raw bundle evidence: `A16`, `A8`, `B1`, `A10`, `A2`, `A14`
 
 Conflict rules:
 - If raw evidence suggests a merge but the reviewed family or table-layout outputs show distinct instruments, keep them separate.
 - If scoring seems plausible but the reference or answer-key evidence is weak, emit a review flag instead of inventing a derivation.
+- Only auto-propose label->score derivations when `scale_mapping_json` is `human_confirmed` or `codebook_confirmed`.
 - If structural missingness is reviewed as valid, do not convert it into ordinary wrong-answer treatment without explicit justification.
 
 ## 3) DEFINITIONS
@@ -199,6 +203,12 @@ You MUST use exactly one of:
 - Why it matters: it can clarify whether an instrument is longitudinal, whether a block is answer-key-like, and whether collection changed over time.
 - What not to use it for: do not invent scoring or merge logic when semantic context is absent or skipped.
 - Precedence rank: 6
+
+`scale_mapping_json`:
+- What it is: resolved family- or column-scoped ordered-scale mappings produced before canon.
+- Why it matters: it is the main source for safe label ordering, numeric score semantics, and reverse-direction awareness when planning score derivations.
+- What not to use it for: do not promote `deterministic_inferred` mappings directly into executable scoring transforms.
+- Precedence rank: 3
 
 `type_transform_worker_json`:
 - What it is: reviewed type/value interpretation layer.

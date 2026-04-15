@@ -86,7 +86,7 @@ Current view surfaces:
 
 `GET /artifact-bundles` is the simplest Dify-facing interface for workers that only need profile-default pruning.
 
-For workers that need request-scoped pruning inputs, use `POST /artifact-bundles/view`. This now matters for `type_transform_worker`, `missingness_worker`, `semantic_context_worker`, `family_worker`, `table_layout_worker`, `analysis_layout_worker`, and `canonical_contract_reviewer`.
+For workers that need request-scoped pruning inputs, use `POST /artifact-bundles/view`. This now matters for `type_transform_worker`, `missingness_worker`, `semantic_context_worker`, `family_worker`, `table_layout_worker`, `scale_mapping_worker`, `analysis_layout_worker`, and `canonical_contract_reviewer`.
 
 - `type_transform_worker`, `missingness_worker`, `semantic_context_worker`, `table_layout_worker`, and `analysis_layout_worker` can accept `global.value_filter.force_include_columns` so finalized grain, reference, and family linkage columns are always retained in a scoped bundle.
 - `canonical_contract_reviewer` can also accept `global.value_filter.force_include_columns`, but the reviewer bundle is now risk-scoped. Keep that list narrow to structural carry-through columns; do not pass the full reviewed contract column list.
@@ -295,6 +295,28 @@ After semantic, type, and missingness workers have produced validated JSON outpu
    - each family item may optionally include `member_defaults` for safe family-wide type defaults and structural-only missingness defaults that should propagate to sibling columns later
    - for repair-node use, use [`prompts/REPAIR_family.md`](/Users/nikhil/Automations/dify-profiler/prompts/REPAIR_family.md)
 
+The intended next stage after family is ordered-scale / codebook mapping:
+
+1. request `POST /artifact-bundles/view` with `mode = "scale_mapping_worker"` and supply:
+   - `light_contract_decisions`
+   - `family_worker_json`
+2. inspect `artifacts.scale_mapping_bundle.has_mapping_evidence`
+3. if it is `false`, skip the extractor and pass an empty extractor sentinel to the resolver
+4. otherwise run [`prompts/scale_mapping_worker_system_prompt.md`](/Users/nikhil/Automations/dify-profiler/prompts/scale_mapping_worker_system_prompt.md)
+5. validate the output with [`JSON validators/scale_mapping_validator.json`](/Users/nikhil/Automations/dify-profiler/JSON%20validators/scale_mapping_validator.json)
+6. repair once with [`prompts/REPAIR_scale_mapping.md`](/Users/nikhil/Automations/dify-profiler/prompts/REPAIR_scale_mapping.md) if needed
+7. call `POST /contracts/scale-mappings` with:
+   - `run_id`
+   - `light_contract_decisions`
+   - `family_worker_json`
+   - validated `scale_mapping_extractor_json` when present
+8. pass the resulting `scale_mapping_json` into canonical synthesis and later analysis-layout planning
+
+This stage is intentionally narrow:
+- it consumes a backend-built compact bundle rather than the full canonical bundle
+- it may use a codebook PDF when one has been uploaded through `POST /codebooks/upload`
+- the deterministic resolver is the final authority; the extractor is proposal-only
+
 The intended next stage after family is a single-pass canonical table-layout proposal worker:
 
 1. request `POST /artifact-bundles/view` with `mode = "table_layout_worker"` and supply:
@@ -349,6 +371,7 @@ The intended next stage after canonical layout is a deterministic canonical-colu
    - `missingness_worker_json`
    - `family_worker_json`
    - `table_layout_worker_json`
+   - `scale_mapping_json`
 3. let the backend load `A17` directly for the same `run_id`
    - if `A17` is missing, the backend deterministically rebuilds it from `A2`, `A3-T`, `A3-V`, `A4`, `A9`, `A13`, `A14`, and `A16`
 4. consume one canonical contract object with:
@@ -488,6 +511,7 @@ The intended next stage after the canonical-contract reviewer remains an analysi
 2. combine the returned bundle with:
    - `light_contract_decisions`
    - `semantic_context_json`
+   - `scale_mapping_json`
    - `type_transform_worker_json`
    - `missingness_worker_json`
    - `family_worker_json`
@@ -512,6 +536,10 @@ The light-contract workbook now captures two kinds of early semantic input in th
 - `dataset_context_and_collection_notes`
 - `semantic_codebook_and_important_variables`
 
+It also captures one structured optional mapping sheet:
+
+- `Scale Mappings`
+
 These rows are intended for:
 
 - dataset purpose and row-meaning notes
@@ -521,6 +549,11 @@ These rows are intended for:
 - simple code meanings and label mappings
 - semantic placeholders or status flags
 
+The `Scale Mappings` sheet is intended for:
+- family-level ordered label ladders
+- standalone column ordered label ladders
+- optional explicit numeric score mappings when the human knows them
+
 They are intentionally not the place for final table-layout instructions.
 
 When a light contract is accepted or a modified workbook is parsed, the downstream handoff now includes:
@@ -529,10 +562,20 @@ When a light contract is accepted or a modified workbook is parsed, the downstre
 "semantic_context_input": {
   "dataset_context_and_collection_notes": "...",
   "semantic_codebook_and_important_variables": "..."
-}
+},
+"scale_mapping_input": [
+  {
+    "target_kind": "family",
+    "target_id": "q_9_main_cell_group",
+    "response_scale_kind": "familiarity_scale",
+    "ordered_labels": ["Never Heard of It 0", "Very Familiar 6"],
+    "numeric_scores": [],
+    "notes": "..."
+  }
+]
 ```
 
-This keeps semantic truth available early without mixing it into the later hard-contract stage.
+This keeps semantic truth available early without mixing it into the later hard-contract stage, while also giving the scale-mapping resolver a structured human override path.
 
 For example, the grain worker can call:
 
@@ -583,6 +626,19 @@ After light-contract finalization, add one more Dify step:
 5. pass the resulting `semantic_context_json` downstream
 
 This semantic-context step should run before later type, missingness, family, or table-modeling stages consume the user notes.
+
+## Codebook Upload
+
+Use:
+- `POST /codebooks/upload`
+- `GET /codebooks/context`
+
+The upload step stores:
+- `runs/<run_id>/codebook.pdf`
+- `runs/<run_id>/codebook_pages.json`
+- `runs/<run_id>/codebook_document.json`
+
+The scale-mapping bundle builder uses extracted page text to shortlist relevant snippets before the extractor runs. The original PDF remains available by signed URL for Dify attachment when needed, but the snippet shortlist should be the primary grounding context.
 
 ### Semantic Context Validator
 

@@ -242,6 +242,7 @@ These literals may appear in the draft contract, but they are code-owned and mus
 
 `type_decision_source`:
 - `reviewed_type_worker`
+- `scale_mapping_resolver`
 - `family_default`
 - `a17_baseline`
 - `unresolved_no_a2_evidence`
@@ -260,6 +261,7 @@ These literals may appear in the draft contract, but they are code-owned and mus
 `semantic_decision_source`:
 - `semantic_context_worker`
 - `family_worker`
+- `scale_mapping_resolver`
 - `unknown`
 
 ## 6) ARTIFACT / INPUT SEMANTICS

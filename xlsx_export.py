@@ -44,6 +44,15 @@ DEFAULT_OVERRIDE_FIELDS: List[Dict[str, str]] = [
     },
 ]
 
+DEFAULT_SCALE_MAPPING_HEADERS: List[str] = [
+    "target_kind",
+    "target_id",
+    "response_scale_kind",
+    "ordered_labels_low_to_high",
+    "numeric_scores_low_to_high",
+    "notes",
+]
+
 
 def _normalize_rows(obj: Any) -> Tuple[List[str], List[List[Any]]]:
     """
@@ -380,7 +389,39 @@ def build_light_contract_xlsx_bytes(contract: Dict[str, Any]) -> bytes:
         ]
         _write_table_sheet(ws_gates, gate_headers, gate_rows, fixed_widths={"trigger_column": 24, "trigger_value": 18, "affected_family_ids": 32, "interpretation": 54})
 
-    # Sheet 7/8: Overrides
+    # Sheet 7: Scale Mappings
+    ws_scale = wb.create_sheet(title="Scale Mappings")
+    scale_rows = [
+        [
+            row.get("target_kind", ""),
+            row.get("target_id", ""),
+            row.get("response_scale_kind", ""),
+            row.get("ordered_labels_low_to_high", ""),
+            row.get("numeric_scores_low_to_high", ""),
+            row.get("notes", ""),
+        ]
+        for row in contract.get("scale_mapping_rows", [])
+    ]
+    _write_table_sheet(
+        ws_scale,
+        DEFAULT_SCALE_MAPPING_HEADERS,
+        scale_rows,
+        fixed_widths={
+            "target_kind": 14,
+            "target_id": 28,
+            "response_scale_kind": 24,
+            "ordered_labels_low_to_high": 50,
+            "numeric_scores_low_to_high": 28,
+            "notes": 54,
+        },
+    )
+    _style_data_region(
+        ws_scale,
+        recommended_cols=["target_kind", "target_id"],
+        editable_cols=["response_scale_kind", "ordered_labels_low_to_high", "numeric_scores_low_to_high", "notes"],
+    )
+
+    # Sheet 8: Overrides
     ws_over = wb.create_sheet(title="Overrides")
     override_headers = ["field", "description", "user_input"]
     override_rows = [
@@ -451,6 +492,7 @@ def parse_light_contract_xlsx_bytes(xlsx_bytes: bytes) -> Dict[str, Any]:
     primary_rows = _sheet_rows_as_dicts(_sheet("Primary Grain")) if _sheet("Primary Grain") else []
     dimension_rows = _sheet_rows_as_dicts(_sheet("Dimension Tables")) if _sheet("Dimension Tables") else []
     family_rows = _sheet_rows_as_dicts(_sheet("Repeat Families")) if _sheet("Repeat Families") else []
+    scale_mapping_rows = _sheet_rows_as_dicts(_sheet("Scale Mappings")) if _sheet("Scale Mappings") else []
     override_rows = _sheet_rows_as_dicts(_sheet("Overrides")) if _sheet("Overrides") else []
 
     return {
@@ -458,5 +500,6 @@ def parse_light_contract_xlsx_bytes(xlsx_bytes: bytes) -> Dict[str, Any]:
         "primary_grain_rows": primary_rows,
         "dimension_rows": dimension_rows,
         "repeat_family_rows": family_rows,
+        "scale_mapping_rows": scale_mapping_rows,
         "override_rows": override_rows,
     }
