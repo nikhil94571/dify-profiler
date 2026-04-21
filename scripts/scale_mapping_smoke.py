@@ -181,6 +181,43 @@ def _assert(condition, message):
         raise AssertionError(message)
 
 
+def _baseline_row(
+    column,
+    *,
+    role,
+    logical_type,
+    storage_type,
+    transform_actions,
+    structural_transform_hints=None,
+    interpretation_hints=None,
+    normalization_notes="",
+):
+    return {
+        "column": column,
+        "a9_primary_role": role,
+        "recommended_logical_type": logical_type,
+        "recommended_storage_type": storage_type,
+        "transform_actions": list(transform_actions),
+        "structural_transform_hints": list(structural_transform_hints or []),
+        "interpretation_hints": list(interpretation_hints or []),
+        "missingness_disposition": "no_material_missingness",
+        "missingness_handling": "no_action_needed",
+        "skip_logic_protected": False,
+        "type_normalization_notes": normalization_notes,
+        "missingness_normalization_notes": "",
+        "quality_score": 0.9,
+        "drift_detected": False,
+        "type_decision_source": "a17_baseline",
+        "missingness_decision_source": "a17_baseline",
+        "type_confidence": 0.61,
+        "missingness_confidence": 0.85,
+        "type_review_required": False,
+        "missingness_review_required": False,
+        "confidence": 0.71,
+        "applied_sources": ["A17"],
+    }
+
+
 def test_light_contract_scale_mapping_sheet():
     payload = {
         "run_id": "run_smoke",
@@ -369,11 +406,710 @@ def test_scale_mapping_resolver_and_canonical_integration():
 
     rows = {row["column"]: row for row in canon["column_contracts"]}
     q9 = rows["Q9Row1"]
+    overall = rows["OverallSatisfaction"]
     _assert(q9["recommended_logical_type"] == "ordinal_category", "expected ordinal category after scale mapping")
     _assert(q9["recommended_storage_type"] == "string", "expected string storage after scale mapping")
     _assert(q9["type_decision_source"] == "scale_mapping_resolver", "expected scale mapping to own the type refinement")
     _assert("requires_codebook_or_label_mapping_review" not in q9["structural_transform_hints"], "expected confirmed mapping to clear codebook review hint")
     _assert("Confirmed scale mapping" in q9["codebook_note"], "expected confirmed codebook note")
+    _assert(overall["recommended_logical_type"] == "numeric_measure", "expected deterministic standalone mapping to stay metadata-only in canon")
+    _assert(overall["recommended_storage_type"] == "integer", "expected deterministic standalone mapping to preserve baseline storage")
+    _assert(overall["type_decision_source"] == "a17_baseline", "expected canon to ignore deterministic standalone mappings for type refinement")
+
+
+def test_scale_mapping_resolver_skips_numeric_standalone_columns():
+    support = {
+        "a2_rows": [
+            {"column": "ID", "top_levels": ["1", "2", "3", "4"], "a2_samples": {"random": []}, "unique_count": 4, "top_candidate": {"type": "categorical"}},
+            {"column": "Age", "top_levels": ["18", "19", "20", "21"], "a2_samples": {"random": []}, "unique_count": 4, "top_candidate": {"type": "numeric"}},
+            {"column": "GPA", "top_levels": ["2.7", "3.0", "3.3", "4.0"], "a2_samples": {"random": []}, "unique_count": 4, "top_candidate": {"type": "numeric"}},
+            {"column": "Final_Grade", "top_levels": ["60", "70", "80", "90"], "a2_samples": {"random": []}, "unique_count": 4, "top_candidate": {"type": "numeric"}},
+            {"column": "ANXATT", "top_levels": ["1", "2", "3"], "a2_samples": {"random": []}, "unique_count": 3, "top_candidate": {"type": "categorical"}},
+            {"column": "MATHATT", "top_levels": ["1", "2", "3"], "a2_samples": {"random": []}, "unique_count": 3, "top_candidate": {"type": "categorical"}},
+            {"column": "OverallSatisfaction", "top_levels": ["Strongly disagree 1", "Disagree 2", "Neutral 3", "Agree 4", "Strongly agree 5"], "a2_samples": {"random": []}, "unique_count": 5, "top_candidate": {"type": "categorical"}},
+        ],
+        "a2_by_col": {},
+        "a2_order": ["ID", "Age", "GPA", "Final_Grade", "ANXATT", "MATHATT", "OverallSatisfaction"],
+        "a9_by_col": {},
+        "a13_by_col": {},
+        "a14_by_col": {},
+        "a16_by_col": {},
+        "a17_by_col": {
+            "ID": _baseline_row("ID", role="id_key", logical_type="identifier", storage_type="string", transform_actions=["trim_whitespace", "cast_to_string"], interpretation_hints=["identifier_not_measure"]),
+            "Age": _baseline_row("Age", role="measure", logical_type="numeric_measure", storage_type="decimal", transform_actions=["trim_whitespace", "cast_to_decimal"]),
+            "GPA": _baseline_row("GPA", role="measure", logical_type="numeric_measure", storage_type="decimal", transform_actions=["trim_whitespace", "cast_to_decimal"]),
+            "Final_Grade": _baseline_row("Final_Grade", role="measure", logical_type="numeric_measure", storage_type="decimal", transform_actions=["trim_whitespace", "cast_to_decimal"]),
+            "ANXATT": _baseline_row("ANXATT", role="measure", logical_type="categorical_code", storage_type="string", transform_actions=["trim_whitespace", "cast_to_string"]),
+            "MATHATT": _baseline_row("MATHATT", role="measure", logical_type="categorical_code", storage_type="string", transform_actions=["trim_whitespace", "cast_to_string"]),
+            "OverallSatisfaction": _baseline_row("OverallSatisfaction", role="measure_item", logical_type="numeric_measure", storage_type="integer", transform_actions=["trim_whitespace", "strip_numeric_formatting", "cast_to_integer"]),
+        },
+        "family_by_column": {},
+        "missing_artifacts": [],
+        "a17_backfilled": False,
+    }
+    support["a2_by_col"] = {row["column"]: row for row in support["a2_rows"]}
+    app._load_canonical_support_artifacts = lambda run_id: support
+
+    scale_mapping_json = app._build_scale_mapping_contract(
+        run_id="run_smoke",
+        light_contract_decisions={
+            "run_id": "run_smoke",
+            "light_contract_status": "accepted",
+            "primary_grain_decision": {"status": "accept", "keys": ["ID"], "comments": ""},
+            "reference_decisions": [],
+            "dimension_decisions": [],
+            "family_decisions": [],
+            "override_notes": {},
+            "semantic_context_input": {"dataset_context_and_collection_notes": "", "semantic_codebook_and_important_variables": ""},
+            "scale_mapping_input": [],
+        },
+        family_worker_json={},
+        scale_mapping_extractor_json={},
+    )
+    by_target = {(row["target_kind"], row["target_id"]): row for row in scale_mapping_json["mappings"]}
+    for column in ["ID", "Age", "GPA", "Final_Grade", "ANXATT", "MATHATT"]:
+        _assert(("column", column) not in by_target, f"expected resolver to skip numeric standalone scale inference for {column}")
+    _assert(by_target[("column", "OverallSatisfaction")]["mapping_status"] == "deterministic_inferred", "expected textual ladder standalone mapping to remain available as resolver metadata")
+
+
+def test_scale_mapping_resolver_drops_placeholder_human_family_rows():
+    support = {
+        "a2_rows": [
+            {"column": "A1Row1", "top_levels": ["A", "B"], "a2_samples": {"random": []}, "unique_count": 2, "top_candidate": {"type": "categorical"}},
+            {"column": "A2Row1", "top_levels": ["A", "B"], "a2_samples": {"random": []}, "unique_count": 2, "top_candidate": {"type": "categorical"}},
+            {"column": "M1_Q1", "top_levels": ["A", "B"], "a2_samples": {"random": []}, "unique_count": 2, "top_candidate": {"type": "categorical"}},
+            {"column": "M2_Q1", "top_levels": ["A", "B"], "a2_samples": {"random": []}, "unique_count": 2, "top_candidate": {"type": "categorical"}},
+            {"column": "Q1", "top_levels": ["A", "B"], "a2_samples": {"random": []}, "unique_count": 2, "top_candidate": {"type": "categorical"}},
+        ],
+        "a2_by_col": {},
+        "a2_order": ["A1Row1", "A2Row1", "M1_Q1", "M2_Q1", "Q1"],
+        "a9_by_col": {},
+        "a13_by_col": {},
+        "a14_by_col": {},
+        "a16_by_col": {},
+        "a17_by_col": {},
+        "family_by_column": {
+            "A1Row1": "a_1",
+            "A2Row1": "a_2",
+            "M1_Q1": "m_1",
+            "M2_Q1": "m_2",
+            "Q1": "q",
+        },
+        "missing_artifacts": [],
+        "a17_backfilled": False,
+    }
+    support["a2_by_col"] = {row["column"]: row for row in support["a2_rows"]}
+    app._load_canonical_support_artifacts = lambda run_id: support
+
+    light_contract_decisions = {
+        "run_id": "run_smoke",
+        "light_contract_status": "accepted",
+        "primary_grain_decision": {"status": "accept", "keys": ["RespondentId"], "comments": ""},
+        "reference_decisions": [],
+        "dimension_decisions": [],
+        "family_decisions": [
+            {"family_id": "a_1", "status": "accept", "table_name": "a1_long", "repeat_index_name": "row", "parent_key": "RespondentId", "comments": ""},
+            {"family_id": "a_2", "status": "accept", "table_name": "a2_long", "repeat_index_name": "row", "parent_key": "RespondentId", "comments": ""},
+            {"family_id": "m_1", "status": "accept", "table_name": "m1_long", "repeat_index_name": "row", "parent_key": "RespondentId", "comments": ""},
+            {"family_id": "m_2", "status": "accept", "table_name": "m2_long", "repeat_index_name": "row", "parent_key": "RespondentId", "comments": ""},
+            {"family_id": "q", "status": "accept", "table_name": "q_long", "repeat_index_name": "row", "parent_key": "RespondentId", "comments": ""},
+        ],
+        "override_notes": {},
+        "semantic_context_input": {"dataset_context_and_collection_notes": "", "semantic_codebook_and_important_variables": ""},
+        "scale_mapping_input": [
+            {"target_kind": "family", "target_id": "a_1"},
+            {"target_kind": "family", "target_id": "a_2"},
+            {"target_kind": "family", "target_id": "m_1"},
+            {"target_kind": "family", "target_id": "m_2"},
+            {"target_kind": "family", "target_id": "q"},
+        ],
+    }
+    scale_mapping_json = app._build_scale_mapping_contract(
+        run_id="run_smoke",
+        light_contract_decisions=light_contract_decisions,
+        family_worker_json={},
+        scale_mapping_extractor_json={},
+    )
+    by_target = {(row["target_kind"], row["target_id"]): row for row in scale_mapping_json["mappings"]}
+    for family_id in ["a_1", "a_2", "m_1", "m_2", "q"]:
+        _assert(("family", family_id) not in by_target, f"expected placeholder light-contract row for {family_id} to be dropped instead of confirmed")
+
+
+def test_canonical_scale_mapping_applies_only_confirmed_label_complete_mappings():
+    support = {
+        "a2_rows": [
+            {"column": "A1Row1", "top_levels": ["1", "2", "3", "4", "5"], "a2_samples": {"random": []}, "unique_count": 5, "top_candidate": {"type": "categorical"}},
+            {"column": "A2Row1", "top_levels": ["1", "2", "3", "4", "5"], "a2_samples": {"random": []}, "unique_count": 5, "top_candidate": {"type": "categorical"}},
+            {"column": "M1_Q1", "top_levels": ["A", "B", "C", "D"], "a2_samples": {"random": []}, "unique_count": 4, "top_candidate": {"type": "categorical"}},
+            {"column": "M2_Q1", "top_levels": ["A", "B", "C", "D"], "a2_samples": {"random": []}, "unique_count": 4, "top_candidate": {"type": "categorical"}},
+            {"column": "Q1", "top_levels": ["A", "B", "C", "D"], "a2_samples": {"random": []}, "unique_count": 4, "top_candidate": {"type": "categorical"}},
+            {"column": "ID", "top_levels": ["1", "2", "3", "4"], "a2_samples": {"random": []}, "unique_count": 4, "top_candidate": {"type": "categorical"}},
+            {"column": "Age", "top_levels": ["18", "19", "20", "21"], "a2_samples": {"random": []}, "unique_count": 4, "top_candidate": {"type": "numeric"}},
+            {"column": "GPA", "top_levels": ["2.7", "3.0", "3.3", "4.0"], "a2_samples": {"random": []}, "unique_count": 4, "top_candidate": {"type": "numeric"}},
+            {"column": "Final_Grade", "top_levels": ["60", "70", "80", "90"], "a2_samples": {"random": []}, "unique_count": 4, "top_candidate": {"type": "numeric"}},
+            {"column": "ANXATT", "top_levels": ["1", "2", "3"], "a2_samples": {"random": []}, "unique_count": 3, "top_candidate": {"type": "categorical"}},
+            {"column": "MATHATT", "top_levels": ["1", "2", "3"], "a2_samples": {"random": []}, "unique_count": 3, "top_candidate": {"type": "categorical"}},
+        ],
+        "a2_by_col": {},
+        "a2_order": ["A1Row1", "A2Row1", "M1_Q1", "M2_Q1", "Q1", "ID", "Age", "GPA", "Final_Grade", "ANXATT", "MATHATT"],
+        "a9_by_col": {},
+        "a13_by_col": {},
+        "a14_by_col": {},
+        "a16_by_col": {},
+        "a17_by_col": {
+            "A1Row1": _baseline_row("A1Row1", role="measure_item", logical_type="numeric_measure", storage_type="integer", transform_actions=["trim_whitespace", "strip_numeric_formatting", "cast_to_integer"], structural_transform_hints=["requires_codebook_or_label_mapping_review"], normalization_notes="validate numeric-label mapping before casting to numeric"),
+            "A2Row1": _baseline_row("A2Row1", role="measure_item", logical_type="numeric_measure", storage_type="integer", transform_actions=["trim_whitespace", "strip_numeric_formatting", "cast_to_integer"], structural_transform_hints=["requires_codebook_or_label_mapping_review"], normalization_notes="validate numeric-label mapping before casting to numeric"),
+            "M1_Q1": _baseline_row("M1_Q1", role="measure_item", logical_type="nominal_category", storage_type="string", transform_actions=["trim_whitespace", "uppercase_values"]),
+            "M2_Q1": _baseline_row("M2_Q1", role="measure_item", logical_type="nominal_category", storage_type="string", transform_actions=["trim_whitespace", "uppercase_values"]),
+            "Q1": _baseline_row("Q1", role="invariant_attr", logical_type="nominal_category", storage_type="string", transform_actions=["trim_whitespace", "uppercase_values"]),
+            "ID": _baseline_row("ID", role="id_key", logical_type="identifier", storage_type="string", transform_actions=["trim_whitespace", "cast_to_string"], interpretation_hints=["identifier_not_measure"]),
+            "Age": _baseline_row("Age", role="measure", logical_type="numeric_measure", storage_type="decimal", transform_actions=["trim_whitespace", "cast_to_decimal"]),
+            "GPA": _baseline_row("GPA", role="measure", logical_type="numeric_measure", storage_type="decimal", transform_actions=["trim_whitespace", "cast_to_decimal"]),
+            "Final_Grade": _baseline_row("Final_Grade", role="measure", logical_type="numeric_measure", storage_type="decimal", transform_actions=["trim_whitespace", "cast_to_decimal"]),
+            "ANXATT": _baseline_row("ANXATT", role="measure", logical_type="categorical_code", storage_type="string", transform_actions=["trim_whitespace", "cast_to_string"]),
+            "MATHATT": _baseline_row("MATHATT", role="measure", logical_type="categorical_code", storage_type="string", transform_actions=["trim_whitespace", "cast_to_string"]),
+        },
+        "family_by_column": {
+            "A1Row1": "a_1",
+            "A2Row1": "a_2",
+            "M1_Q1": "m_1",
+            "M2_Q1": "m_2",
+            "Q1": "q",
+        },
+        "missing_artifacts": [],
+        "a17_backfilled": False,
+    }
+    support["a2_by_col"] = {row["column"]: row for row in support["a2_rows"]}
+    app._load_canonical_support_artifacts = lambda run_id: support
+
+    light_contract_decisions = {
+        "run_id": "run_smoke",
+        "light_contract_status": "accepted",
+        "primary_grain_decision": {"status": "accept", "keys": ["ID"], "comments": ""},
+        "reference_decisions": [],
+        "dimension_decisions": [],
+        "family_decisions": [
+            {"family_id": "a_1", "status": "accept", "table_name": "a1_long", "repeat_index_name": "row", "parent_key": "ID", "comments": ""},
+            {"family_id": "a_2", "status": "accept", "table_name": "a2_long", "repeat_index_name": "row", "parent_key": "ID", "comments": ""},
+            {"family_id": "m_1", "status": "accept", "table_name": "m1_long", "repeat_index_name": "row", "parent_key": "ID", "comments": ""},
+            {"family_id": "m_2", "status": "accept", "table_name": "m2_long", "repeat_index_name": "row", "parent_key": "ID", "comments": ""},
+            {"family_id": "q", "status": "accept", "table_name": "q_long", "repeat_index_name": "row", "parent_key": "ID", "comments": ""},
+        ],
+        "override_notes": {},
+        "semantic_context_input": {"dataset_context_and_collection_notes": "", "semantic_codebook_and_important_variables": ""},
+        "scale_mapping_input": [
+            {"target_kind": "family", "target_id": "a_1", "response_scale_kind": "ordinal_scale", "ordered_labels": ["1", "2", "3", "4", "5"], "numeric_scores": [1, 2, 3, 4, 5], "notes": "Confirmed A1 ladder."},
+            {"target_kind": "family", "target_id": "a_2", "response_scale_kind": "ordinal_scale", "ordered_labels": ["1", "2", "3", "4", "5"], "numeric_scores": [1, 2, 3, 4, 5], "notes": "Confirmed A2 ladder."},
+            {"target_kind": "family", "target_id": "m_1"},
+            {"target_kind": "family", "target_id": "m_2"},
+            {"target_kind": "family", "target_id": "q"},
+        ],
+    }
+    family_worker_json = {
+        "family_results": [
+            {"family_result": {"family_id": "a_1", "recommended_family_role": "repeated_survey_block", "member_semantics_notes": "Start-of-term anxiety ladder"}},
+            {"family_result": {"family_id": "a_2", "recommended_family_role": "repeated_survey_block", "member_semantics_notes": "End-of-term anxiety ladder"}},
+            {"family_result": {"family_id": "m_1", "recommended_family_role": "repeated_assessment", "member_semantics_notes": "Math item responses"}},
+            {"family_result": {"family_id": "m_2", "recommended_family_role": "repeated_assessment", "member_semantics_notes": "Math item responses"}},
+            {"family_result": {"family_id": "q", "recommended_family_role": "reference_lookup", "member_semantics_notes": "Answer key codes"}},
+        ]
+    }
+
+    scale_mapping_json = app._build_scale_mapping_contract(
+        run_id="run_smoke",
+        light_contract_decisions=light_contract_decisions,
+        family_worker_json=family_worker_json,
+        scale_mapping_extractor_json={},
+    )
+    by_target = {(row["target_kind"], row["target_id"]): row for row in scale_mapping_json["mappings"]}
+    _assert(by_target[("family", "a_1")]["mapping_status"] == "human_confirmed", "expected A1 confirmed family mapping")
+    _assert(by_target[("family", "a_2")]["mapping_status"] == "human_confirmed", "expected A2 confirmed family mapping")
+    for family_id in ["m_1", "m_2", "q"]:
+        _assert(("family", family_id) not in by_target, f"expected placeholder row for {family_id} to be dropped before canon")
+
+    canon = app._synthesize_canonical_column_contract(
+        run_id="run_smoke",
+        light_contract_decisions=light_contract_decisions,
+        semantic_context_json={"status": "skipped", "reason": "light_contract_accepted"},
+        type_transform_worker_json={"column_decisions": [], "global_transform_rules": []},
+        missingness_worker_json={"column_decisions": [], "global_contract": {"token_missing_placeholders_detected": False, "notes": ""}, "global_findings": []},
+        family_worker_json=family_worker_json,
+        table_layout_worker_json={
+            "column_table_assignments": [
+                {"column": "A1Row1", "assigned_table": "a1_long", "assignment_role": "melt_member", "source_family_id": "a_1"},
+                {"column": "A2Row1", "assigned_table": "a2_long", "assignment_role": "melt_member", "source_family_id": "a_2"},
+                {"column": "M1_Q1", "assigned_table": "m1_long", "assignment_role": "melt_member", "source_family_id": "m_1"},
+                {"column": "M2_Q1", "assigned_table": "m2_long", "assignment_role": "melt_member", "source_family_id": "m_2"},
+                {"column": "Q1", "assigned_table": "q_long", "assignment_role": "melt_member", "source_family_id": "q"},
+                {"column": "ID", "assigned_table": "students", "assignment_role": "base_key", "source_family_id": ""},
+                {"column": "Age", "assigned_table": "students", "assignment_role": "base_attribute", "source_family_id": ""},
+                {"column": "GPA", "assigned_table": "students", "assignment_role": "base_attribute", "source_family_id": ""},
+                {"column": "Final_Grade", "assigned_table": "students", "assignment_role": "base_attribute", "source_family_id": ""},
+                {"column": "ANXATT", "assigned_table": "students", "assignment_role": "base_attribute", "source_family_id": ""},
+                {"column": "MATHATT", "assigned_table": "students", "assignment_role": "base_attribute", "source_family_id": ""},
+            ],
+            "table_suggestions": [
+                {"table_name": "a1_long", "kind": "child_repeat"},
+                {"table_name": "a2_long", "kind": "child_repeat"},
+                {"table_name": "m1_long", "kind": "child_repeat"},
+                {"table_name": "m2_long", "kind": "child_repeat"},
+                {"table_name": "q_long", "kind": "child_repeat"},
+                {"table_name": "students", "kind": "base_table"},
+            ],
+        },
+        scale_mapping_json=scale_mapping_json,
+        support=support,
+    )
+
+    rows = {row["column"]: row for row in canon["column_contracts"]}
+    for column in ["A1Row1", "A2Row1"]:
+        _assert(rows[column]["recommended_logical_type"] == "ordinal_category", f"expected confirmed family mapping to refine {column}")
+        _assert(rows[column]["type_decision_source"] == "scale_mapping_resolver", f"expected scale mapping to own the type refinement for {column}")
+    _assert(rows["M1_Q1"]["recommended_logical_type"] == "nominal_category", "expected M1 categorical answers to stay categorical")
+    _assert(rows["M1_Q1"]["type_decision_source"] == "a17_baseline", "expected M1 to preserve baseline type source")
+    _assert(rows["M2_Q1"]["recommended_logical_type"] == "nominal_category", "expected M2 categorical answers to stay categorical")
+    _assert(rows["M2_Q1"]["type_decision_source"] == "a17_baseline", "expected M2 to preserve baseline type source")
+    _assert(rows["Q1"]["recommended_logical_type"] == "nominal_category", "expected Q answer-key codes to stay categorical")
+    _assert(rows["Q1"]["type_decision_source"] == "a17_baseline", "expected Q answer-key codes to preserve baseline type source")
+    _assert(rows["ID"]["recommended_logical_type"] == "identifier", "expected ID to remain an identifier")
+    _assert(rows["ID"]["type_decision_source"] == "a17_baseline", "expected ID to preserve baseline type source")
+    for column in ["Age", "GPA", "Final_Grade"]:
+        _assert(rows[column]["recommended_logical_type"] == "numeric_measure", f"expected {column} to remain numeric")
+        _assert(rows[column]["type_decision_source"] == "a17_baseline", f"expected {column} to preserve baseline type source")
+    for column in ["ANXATT", "MATHATT"]:
+        _assert(rows[column]["recommended_logical_type"] == "categorical_code", f"expected {column} to remain a coded gating field")
+        _assert(rows[column]["type_decision_source"] == "a17_baseline", f"expected {column} to preserve baseline type source")
+
+
+def test_scale_mapping_resolver_reconciles_codebook_labels_to_numeric_source_tokens():
+    support = {
+        "a2_rows": [
+            {
+                "column": "A1Row1",
+                "top_levels": ["1", "2", "3", "4", "5"],
+                "a2_samples": {"random": []},
+                "unique_count": 5,
+                "top_candidate": {"type": "categorical"},
+            },
+            {
+                "column": "A2Row1",
+                "top_levels": ["1", "2", "3", "4", "5"],
+                "a2_samples": {"random": []},
+                "unique_count": 5,
+                "top_candidate": {"type": "categorical"},
+            },
+        ],
+        "a2_by_col": {},
+        "a2_order": ["A1Row1", "A2Row1"],
+        "a9_by_col": {},
+        "a13_by_col": {},
+        "a14_by_col": {},
+        "a16_by_col": {},
+        "a17_by_col": {},
+        "family_by_column": {
+            "A1Row1": "a_1",
+            "A2Row1": "a_2",
+        },
+        "missing_artifacts": [],
+        "a17_backfilled": False,
+    }
+    support["a2_by_col"] = {row["column"]: row for row in support["a2_rows"]}
+    app._load_canonical_support_artifacts = lambda run_id: support
+
+    light_contract_decisions = {
+        "run_id": "run_smoke",
+        "light_contract_status": "accepted",
+        "primary_grain_decision": {"status": "accept", "keys": ["RespondentId"], "comments": ""},
+        "reference_decisions": [],
+        "dimension_decisions": [],
+        "family_decisions": [
+            {"family_id": "a_1", "status": "accept", "table_name": "a1_long", "repeat_index_name": "row", "parent_key": "RespondentId", "comments": ""},
+            {"family_id": "a_2", "status": "accept", "table_name": "a2_long", "repeat_index_name": "row", "parent_key": "RespondentId", "comments": ""},
+        ],
+        "override_notes": {},
+        "semantic_context_input": {"dataset_context_and_collection_notes": "", "semantic_codebook_and_important_variables": ""},
+        "scale_mapping_input": [],
+    }
+    family_worker_json = {
+        "family_results": [
+            {"family_result": {"family_id": "a_1", "recommended_family_role": "repeated_survey_block", "member_semantics_notes": "STARS anxiety start-of-term"}},
+            {"family_result": {"family_id": "a_2", "recommended_family_role": "repeated_survey_block", "member_semantics_notes": "STARS anxiety end-of-term"}},
+        ]
+    }
+    extractor_json = {
+        "worker": "scale_mapping_extractor",
+        "summary": {"overview": "", "key_points": []},
+        "mappings": [
+            {
+                "target_kind": "family",
+                "target_id": "a_1",
+                "mapping_status": "codebook_confirmed",
+                "response_scale_kind": "anxiety_likert_1_to_5",
+                "ordered_labels": ["No anxiety 1", "2", "3", "4", "Strong anxiety 5"],
+                "label_to_ordinal_position": {
+                    "No anxiety 1": 1,
+                    "2": 2,
+                    "3": 3,
+                    "4": 4,
+                    "Strong anxiety 5": 5,
+                },
+                "label_to_numeric_score": {
+                    "No anxiety 1": 1,
+                    "2": 2,
+                    "3": 3,
+                    "4": 4,
+                    "Strong anxiety 5": 5,
+                },
+                "numeric_score_semantics_confirmed": True,
+                "source": "codebook_pdf",
+                "notes": "Codebook says 1 means No anxiety and 5 means Strong anxiety.",
+                "confidence": 0.92,
+            }
+        ],
+        "review_flags": [],
+        "assumptions": [],
+    }
+
+    scale_mapping_json = app._build_scale_mapping_contract(
+        run_id="run_smoke",
+        light_contract_decisions=light_contract_decisions,
+        family_worker_json=family_worker_json,
+        scale_mapping_extractor_json=extractor_json,
+    )
+    by_target = {(row["target_kind"], row["target_id"]): row for row in scale_mapping_json["mappings"]}
+    a1 = by_target[("family", "a_1")]
+    _assert(a1["ordered_labels"] == ["1", "2", "3", "4", "5"], "expected resolver to rewrite polluted labels to observed numeric source tokens")
+    _assert(a1["label_to_numeric_score"] == {"1": 1, "2": 2, "3": 3, "4": 4, "5": 5}, "expected reconciled numeric mapping to use raw numeric tokens")
+    _assert("Codebook meaning: 1 = No anxiety; 5 = Strong anxiety." in a1["notes"], "expected semantic explanation to be preserved in notes")
+
+    support["a17_by_col"] = {
+        "A1Row1": {
+            "column": "A1Row1",
+            "a9_primary_role": "measure_item",
+            "recommended_logical_type": "numeric_measure",
+            "recommended_storage_type": "integer",
+            "transform_actions": ["trim_whitespace", "strip_numeric_formatting", "cast_to_integer"],
+            "structural_transform_hints": ["requires_codebook_or_label_mapping_review"],
+            "interpretation_hints": [],
+            "missingness_disposition": "no_material_missingness",
+            "missingness_handling": "no_action_needed",
+            "skip_logic_protected": False,
+            "type_normalization_notes": "validate numeric-label mapping before casting to numeric",
+            "missingness_normalization_notes": "",
+            "quality_score": 0.9,
+            "drift_detected": False,
+            "type_decision_source": "a17_baseline",
+            "missingness_decision_source": "a17_baseline",
+            "type_confidence": 0.61,
+            "missingness_confidence": 0.85,
+            "type_review_required": False,
+            "missingness_review_required": False,
+            "confidence": 0.71,
+            "applied_sources": ["A17"],
+        }
+    }
+    canon = app._synthesize_canonical_column_contract(
+        run_id="run_smoke",
+        light_contract_decisions=light_contract_decisions,
+        semantic_context_json={"status": "skipped", "reason": "light_contract_accepted"},
+        type_transform_worker_json={"column_decisions": [], "global_transform_rules": []},
+        missingness_worker_json={"column_decisions": [], "global_contract": {"token_missing_placeholders_detected": False, "notes": ""}, "global_findings": []},
+        family_worker_json=family_worker_json,
+        table_layout_worker_json={
+            "column_table_assignments": [
+                {"column": "A1Row1", "assigned_table": "a1_long", "assignment_role": "melt_member", "source_family_id": "a_1"},
+            ],
+            "table_suggestions": [
+                {"table_name": "a1_long", "kind": "child_repeat"},
+            ],
+        },
+        scale_mapping_json=scale_mapping_json,
+        support=support,
+    )
+    canon_row = {row["column"]: row for row in canon["column_contracts"]}["A1Row1"]
+    _assert("Ordered labels: 1 | 2 | 3 | 4 | 5." in canon_row["codebook_note"], "expected canon note to use reconciled raw source labels")
+    _assert("No anxiety 1" not in canon_row["codebook_note"], "expected canon note to avoid polluted hybrid labels")
+
+
+def test_scale_mapping_resolver_preserves_textual_source_labels():
+    support = {
+        "a2_rows": [
+            {
+                "column": "AnxietyOverall",
+                "top_levels": ["No anxiety", "Low", "Moderate", "High", "Strong anxiety"],
+                "a2_samples": {"random": []},
+                "unique_count": 5,
+                "top_candidate": {"type": "categorical"},
+            }
+        ],
+        "a2_by_col": {},
+        "a2_order": ["AnxietyOverall"],
+        "a9_by_col": {},
+        "a13_by_col": {},
+        "a14_by_col": {},
+        "a16_by_col": {},
+        "a17_by_col": {},
+        "family_by_column": {},
+        "missing_artifacts": [],
+        "a17_backfilled": False,
+    }
+    support["a2_by_col"] = {row["column"]: row for row in support["a2_rows"]}
+    app._load_canonical_support_artifacts = lambda run_id: support
+
+    scale_mapping_json = app._build_scale_mapping_contract(
+        run_id="run_smoke",
+        light_contract_decisions={
+            "run_id": "run_smoke",
+            "light_contract_status": "accepted",
+            "primary_grain_decision": {"status": "accept", "keys": ["RespondentId"], "comments": ""},
+            "reference_decisions": [],
+            "dimension_decisions": [],
+            "family_decisions": [],
+            "override_notes": {},
+            "semantic_context_input": {"dataset_context_and_collection_notes": "", "semantic_codebook_and_important_variables": ""},
+            "scale_mapping_input": [],
+        },
+        family_worker_json={},
+        scale_mapping_extractor_json={
+            "worker": "scale_mapping_extractor",
+            "summary": {"overview": "", "key_points": []},
+            "mappings": [
+                {
+                    "target_kind": "column",
+                    "target_id": "AnxietyOverall",
+                    "mapping_status": "codebook_confirmed",
+                    "response_scale_kind": "anxiety_likert_1_to_5",
+                    "ordered_labels": ["No anxiety", "Low", "Moderate", "High", "Strong anxiety"],
+                    "label_to_ordinal_position": {
+                        "No anxiety": 1,
+                        "Low": 2,
+                        "Moderate": 3,
+                        "High": 4,
+                        "Strong anxiety": 5,
+                    },
+                    "label_to_numeric_score": {},
+                    "numeric_score_semantics_confirmed": False,
+                    "source": "codebook_pdf",
+                    "notes": "Observed raw values are already textual.",
+                    "confidence": 0.92,
+                }
+            ],
+            "review_flags": [],
+            "assumptions": [],
+        },
+    )
+    by_target = {(row["target_kind"], row["target_id"]): row for row in scale_mapping_json["mappings"]}
+    textual = by_target[("column", "AnxietyOverall")]
+    _assert(textual["ordered_labels"] == ["No anxiety", "Low", "Moderate", "High", "Strong anxiety"], "expected textual raw labels to remain unchanged")
+
+
+def test_scale_mapping_resolver_reconciles_numeric_tokens_with_whitespace():
+    support = {
+        "a2_rows": [
+            {
+                "column": "AnxietyNumeric",
+                "top_levels": [" 1 ", "2", " 3", "4 ", "5"],
+                "a2_samples": {"random": []},
+                "unique_count": 5,
+                "top_candidate": {"type": "categorical"},
+            }
+        ],
+        "a2_by_col": {},
+        "a2_order": ["AnxietyNumeric"],
+        "a9_by_col": {},
+        "a13_by_col": {},
+        "a14_by_col": {},
+        "a16_by_col": {},
+        "a17_by_col": {},
+        "family_by_column": {},
+        "missing_artifacts": [],
+        "a17_backfilled": False,
+    }
+    support["a2_by_col"] = {row["column"]: row for row in support["a2_rows"]}
+    app._load_canonical_support_artifacts = lambda run_id: support
+
+    scale_mapping_json = app._build_scale_mapping_contract(
+        run_id="run_smoke",
+        light_contract_decisions={
+            "run_id": "run_smoke",
+            "light_contract_status": "accepted",
+            "primary_grain_decision": {"status": "accept", "keys": ["RespondentId"], "comments": ""},
+            "reference_decisions": [],
+            "dimension_decisions": [],
+            "family_decisions": [],
+            "override_notes": {},
+            "semantic_context_input": {"dataset_context_and_collection_notes": "", "semantic_codebook_and_important_variables": ""},
+            "scale_mapping_input": [],
+        },
+        family_worker_json={},
+        scale_mapping_extractor_json={
+            "worker": "scale_mapping_extractor",
+            "summary": {"overview": "", "key_points": []},
+            "mappings": [
+                {
+                    "target_kind": "column",
+                    "target_id": "AnxietyNumeric",
+                    "mapping_status": "codebook_confirmed",
+                    "response_scale_kind": "anxiety_likert_1_to_5",
+                    "ordered_labels": ["No anxiety 1", "2", "3", "4", "Strong anxiety 5"],
+                    "label_to_ordinal_position": {"No anxiety 1": 1, "2": 2, "3": 3, "4": 4, "Strong anxiety 5": 5},
+                    "label_to_numeric_score": {"No anxiety 1": 1, "2": 2, "3": 3, "4": 4, "Strong anxiety 5": 5},
+                    "numeric_score_semantics_confirmed": True,
+                    "source": "codebook_pdf",
+                    "notes": "Codebook says 1 means No anxiety and 5 means Strong anxiety.",
+                    "confidence": 0.92,
+                }
+            ],
+            "review_flags": [],
+            "assumptions": [],
+        },
+    )
+    mapping = {(row["target_kind"], row["target_id"]): row for row in scale_mapping_json["mappings"]}[("column", "AnxietyNumeric")]
+    _assert(mapping["ordered_labels"] == ["1", "2", "3", "4", "5"], "expected whitespace-padded numeric raw tokens to reconcile cleanly")
+
+
+def test_scale_mapping_resolver_flags_ambiguous_source_value_mismatch():
+    support = {
+        "a2_rows": [
+            {
+                "column": "AnxietyMismatch",
+                "top_levels": ["1", "2", "4", "5"],
+                "a2_samples": {"random": []},
+                "unique_count": 4,
+                "top_candidate": {"type": "categorical"},
+            }
+        ],
+        "a2_by_col": {},
+        "a2_order": ["AnxietyMismatch"],
+        "a9_by_col": {},
+        "a13_by_col": {},
+        "a14_by_col": {},
+        "a16_by_col": {},
+        "a17_by_col": {},
+        "family_by_column": {},
+        "missing_artifacts": [],
+        "a17_backfilled": False,
+    }
+    support["a2_by_col"] = {row["column"]: row for row in support["a2_rows"]}
+    app._load_canonical_support_artifacts = lambda run_id: support
+
+    scale_mapping_json = app._build_scale_mapping_contract(
+        run_id="run_smoke",
+        light_contract_decisions={
+            "run_id": "run_smoke",
+            "light_contract_status": "accepted",
+            "primary_grain_decision": {"status": "accept", "keys": ["RespondentId"], "comments": ""},
+            "reference_decisions": [],
+            "dimension_decisions": [],
+            "family_decisions": [],
+            "override_notes": {},
+            "semantic_context_input": {"dataset_context_and_collection_notes": "", "semantic_codebook_and_important_variables": ""},
+            "scale_mapping_input": [],
+        },
+        family_worker_json={},
+        scale_mapping_extractor_json={
+            "worker": "scale_mapping_extractor",
+            "summary": {"overview": "", "key_points": []},
+            "mappings": [
+                {
+                    "target_kind": "column",
+                    "target_id": "AnxietyMismatch",
+                    "mapping_status": "codebook_confirmed",
+                    "response_scale_kind": "anxiety_likert_1_to_5",
+                    "ordered_labels": ["No anxiety 1", "2", "3", "Strong anxiety 5"],
+                    "label_to_ordinal_position": {"No anxiety 1": 1, "2": 2, "3": 3, "Strong anxiety 5": 4},
+                    "label_to_numeric_score": {"No anxiety 1": 1, "2": 2, "3": 3, "Strong anxiety 5": 5},
+                    "numeric_score_semantics_confirmed": True,
+                    "source": "codebook_pdf",
+                    "notes": "Extractor proposed a 1-5 ladder.",
+                    "confidence": 0.92,
+                }
+            ],
+            "review_flags": [],
+            "assumptions": [],
+        },
+    )
+    mapping = {(row["target_kind"], row["target_id"]): row for row in scale_mapping_json["mappings"]}[("column", "AnxietyMismatch")]
+    _assert(mapping["ordered_labels"] == ["No anxiety 1", "2", "3", "Strong anxiety 5"], "expected ambiguous mapping to remain unchanged when reconciliation is unsafe")
+    review_flags = scale_mapping_json.get("review_flags") or []
+    _assert(any(flag.get("issue") == "scale_mapping_source_value_mismatch" and flag.get("item") == "column:AnxietyMismatch" for flag in review_flags), "expected ambiguous mismatch to raise a resolver review flag")
+
+
+def test_scale_mapping_resolver_preserves_human_override_precedence():
+    support = {
+        "a2_rows": [
+            {
+                "column": "A1Row1",
+                "top_levels": ["1", "2", "3", "4", "5"],
+                "a2_samples": {"random": []},
+                "unique_count": 5,
+                "top_candidate": {"type": "categorical"},
+            }
+        ],
+        "a2_by_col": {},
+        "a2_order": ["A1Row1"],
+        "a9_by_col": {},
+        "a13_by_col": {},
+        "a14_by_col": {},
+        "a16_by_col": {},
+        "a17_by_col": {},
+        "family_by_column": {"A1Row1": "a_1"},
+        "missing_artifacts": [],
+        "a17_backfilled": False,
+    }
+    support["a2_by_col"] = {row["column"]: row for row in support["a2_rows"]}
+    app._load_canonical_support_artifacts = lambda run_id: support
+
+    scale_mapping_json = app._build_scale_mapping_contract(
+        run_id="run_smoke",
+        light_contract_decisions={
+            "run_id": "run_smoke",
+            "light_contract_status": "accepted",
+            "primary_grain_decision": {"status": "accept", "keys": ["RespondentId"], "comments": ""},
+            "reference_decisions": [],
+            "dimension_decisions": [],
+            "family_decisions": [
+                {"family_id": "a_1", "status": "accept", "table_name": "a1_long", "repeat_index_name": "row", "parent_key": "RespondentId", "comments": ""},
+            ],
+            "override_notes": {},
+            "semantic_context_input": {"dataset_context_and_collection_notes": "", "semantic_codebook_and_important_variables": ""},
+            "scale_mapping_input": [
+                {
+                    "target_kind": "family",
+                    "target_id": "a_1",
+                    "response_scale_kind": "anxiety_likert_1_to_5",
+                    "ordered_labels": ["1", "2", "3", "4", "5"],
+                    "numeric_scores": [1, 2, 3, 4, 5],
+                    "notes": "Human confirmed numeric ladder.",
+                }
+            ],
+        },
+        family_worker_json={},
+        scale_mapping_extractor_json={
+            "worker": "scale_mapping_extractor",
+            "summary": {"overview": "", "key_points": []},
+            "mappings": [
+                {
+                    "target_kind": "family",
+                    "target_id": "a_1",
+                    "mapping_status": "codebook_confirmed",
+                    "response_scale_kind": "anxiety_likert_1_to_5",
+                    "ordered_labels": ["No anxiety 1", "2", "3", "4", "Strong anxiety 5"],
+                    "label_to_ordinal_position": {"No anxiety 1": 1, "2": 2, "3": 3, "4": 4, "Strong anxiety 5": 5},
+                    "label_to_numeric_score": {"No anxiety 1": 1, "2": 2, "3": 3, "4": 4, "Strong anxiety 5": 5},
+                    "numeric_score_semantics_confirmed": True,
+                    "source": "codebook_pdf",
+                    "notes": "Extractor tried to restate the codebook anchors.",
+                    "confidence": 0.92,
+                }
+            ],
+            "review_flags": [],
+            "assumptions": [],
+        },
+    )
+    mapping = {(row["target_kind"], row["target_id"]): row for row in scale_mapping_json["mappings"]}[("family", "a_1")]
+    _assert(mapping["mapping_status"] == "human_confirmed", "expected structured light-contract mapping to keep precedence over extractor output")
+    _assert(mapping["ordered_labels"] == ["1", "2", "3", "4", "5"], "expected human-confirmed raw labels to remain untouched")
 
 
 def test_scale_mapping_bundle_no_codebook_render_request():
@@ -808,6 +1544,14 @@ def test_scale_mapping_bundle_combined_rendered_pages_signing_failure():
 if __name__ == "__main__":
     test_light_contract_scale_mapping_sheet()
     test_scale_mapping_resolver_and_canonical_integration()
+    test_scale_mapping_resolver_skips_numeric_standalone_columns()
+    test_scale_mapping_resolver_drops_placeholder_human_family_rows()
+    test_canonical_scale_mapping_applies_only_confirmed_label_complete_mappings()
+    test_scale_mapping_resolver_reconciles_codebook_labels_to_numeric_source_tokens()
+    test_scale_mapping_resolver_preserves_textual_source_labels()
+    test_scale_mapping_resolver_reconciles_numeric_tokens_with_whitespace()
+    test_scale_mapping_resolver_flags_ambiguous_source_value_mismatch()
+    test_scale_mapping_resolver_preserves_human_override_precedence()
     test_scale_mapping_bundle_no_codebook_render_request()
     test_scale_mapping_bundle_rendered_pages_and_cache()
     test_scale_mapping_bundle_rendered_pages_vertical_layout()

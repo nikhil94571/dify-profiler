@@ -3632,6 +3632,23 @@ def _looks_scale_like_values(values: Iterable[Any]) -> bool:
     )
 
 
+def _has_textual_scale_cues(values: Iterable[Any]) -> bool:
+    cleaned = [str(value).strip() for value in values if str(value).strip()]
+    if not cleaned:
+        return False
+    lowered = [value.lower() for value in cleaned]
+    return (
+        any(any(token in value for token in LIKERT_TOKENS) for value in lowered)
+        or any(
+            re.search(
+                r"\b(?:never heard|very familiar|strongly agree|strongly disagree|neutral|somewhat)\b",
+                value,
+            )
+            for value in lowered
+        )
+    )
+
+
 def _infer_scale_kind(values: Iterable[Any], semantic_text: str) -> str:
     blob = f"{semantic_text or ''} {' '.join(str(v) for v in values)}".lower()
     if "familiar" in blob or "never heard" in blob:
@@ -3653,6 +3670,66 @@ def _extract_numeric_suffix(value: str) -> Optional[float]:
         return float(match.group(1))
     except (TypeError, ValueError):
         return None
+
+
+def _is_bare_numeric_token(value: Any) -> bool:
+    return bool(re.fullmatch(r"[+-]?\d+(?:\.\d+)?", str(value or "").strip()))
+
+
+def _all_values_are_bare_numeric(values: Iterable[Any]) -> bool:
+    cleaned = [str(value).strip() for value in values if str(value).strip()]
+    return bool(cleaned) and all(_is_bare_numeric_token(value) for value in cleaned)
+
+
+def _standalone_column_supports_scale_inference(
+    *,
+    column: str,
+    observed_values: Iterable[Any],
+    support: Dict[str, Any],
+    light_contract_maps: Dict[str, Any],
+) -> bool:
+    cleaned_values = _dedupe_preserve_order(str(value).strip() for value in observed_values if str(value).strip())
+    if len(cleaned_values) < 2 or not _looks_scale_like_values(cleaned_values):
+        return False
+
+    if column in set(light_contract_maps.get("primary_keys") or []):
+        return False
+    if column in set((light_contract_maps.get("reference_table_by_key") or {}).keys()):
+        return False
+
+    a17_row = (support.get("a17_by_col") or {}).get(column) or {}
+    a9_row = (support.get("a9_by_col") or {}).get(column) or {}
+    a2_row = (support.get("a2_by_col") or {}).get(column) or {}
+    role = str(a17_row.get("a9_primary_role") or a9_row.get("primary_role") or "").strip()
+    baseline_type = str(a17_row.get("recommended_logical_type") or "").strip()
+    top_candidate_type = str((a2_row.get("top_candidate") or {}).get("type") or "").strip()
+    metadata_blob = " ".join(
+        bit
+        for bit in [
+            column,
+            role,
+            baseline_type,
+            str(a17_row.get("type_normalization_notes") or "").strip(),
+            str(a17_row.get("normalization_notes") or "").strip(),
+        ]
+        if bit
+    ).lower()
+
+    if role in {"id_key", "time_index", "repeat_index"}:
+        return False
+    if _all_values_are_bare_numeric(cleaned_values):
+        return False
+    if not _has_textual_scale_cues(cleaned_values):
+        if baseline_type in {"identifier", "numeric_measure", "date", "datetime"}:
+            return False
+        if role in {"measure", "measure_numeric"}:
+            return False
+        if top_candidate_type == "numeric":
+            return False
+        if any(token in metadata_blob for token in {"gate", "gating", "screen", "control", "identifier"}):
+            return False
+
+    return True
 
 
 def _deterministic_scale_inference(
@@ -3900,7 +3977,12 @@ def _build_scale_mapping_bundle(
             continue
         preview_values = _preview_values_from_a2_row(a2_row, limit=8)
         unique_count = int(a2_row.get("unique_count") or 0)
-        if unique_count > 12 or not _looks_scale_like_values(preview_values):
+        if unique_count > 12 or not _standalone_column_supports_scale_inference(
+            column=column,
+            observed_values=preview_values,
+            support=support,
+            light_contract_maps=light_contract_maps,
+        ):
             continue
         candidate_standalone_columns.append(
             {
@@ -4399,7 +4481,7 @@ def _normalize_light_contract_scale_mapping_input(scale_mapping_rows: List[Dict[
             )
         notes = str(row.get("notes") or "").strip()
 
-        if not target_id and not ordered_labels and not numeric_scores_raw and not response_scale_kind and not notes:
+        if not ordered_labels and not numeric_scores_raw and not response_scale_kind and not notes:
             continue
         if target_kind not in {"family", "column"} or not target_id:
             continue
@@ -13604,8 +13686,11 @@ def _build_mapping_entry_from_human_input(entry: Dict[str, Any]) -> Dict[str, An
         if ordered_labels and numeric_scores and len(ordered_labels) == len(numeric_scores)
         else {}
     )
-    response_scale_kind = str(entry.get("response_scale_kind") or "").strip() or _infer_scale_kind(ordered_labels, str(entry.get("notes") or ""))
-    mapping_status = "human_confirmed" if ordered_labels or numeric_map or response_scale_kind else "unresolved"
+    explicit_response_scale_kind = str(entry.get("response_scale_kind") or "").strip()
+    response_scale_kind = explicit_response_scale_kind
+    if not response_scale_kind and ordered_labels:
+        response_scale_kind = _infer_scale_kind(ordered_labels, str(entry.get("notes") or ""))
+    mapping_status = "human_confirmed" if ordered_labels or numeric_map or explicit_response_scale_kind else "unresolved"
     return {
         "target_kind": str(entry.get("target_kind") or "").strip(),
         "target_id": str(entry.get("target_id") or "").strip(),
@@ -13624,6 +13709,7 @@ def _build_mapping_entry_from_human_input(entry: Dict[str, Any]) -> Dict[str, An
 def _collect_scale_mapping_candidates(
     *,
     support: Dict[str, Any],
+    light_contract_maps: Dict[str, Any],
     family_results_by_id: Dict[str, Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     reverse_family_map = _reverse_family_column_map(support["family_by_column"])
@@ -13632,7 +13718,7 @@ def _collect_scale_mapping_candidates(
     for family_id, member_columns in sorted(reverse_family_map.items()):
         observed_values: List[str] = []
         for column in member_columns[:6]:
-            observed_values.extend(_preview_values_from_a2_row(support["a2_by_col"].get(column) or {}, limit=4))
+            observed_values.extend(_preview_values_from_a2_row(support["a2_by_col"].get(column) or {}, limit=8))
         observed_values = _dedupe_preserve_order(observed_values)
         if not observed_values or not _looks_scale_like_values(observed_values):
             continue
@@ -13659,7 +13745,12 @@ def _collect_scale_mapping_candidates(
         if not column or column in support["family_by_column"]:
             continue
         observed_values = _preview_values_from_a2_row(a2_row, limit=8)
-        if not observed_values or not _looks_scale_like_values(observed_values):
+        if not observed_values or not _standalone_column_supports_scale_inference(
+            column=column,
+            observed_values=observed_values,
+            support=support,
+            light_contract_maps=light_contract_maps,
+        ):
             continue
         column_candidates.append(
             {
@@ -13671,6 +13762,141 @@ def _collect_scale_mapping_candidates(
         )
 
     return family_candidates, column_candidates
+
+
+def _observed_scale_values_for_target(
+    *,
+    support: Dict[str, Any],
+    target_kind: str,
+    target_id: str,
+) -> List[str]:
+    if target_kind == "family":
+        member_columns = _reverse_family_column_map(support["family_by_column"]).get(target_id, [])
+        observed_values: List[str] = []
+        for column in member_columns[:6]:
+            observed_values.extend(_preview_values_from_a2_row(support["a2_by_col"].get(column) or {}, limit=8))
+        return _dedupe_preserve_order(observed_values)
+    if target_kind == "column":
+        return _preview_values_from_a2_row(support["a2_by_col"].get(target_id) or {}, limit=8)
+    return []
+
+
+def _normalize_scale_token(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _normalize_numeric_token(value: Any) -> Optional[str]:
+    text = _normalize_scale_token(value)
+    if not text:
+        return None
+    match = re.fullmatch(r"([+-]?\d+(?:\.\d+)?)", text)
+    if not match:
+        return None
+    try:
+        numeric = float(match.group(1))
+    except (TypeError, ValueError):
+        return None
+    if numeric.is_integer():
+        return str(int(numeric))
+    return str(numeric).rstrip("0").rstrip(".")
+
+
+def _extract_numeric_anchor_token(value: Any) -> Optional[str]:
+    numeric = _extract_numeric_suffix(_normalize_scale_token(value))
+    if numeric is None:
+        return None
+    if float(numeric).is_integer():
+        return str(int(numeric))
+    return str(float(numeric)).rstrip("0").rstrip(".")
+
+
+def _mapping_labels_match_observed_source_tokens(
+    ordered_labels: List[str],
+    observed_values: List[str],
+) -> bool:
+    observed_set = {_normalize_scale_token(value) for value in observed_values if _normalize_scale_token(value)}
+    return bool(observed_set) and all(_normalize_scale_token(label) in observed_set for label in ordered_labels)
+
+
+def _semantic_label_without_numeric_anchor(value: Any) -> str:
+    text = _normalize_scale_token(value)
+    if not text:
+        return ""
+    match = re.fullmatch(r"(.+?)\s+([+-]?\d+(?:\.\d+)?)", text)
+    if not match:
+        return text
+    return match.group(1).strip()
+
+
+def _reconcile_mapping_to_observed_source_tokens(
+    mapping: Dict[str, Any],
+    observed_values: List[str],
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    normalized_observed = [_normalize_scale_token(value) for value in observed_values if _normalize_scale_token(value)]
+    if not normalized_observed:
+        return dict(mapping), None
+
+    ordered_labels = [_normalize_scale_token(label) for label in (mapping.get("ordered_labels") or []) if _normalize_scale_token(label)]
+    if not ordered_labels:
+        return dict(mapping), None
+
+    if _mapping_labels_match_observed_source_tokens(ordered_labels, normalized_observed):
+        return dict(mapping), None
+
+    observed_numeric_tokens = [_normalize_numeric_token(value) for value in normalized_observed]
+    if not observed_numeric_tokens or any(token is None for token in observed_numeric_tokens):
+        return dict(mapping), "extractor mapping labels do not align with observed source tokens"
+    observed_numeric_tokens = [token for token in observed_numeric_tokens if token is not None]
+    if len(set(observed_numeric_tokens)) != len(observed_numeric_tokens):
+        return dict(mapping), "observed source tokens are not uniquely numeric, so extractor mapping could not be safely reconciled"
+
+    ordered_numeric_tokens = [_extract_numeric_anchor_token(label) for label in ordered_labels]
+    if any(token is None for token in ordered_numeric_tokens):
+        return dict(mapping), "extractor mapping labels do not expose a recoverable numeric ladder"
+    ordered_numeric_tokens = [token for token in ordered_numeric_tokens if token is not None]
+    if len(ordered_numeric_tokens) != len(ordered_labels):
+        return dict(mapping), "extractor mapping labels expose an incomplete numeric ladder"
+    if len(set(ordered_numeric_tokens)) != len(ordered_numeric_tokens):
+        return dict(mapping), "extractor mapping labels expose duplicate numeric anchors"
+    if set(ordered_numeric_tokens) != set(observed_numeric_tokens):
+        return dict(mapping), "extractor mapping labels do not match the observed numeric source vocabulary"
+
+    observed_numeric_to_raw = {
+        numeric: raw
+        for raw, numeric in zip(normalized_observed, observed_numeric_tokens)
+    }
+    reconciled_labels = [observed_numeric_to_raw[token] for token in ordered_numeric_tokens]
+    reconciled_numeric_map = {
+        observed_numeric_to_raw[token]: float(token) if "." in token else int(token)
+        for token in ordered_numeric_tokens
+    }
+
+    rewritten = dict(mapping)
+    rewritten["ordered_labels"] = reconciled_labels
+    rewritten["label_to_ordinal_position"] = {
+        label: idx + 1
+        for idx, label in enumerate(reconciled_labels)
+    }
+    if mapping.get("numeric_score_semantics_confirmed"):
+        rewritten["label_to_numeric_score"] = reconciled_numeric_map
+    else:
+        rewritten["label_to_numeric_score"] = {
+            label: reconciled_numeric_map[label]
+            for label in reconciled_labels
+            if label in reconciled_numeric_map and _extract_numeric_anchor_token(label) is not None
+        }
+    meaning_bits: List[str] = []
+    for original_label, token in zip(ordered_labels, ordered_numeric_tokens):
+        raw_label = observed_numeric_to_raw[token]
+        original_label_text = _normalize_scale_token(original_label)
+        if original_label_text != raw_label:
+            meaning_bits.append(f"{raw_label} = {_semantic_label_without_numeric_anchor(original_label_text)}")
+    if meaning_bits:
+        rewritten["notes"] = _merge_notes(
+            str(rewritten.get("notes") or ""),
+            f"Codebook meaning: {'; '.join(meaning_bits)}.",
+        )
+    return rewritten, None
 
 
 def _build_scale_mapping_contract(
@@ -13713,10 +13939,28 @@ def _build_scale_mapping_contract(
             continue
         if mapping.get("mapping_status") == "unresolved" and not mapping.get("ordered_labels"):
             continue
-        resolved_by_target[target_key] = dict(mapping)
+        target_kind, target_id = target_key
+        observed_values = _observed_scale_values_for_target(
+            support=support,
+            target_kind=target_kind,
+            target_id=target_id,
+        )
+        reconciled_mapping, reconciliation_issue = _reconcile_mapping_to_observed_source_tokens(
+            dict(mapping),
+            observed_values,
+        )
+        if reconciliation_issue:
+            _add_review_flag(
+                review_flags,
+                f"{target_kind}:{target_id}",
+                "scale_mapping_source_value_mismatch",
+                reconciliation_issue,
+            )
+        resolved_by_target[target_key] = reconciled_mapping
 
     family_candidates, column_candidates = _collect_scale_mapping_candidates(
         support=support,
+        light_contract_maps=light_contract_maps,
         family_results_by_id=family_results_by_id,
     )
     for candidate in family_candidates + column_candidates:
@@ -14074,9 +14318,13 @@ def _apply_scale_mapping_to_type_and_semantics(
     ordered_labels = [str(label).strip() for label in (mapping.get("ordered_labels") or []) if str(label or "").strip()]
     mapping_status = str(mapping.get("mapping_status") or "").strip()
     confirmed = mapping_status in {"human_confirmed", "codebook_confirmed"}
+    confirmed_with_labels = confirmed and bool(ordered_labels)
     materially_applied = False
 
-    if ordered_labels or str(mapping.get("response_scale_kind") or "").strip():
+    if not confirmed_with_labels:
+        return updated_type, updated_semantic, False
+
+    if ordered_labels:
         updated_type["recommended_logical_type"] = "ordinal_category"
         updated_type["recommended_storage_type"] = "string"
         preserved_actions = [

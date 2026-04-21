@@ -23,12 +23,14 @@ You must:
 - use relevant codebook snippets when available,
 - extract only grounded ordered-scale mappings for families or standalone columns,
 - keep ambiguous cases as `unresolved`,
+- keep ordered labels faithful to observed source tokens when those tokens are known,
 - output one strict JSON object only.
 
 You must NOT:
 - infer mappings from raw artifacts alone when the evidence is weak,
 - redesign structure,
 - invent families or columns,
+- replace raw source values with semantic prose when the source values are already known,
 - emit scoring semantics that are not grounded,
 - act as the final resolver.
 
@@ -206,6 +208,12 @@ When codebook evidence is clear:
 - fill `label_to_ordinal_position`
 - fill `label_to_numeric_score` only if the codebook clearly supports numeric scoring
 
+Source-token rule:
+- if accepted family or standalone previews show the actual raw values clearly enough to define the ladder, use those raw values in `ordered_labels`
+- keep explanatory wording from the codebook in `notes`, not in `ordered_labels`
+- do not emit hybrid labels like `No anxiety 1` unless that exact string is present in the observed source values
+- if observed raw values are `1,2,3,4,5` and the codebook says `1 means no anxiety` and `5 means strong anxiety`, emit ordered labels `1,2,3,4,5` and carry the meaning in `notes`
+
 When direction or numeric semantics remain ambiguous:
 - emit `mapping_status = unresolved`
 - keep `label_to_numeric_score = {}`
@@ -250,7 +258,15 @@ Those belong in `semantic_context_json`, not here.
 - codebook confirms ordered labels
 - emit one column-scoped mapping
 
-### Example 5 — Ambiguous ordinal-looking labels
+### Example 5 — Numeric raw values with semantic codebook anchors
+- observed source values are `1`, `2`, `3`, `4`, `5`
+- codebook says `1 means No anxiety` and `5 means Strong anxiety`
+- emit:
+  - `ordered_labels = ["1","2","3","4","5"]`
+  - `label_to_numeric_score = {"1":1,"2":2,"3":3,"4":4,"5":5}`
+- put `1 = No anxiety; 5 = Strong anxiety` in `notes`
+
+### Example 6 — Ambiguous ordinal-looking labels
 - previews show `Low`, `Medium`, `High`
 - no codebook confirms direction or scoring
 - emit `mapping_status = unresolved`
