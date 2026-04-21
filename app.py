@@ -51,6 +51,17 @@ try:
 except Exception:
     PdfReader = None
 
+try:
+    import pypdfium2 as pdfium  # optional for codebook page rendering
+except Exception:
+    pdfium = None
+
+try:
+    from PIL import Image, ImageDraw  # optional for PNG encoding during codebook rendering
+except Exception:
+    Image = None
+    ImageDraw = None
+
 app = FastAPI()
 bearer = HTTPBearer(auto_error=True)
 
@@ -67,6 +78,18 @@ logger = logging.getLogger("profiler")
 # Stage logger: goes to uvicorn stderr / Cloud Run logs
 stage_logger = logging.getLogger("uvicorn.error")
 stage_logger.setLevel(logging.INFO)
+
+if PdfReader is None:
+    stage_logger.warning(
+        "pypdf is not installed; /codebooks/upload will fail until dependencies are reinstalled from requirements.txt "
+        "or the deployment image is rebuilt."
+    )
+
+if pdfium is None or Image is None or ImageDraw is None:
+    stage_logger.warning(
+        "Codebook page-image rendering dependencies are unavailable; rendered codebook page URLs will fail until "
+        "requirements are reinstalled or the deployment image is rebuilt."
+    )
 
 # ip -> timestamps
 _req_times = defaultdict(deque)
@@ -88,6 +111,20 @@ PATTERN_SCAN_MAX_ROWS = int(os.getenv("PATTERN_SCAN_MAX_ROWS", "50000"))
 # Why it matters: avoids missing tail-end formatting changes without introducing nondeterminism.
 PATTERN_SCAN_HEAD_ROWS = int(os.getenv("PATTERN_SCAN_HEAD_ROWS", "2000"))
 PATTERN_SCAN_TAIL_ROWS = int(os.getenv("PATTERN_SCAN_TAIL_ROWS", "2000"))
+
+CODEBOOK_RENDER_VERSION = "2"
+CODEBOOK_RENDER_THRESHOLD_CHARS = int(os.getenv("CODEBOOK_RENDER_THRESHOLD_CHARS", "80"))
+CODEBOOK_RENDER_ADJACENT_WINDOW = int(os.getenv("CODEBOOK_RENDER_ADJACENT_WINDOW", "1"))
+CODEBOOK_RENDER_FALLBACK_FIRST_N_PAGES = int(os.getenv("CODEBOOK_RENDER_FALLBACK_FIRST_N_PAGES", "4"))
+CODEBOOK_RENDER_MAX_PAGES = int(os.getenv("CODEBOOK_RENDER_MAX_PAGES", "8"))
+CODEBOOK_RENDER_SCALE = float(os.getenv("CODEBOOK_RENDER_SCALE", "2.0"))
+CODEBOOK_RENDER_MANIFEST_OBJECT_NAME = "codebook_rendered_pages_manifest.json"
+CODEBOOK_RENDER_OBJECT_PREFIX = "codebook_rendered_pages"
+CODEBOOK_RENDER_CONTACT_SHEET_OBJECT_NAME = f"{CODEBOOK_RENDER_OBJECT_PREFIX}/combined_pages.png"
+CODEBOOK_RENDER_CONTACT_SHEET_MAX_TILE_WIDTH = int(os.getenv("CODEBOOK_RENDER_CONTACT_SHEET_MAX_TILE_WIDTH", "1000"))
+CODEBOOK_RENDER_CONTACT_SHEET_PADDING = int(os.getenv("CODEBOOK_RENDER_CONTACT_SHEET_PADDING", "24"))
+CODEBOOK_RENDER_CONTACT_SHEET_GUTTER = int(os.getenv("CODEBOOK_RENDER_CONTACT_SHEET_GUTTER", "24"))
+CODEBOOK_RENDER_CONTACT_SHEET_LABEL_HEIGHT = int(os.getenv("CODEBOOK_RENDER_CONTACT_SHEET_LABEL_HEIGHT", "40"))
 
 
 # Limits for examples emitted per pattern category
@@ -2746,9 +2783,12 @@ def _upload_xlsx_and_sign(xlsx_bytes: bytes, filename: str) -> Dict[str, Any]:
             content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-        signing_sa = os.getenv("SIGNING_SA_EMAIL")
+        signing_sa = (
+            str(os.getenv("SIGNING_SA_EMAIL") or "").strip()
+            or str(os.getenv("EXPORT_SIGNER_SERVICE_ACCOUNT") or "").strip()
+        )
         if not signing_sa:
-            raise HTTPException(status_code=500, detail="Missing SIGNING_SA_EMAIL env var")
+            raise HTTPException(status_code=500, detail="Missing SIGNING_SA_EMAIL or EXPORT_SIGNER_SERVICE_ACCOUNT env var")
 
         source_creds, _ = google.auth.default()
         signing_creds = impersonated_credentials.Credentials(
@@ -2864,9 +2904,9 @@ def _sign_run_object_download(
         if not blob.exists(client):
             raise HTTPException(status_code=404, detail=f"{object_name} not found for run_id")
 
-        signing_sa = os.getenv("EXPORT_SIGNER_SERVICE_ACCOUNT")
+        signing_sa = _resolve_signing_service_account()
         if not signing_sa:
-            raise HTTPException(status_code=500, detail="Missing EXPORT_SIGNER_SERVICE_ACCOUNT env var")
+            raise HTTPException(status_code=500, detail="Missing EXPORT_SIGNER_SERVICE_ACCOUNT or SIGNING_SA_EMAIL env var")
 
         source_creds, _ = google.auth.default()
         signing_creds = impersonated_credentials.Credentials(
@@ -2890,6 +2930,34 @@ def _sign_run_object_download(
         raise HTTPException(status_code=500, detail=f"Failed to sign run object download: {exc}") from exc
 
 
+def _try_sign_run_object_download(
+    run_id: str,
+    object_name: str,
+    *,
+    filename: str,
+    content_type: str,
+) -> Tuple[str, str]:
+    try:
+        return (
+            _sign_run_object_download(
+                run_id,
+                object_name,
+                filename=filename,
+                content_type=content_type,
+            ),
+            "",
+        )
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, str) else json.dumps(exc.detail, separators=(",", ":"))
+        stage_logger.warning(
+            "codebook_signed_url_skipped run_id=%s object_name=%s detail=%s",
+            run_id,
+            object_name,
+            detail,
+        )
+        return "", detail
+
+
 def _persist_light_contract_decisions(run_id: str, handoff: Dict[str, Any], source: str) -> Tuple[Dict[str, Any], str]:
     decisions = dict(handoff)
     decisions["run_id"] = run_id
@@ -2909,11 +2977,575 @@ def _load_optional_json_from_run_object(run_id: str, object_name: str) -> Option
         raise
 
 
+def _run_object_exists(run_id: str, object_name: str) -> bool:
+    bucket_name = os.getenv("EXPORT_BUCKET")
+    if not bucket_name:
+        raise HTTPException(status_code=500, detail="Missing EXPORT_BUCKET env var")
+    try:
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(f"runs/{run_id}/{object_name}")
+        return bool(blob.exists(client))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Failed to check run object existence: {exc}") from exc
+
+
+def _resolve_signing_service_account() -> str:
+    return (
+        str(os.getenv("EXPORT_SIGNER_SERVICE_ACCOUNT") or "").strip()
+        or str(os.getenv("SIGNING_SA_EMAIL") or "").strip()
+    )
+
+
+def _build_codebook_relevant_page_snippets(
+    page_records: List[Dict[str, Any]],
+    query_terms: List[str],
+) -> Tuple[List[Dict[str, Any]], Dict[int, List[str]]]:
+    relevant_page_snippets: List[Dict[str, Any]] = []
+    matched_terms_by_page: Dict[int, List[str]] = {}
+    if not page_records or not query_terms:
+        return relevant_page_snippets, matched_terms_by_page
+
+    scored_pages: List[Tuple[int, Dict[str, Any], List[str]]] = []
+    for page in page_records:
+        text = str(page.get("text") or "")
+        lowered = text.lower()
+        matched_terms = [term for term in query_terms if term and term.lower() in lowered]
+        if matched_terms:
+            scored_pages.append((len(matched_terms), page, matched_terms[:8]))
+
+    for _, page, matched_terms in sorted(scored_pages, key=lambda item: (-item[0], int(item[1].get("page_number") or 0)))[:6]:
+        page_number = int(page.get("page_number") or 0)
+        if page_number <= 0:
+            continue
+        snippet = str(page.get("text") or "")[:1600]
+        relevant_page_snippets.append(
+            {
+                "page_number": page_number,
+                "matched_terms": matched_terms,
+                "snippet": snippet,
+            }
+        )
+        matched_terms_by_page[page_number] = matched_terms
+
+    return relevant_page_snippets, matched_terms_by_page
+
+
+def _default_scale_mapping_render_selection(*, requested: bool) -> Dict[str, Any]:
+    return {
+        "requested": requested,
+        "selected_page_numbers": [],
+        "used_fallback": False,
+        "threshold_chars": CODEBOOK_RENDER_THRESHOLD_CHARS,
+        "adjacent_window": CODEBOOK_RENDER_ADJACENT_WINDOW,
+        "fallback_first_n_pages": CODEBOOK_RENDER_FALLBACK_FIRST_N_PAGES,
+        "max_rendered_pages": CODEBOOK_RENDER_MAX_PAGES,
+    }
+
+
+def _default_scale_mapping_combined_rendered_pages() -> Dict[str, Any]:
+    return {
+        "present": False,
+        "image_object_path": "",
+        "image_signed_url": "",
+        "signed_url_error": "",
+        "page_numbers": [],
+        "layout": "",
+        "tile_count": 0,
+    }
+
+
+def _select_scale_mapping_render_pages(
+    *,
+    page_records: List[Dict[str, Any]],
+    relevant_page_snippets: List[Dict[str, Any]],
+    threshold_chars: int = CODEBOOK_RENDER_THRESHOLD_CHARS,
+    adjacent_window: int = CODEBOOK_RENDER_ADJACENT_WINDOW,
+    fallback_first_n_pages: int = CODEBOOK_RENDER_FALLBACK_FIRST_N_PAGES,
+    max_rendered_pages: int = CODEBOOK_RENDER_MAX_PAGES,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    selection_meta = _default_scale_mapping_render_selection(requested=True)
+    selection_meta["threshold_chars"] = threshold_chars
+    selection_meta["adjacent_window"] = adjacent_window
+    selection_meta["fallback_first_n_pages"] = fallback_first_n_pages
+    selection_meta["max_rendered_pages"] = max_rendered_pages
+
+    pages_by_number: Dict[int, Dict[str, Any]] = {}
+    for page in page_records:
+        page_number = int(page.get("page_number") or 0)
+        if page_number <= 0:
+            continue
+        pages_by_number[page_number] = page
+
+    if not pages_by_number:
+        return [], selection_meta
+
+    matched_terms_by_page: Dict[int, List[str]] = {}
+    matched_page_numbers: List[int] = []
+    for snippet in relevant_page_snippets:
+        page_number = int(snippet.get("page_number") or 0)
+        if page_number <= 0 or page_number not in pages_by_number:
+            continue
+        matched_page_numbers.append(page_number)
+        matched_terms_by_page[page_number] = [
+            str(term).strip()
+            for term in (snippet.get("matched_terms") or [])
+            if str(term or "").strip()
+        ][:8]
+    matched_page_numbers = sorted(set(matched_page_numbers))
+
+    adjacent_page_numbers: List[int] = []
+    if matched_page_numbers and adjacent_window > 0:
+        adjacent_candidates: Set[int] = set()
+        for page_number in matched_page_numbers:
+            for delta in range(1, adjacent_window + 1):
+                adjacent_candidates.add(page_number - delta)
+                adjacent_candidates.add(page_number + delta)
+        adjacent_page_numbers = sorted(page_number for page_number in adjacent_candidates if page_number in pages_by_number)
+
+    low_text_page_numbers = sorted(
+        page_number
+        for page_number, page in pages_by_number.items()
+        if int(page.get("char_count") or 0) <= threshold_chars
+    )
+
+    fallback_page_numbers: List[int] = []
+    if not matched_page_numbers and fallback_first_n_pages > 0:
+        max_page_number = max(pages_by_number)
+        fallback_page_numbers = list(range(1, min(max_page_number, fallback_first_n_pages) + 1))
+
+    page_details: Dict[int, Dict[str, Any]] = {}
+    reason_groups = [
+        ("matched_snippet", matched_page_numbers),
+        ("adjacent_to_matched", adjacent_page_numbers),
+        ("low_text", low_text_page_numbers),
+        ("fallback_first_n", fallback_page_numbers),
+    ]
+    for reason, page_numbers in reason_groups:
+        for page_number in page_numbers:
+            if page_number not in pages_by_number:
+                continue
+            page = pages_by_number[page_number]
+            detail = page_details.setdefault(
+                page_number,
+                {
+                    "page_number": page_number,
+                    "char_count": int(page.get("char_count") or 0),
+                    "matched_terms": matched_terms_by_page.get(page_number, []),
+                    "selection_reasons": [],
+                },
+            )
+            if reason not in detail["selection_reasons"]:
+                detail["selection_reasons"].append(reason)
+
+    selected_in_priority_order: List[int] = []
+    seen: Set[int] = set()
+    for _reason, page_numbers in reason_groups:
+        for page_number in page_numbers:
+            if page_number not in pages_by_number or page_number in seen:
+                continue
+            selected_in_priority_order.append(page_number)
+            seen.add(page_number)
+            if len(selected_in_priority_order) >= max_rendered_pages:
+                break
+        if len(selected_in_priority_order) >= max_rendered_pages:
+            break
+
+    selected_page_numbers = sorted(selected_in_priority_order)
+    selection_meta["selected_page_numbers"] = selected_page_numbers
+    selection_meta["used_fallback"] = bool(not matched_page_numbers and fallback_page_numbers)
+
+    return [page_details[page_number] for page_number in selected_page_numbers], selection_meta
+
+
+def _contact_sheet_layout_for_page_count(page_count: int) -> str:
+    return "vertical" if page_count <= 2 else "grid_2col"
+
+
+def _build_codebook_contact_sheet(
+    rendered_bytes: Dict[int, bytes],
+    page_numbers: List[int],
+) -> Tuple[bytes, str, int]:
+    if Image is None or ImageDraw is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Codebook page-image rendering dependencies are unavailable. "
+                "Reinstall dependencies from requirements.txt and restart the service "
+                "(or rebuild and redeploy the image)."
+            ),
+        )
+
+    ordered_page_numbers = [page_number for page_number in page_numbers if page_number in rendered_bytes]
+    if not ordered_page_numbers:
+        raise HTTPException(status_code=500, detail="Cannot build combined codebook contact sheet without rendered pages")
+
+    layout = _contact_sheet_layout_for_page_count(len(ordered_page_numbers))
+    padding = CODEBOOK_RENDER_CONTACT_SHEET_PADDING
+    gutter = CODEBOOK_RENDER_CONTACT_SHEET_GUTTER
+    label_height = CODEBOOK_RENDER_CONTACT_SHEET_LABEL_HEIGHT
+    max_tile_width = CODEBOOK_RENDER_CONTACT_SHEET_MAX_TILE_WIDTH
+
+    tiles: List[Tuple[int, Any]] = []
+    for page_number in ordered_page_numbers:
+        try:
+            with Image.open(io.BytesIO(rendered_bytes[page_number])) as original:
+                tile = original.convert("RGB")
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to open rendered codebook page {page_number}: {exc}") from exc
+
+        width, height = tile.size
+        if width > max_tile_width:
+            ratio = max_tile_width / float(width)
+            tile = tile.resize((max_tile_width, max(1, int(height * ratio))), Image.Resampling.LANCZOS)
+        tiles.append((page_number, tile))
+
+    prepared_tiles: List[Tuple[int, Any]] = []
+    try:
+        for page_number, tile in tiles:
+            tile_width, tile_height = tile.size
+            labeled = Image.new("RGB", (tile_width, tile_height + label_height), "white")
+            draw = ImageDraw.Draw(labeled)
+            draw.rectangle((0, 0, tile_width, label_height), fill="black")
+            draw.text((12, 10), f"Page {page_number}", fill="white")
+            labeled.paste(tile, (0, label_height))
+            prepared_tiles.append((page_number, labeled))
+
+        if layout == "vertical":
+            canvas_width = max(tile.size[0] for _, tile in prepared_tiles) + (padding * 2)
+            canvas_height = (
+                sum(tile.size[1] for _, tile in prepared_tiles)
+                + (gutter * max(0, len(prepared_tiles) - 1))
+                + (padding * 2)
+            )
+            canvas = Image.new("RGB", (canvas_width, canvas_height), "white")
+            y_offset = padding
+            for _, tile in prepared_tiles:
+                x_offset = padding + max(0, (canvas_width - (padding * 2) - tile.size[0]) // 2)
+                canvas.paste(tile, (x_offset, y_offset))
+                y_offset += tile.size[1] + gutter
+        else:
+            rows: List[List[Tuple[int, Any]]] = []
+            for idx in range(0, len(prepared_tiles), 2):
+                rows.append(prepared_tiles[idx:idx + 2])
+            row_heights = [max(tile.size[1] for _, tile in row) for row in rows]
+            row_widths = [
+                sum(tile.size[0] for _, tile in row) + (gutter if len(row) > 1 else 0)
+                for row in rows
+            ]
+            canvas_width = max(row_widths) + (padding * 2)
+            canvas_height = sum(row_heights) + (gutter * max(0, len(rows) - 1)) + (padding * 2)
+            canvas = Image.new("RGB", (canvas_width, canvas_height), "white")
+            y_offset = padding
+            for row, row_height, row_width in zip(rows, row_heights, row_widths):
+                x_offset = padding + max(0, (canvas_width - (padding * 2) - row_width) // 2)
+                for _, tile in row:
+                    y_tile = y_offset + max(0, (row_height - tile.size[1]) // 2)
+                    canvas.paste(tile, (x_offset, y_tile))
+                    x_offset += tile.size[0] + gutter
+                y_offset += row_height + gutter
+
+        buffer = io.BytesIO()
+        canvas.save(buffer, format="PNG")
+        canvas.close()
+        return buffer.getvalue(), layout, len(ordered_page_numbers)
+    finally:
+        for _, tile in prepared_tiles:
+            if hasattr(tile, "close"):
+                tile.close()
+        for _, tile in tiles:
+            if hasattr(tile, "close"):
+                tile.close()
+
+
+def _render_codebook_pages_to_pngs(
+    pdf_bytes: bytes,
+    page_numbers: List[int],
+    *,
+    scale: float = CODEBOOK_RENDER_SCALE,
+) -> Dict[int, bytes]:
+    if pdfium is None or Image is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Codebook page-image rendering dependencies are unavailable. "
+                "Reinstall dependencies from requirements.txt and restart the service "
+                "(or rebuild and redeploy the image)."
+            ),
+        )
+
+    try:
+        document = pdfium.PdfDocument(pdf_bytes)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to open codebook PDF for rendering: {exc}") from exc
+
+    rendered_pages: Dict[int, bytes] = {}
+    try:
+        page_total = len(document)
+        for page_number in sorted(set(page_numbers)):
+            if page_number < 1 or page_number > page_total:
+                continue
+            page = document[page_number - 1]
+            bitmap = None
+            pil_image = None
+            try:
+                bitmap = page.render(scale=scale)
+                pil_image = bitmap.to_pil()
+                buffer = io.BytesIO()
+                pil_image.save(buffer, format="PNG")
+                rendered_pages[page_number] = buffer.getvalue()
+            except Exception as exc:
+                raise HTTPException(status_code=500, detail=f"Failed to render codebook page {page_number}: {exc}") from exc
+            finally:
+                if pil_image is not None and hasattr(pil_image, "close"):
+                    pil_image.close()
+                if bitmap is not None and hasattr(bitmap, "close"):
+                    bitmap.close()
+                if hasattr(page, "close"):
+                    page.close()
+    finally:
+        if hasattr(document, "close"):
+            document.close()
+
+    return rendered_pages
+
+
+def _scale_mapping_render_manifest_matches(
+    manifest: Dict[str, Any],
+    *,
+    run_id: str,
+    source_object_path: str,
+    source_pdf_sha256: str,
+    page_count: int,
+    selected_page_numbers: List[int],
+    threshold_chars: int,
+    adjacent_window: int,
+    fallback_first_n_pages: int,
+    max_rendered_pages: int,
+) -> bool:
+    if not isinstance(manifest, dict):
+        return False
+    if str(manifest.get("render_version") or "").strip() != CODEBOOK_RENDER_VERSION:
+        return False
+
+    source = manifest.get("source") if isinstance(manifest.get("source"), dict) else {}
+    if str(source.get("object_path") or "").strip() != source_object_path:
+        return False
+    if str(source.get("pdf_sha256") or "").strip() != source_pdf_sha256:
+        return False
+    if int(source.get("page_count") or 0) != page_count:
+        return False
+
+    policy = manifest.get("policy") if isinstance(manifest.get("policy"), dict) else {}
+    if int(policy.get("threshold_chars") or 0) != threshold_chars:
+        return False
+    if int(policy.get("adjacent_window") or 0) != adjacent_window:
+        return False
+    if int(policy.get("fallback_first_n_pages") or 0) != fallback_first_n_pages:
+        return False
+    if int(policy.get("max_rendered_pages") or 0) != max_rendered_pages:
+        return False
+    if float(policy.get("scale") or 0.0) != float(CODEBOOK_RENDER_SCALE):
+        return False
+
+    rendered_pages = _coerce_list_of_dicts(manifest.get("rendered_pages"))
+    manifest_page_numbers = [int(page.get("page_number") or 0) for page in rendered_pages]
+    if manifest_page_numbers != selected_page_numbers:
+        return False
+    for page in rendered_pages:
+        object_name = str(page.get("image_object_name") or "").strip()
+        if not object_name or not _run_object_exists(run_id, object_name):
+            return False
+
+    combined = manifest.get("combined_rendered_pages") if isinstance(manifest.get("combined_rendered_pages"), dict) else {}
+    combined_object_name = str(combined.get("image_object_name") or "").strip()
+    if not combined_object_name or not _run_object_exists(run_id, combined_object_name):
+        return False
+    combined_page_numbers = [int(page_number) for page_number in (combined.get("page_numbers") or []) if isinstance(page_number, (int, float))]
+    if combined_page_numbers != selected_page_numbers:
+        return False
+    if str(combined.get("layout") or "").strip() != _contact_sheet_layout_for_page_count(len(selected_page_numbers)):
+        return False
+    if int(combined.get("tile_count") or 0) != len(selected_page_numbers):
+        return False
+    return True
+
+
+def _ensure_scale_mapping_rendered_pages(
+    *,
+    run_id: str,
+    codebook_document: Dict[str, Any],
+    page_records: List[Dict[str, Any]],
+    relevant_page_snippets: List[Dict[str, Any]],
+    include_rendered_codebook_pages: bool,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
+    requested = bool(include_rendered_codebook_pages and codebook_document.get("object_path"))
+    selection_meta = _default_scale_mapping_render_selection(requested=requested)
+    combined_rendered_pages = _default_scale_mapping_combined_rendered_pages()
+    if not requested:
+        return [], selection_meta, combined_rendered_pages
+
+    selected_pages, selection_meta = _select_scale_mapping_render_pages(
+        page_records=page_records,
+        relevant_page_snippets=relevant_page_snippets,
+        threshold_chars=CODEBOOK_RENDER_THRESHOLD_CHARS,
+        adjacent_window=CODEBOOK_RENDER_ADJACENT_WINDOW,
+        fallback_first_n_pages=CODEBOOK_RENDER_FALLBACK_FIRST_N_PAGES,
+        max_rendered_pages=CODEBOOK_RENDER_MAX_PAGES,
+    )
+    if not selected_pages:
+        return [], selection_meta, combined_rendered_pages
+
+    pdf_bytes = _load_bytes_from_run_object(run_id, "codebook.pdf")
+    pdf_sha256 = hashlib.sha256(pdf_bytes).hexdigest()
+    source_object_path = str(codebook_document.get("object_path") or "").strip()
+    page_count = int(codebook_document.get("page_count") or 0)
+
+    manifest = _load_optional_json_from_run_object(run_id, CODEBOOK_RENDER_MANIFEST_OBJECT_NAME) or {}
+    if not _scale_mapping_render_manifest_matches(
+        manifest,
+        run_id=run_id,
+        source_object_path=source_object_path,
+        source_pdf_sha256=pdf_sha256,
+        page_count=page_count,
+        selected_page_numbers=selection_meta["selected_page_numbers"],
+        threshold_chars=selection_meta["threshold_chars"],
+        adjacent_window=selection_meta["adjacent_window"],
+        fallback_first_n_pages=selection_meta["fallback_first_n_pages"],
+        max_rendered_pages=selection_meta["max_rendered_pages"],
+    ):
+        rendered_bytes = _render_codebook_pages_to_pngs(pdf_bytes, selection_meta["selected_page_numbers"])
+        rendered_pages_manifest: List[Dict[str, Any]] = []
+        for page in selected_pages:
+            page_number = int(page.get("page_number") or 0)
+            if page_number not in rendered_bytes:
+                raise HTTPException(status_code=500, detail=f"Rendered codebook image missing for page {page_number}")
+            image_object_name = f"{CODEBOOK_RENDER_OBJECT_PREFIX}/page_{page_number:04d}.png"
+            image_object_path = _upload_bytes_to_run_object(
+                run_id,
+                image_object_name,
+                rendered_bytes[page_number],
+                content_type="image/png",
+            )
+            rendered_pages_manifest.append(
+                {
+                    "page_number": page_number,
+                    "image_object_name": image_object_name,
+                    "image_object_path": image_object_path,
+                }
+            )
+
+        combined_png_bytes, combined_layout, combined_tile_count = _build_codebook_contact_sheet(
+            rendered_bytes,
+            selection_meta["selected_page_numbers"],
+        )
+        combined_image_object_path = _upload_bytes_to_run_object(
+            run_id,
+            CODEBOOK_RENDER_CONTACT_SHEET_OBJECT_NAME,
+            combined_png_bytes,
+            content_type="image/png",
+        )
+        manifest = {
+            "run_id": run_id,
+            "render_version": CODEBOOK_RENDER_VERSION,
+            "source": {
+                "object_path": source_object_path,
+                "page_count": page_count,
+                "pdf_sha256": pdf_sha256,
+            },
+            "policy": {
+                "threshold_chars": selection_meta["threshold_chars"],
+                "adjacent_window": selection_meta["adjacent_window"],
+                "fallback_first_n_pages": selection_meta["fallback_first_n_pages"],
+                "max_rendered_pages": selection_meta["max_rendered_pages"],
+                "scale": CODEBOOK_RENDER_SCALE,
+            },
+            "rendered_pages": rendered_pages_manifest,
+            "combined_rendered_pages": {
+                "image_object_name": CODEBOOK_RENDER_CONTACT_SHEET_OBJECT_NAME,
+                "image_object_path": combined_image_object_path,
+                "page_numbers": list(selection_meta["selected_page_numbers"]),
+                "layout": combined_layout,
+                "tile_count": combined_tile_count,
+            },
+            "generated_at": pd.Timestamp.utcnow().isoformat(),
+        }
+        _upload_json_to_run_object(run_id, CODEBOOK_RENDER_MANIFEST_OBJECT_NAME, manifest)
+
+    manifest_rows = {
+        int(row.get("page_number") or 0): row
+        for row in _coerce_list_of_dicts(manifest.get("rendered_pages"))
+        if int(row.get("page_number") or 0) > 0
+    }
+    combined_manifest = manifest.get("combined_rendered_pages") if isinstance(manifest.get("combined_rendered_pages"), dict) else {}
+    rendered_page_images: List[Dict[str, Any]] = []
+    for page in selected_pages:
+        page_number = int(page.get("page_number") or 0)
+        manifest_row = manifest_rows.get(page_number) or {}
+        image_object_name = str(manifest_row.get("image_object_name") or "").strip()
+        image_object_path = str(manifest_row.get("image_object_path") or "").strip() or (
+            f"runs/{run_id}/{image_object_name}" if image_object_name else ""
+        )
+        signed_url, signed_url_error = ("", "rendered page object missing")
+        if image_object_name:
+            signed_url, signed_url_error = _try_sign_run_object_download(
+                run_id,
+                image_object_name,
+                filename=f"codebook_page_{page_number:04d}.png",
+                content_type="image/png",
+            )
+        rendered_page_images.append(
+            {
+                "page_number": page_number,
+                "image_object_path": image_object_path,
+                "image_signed_url": signed_url,
+                "signed_url_error": signed_url_error,
+                "selection_reasons": list(page.get("selection_reasons") or []),
+                "char_count": int(page.get("char_count") or 0),
+                "matched_terms": list(page.get("matched_terms") or []),
+            }
+        )
+
+    combined_object_name = str(combined_manifest.get("image_object_name") or "").strip()
+    combined_object_path = str(combined_manifest.get("image_object_path") or "").strip() or (
+        f"runs/{run_id}/{combined_object_name}" if combined_object_name else ""
+    )
+    combined_signed_url, combined_signed_url_error = ("", "combined rendered pages object missing")
+    if combined_object_name:
+        combined_signed_url, combined_signed_url_error = _try_sign_run_object_download(
+            run_id,
+            combined_object_name,
+            filename="codebook_combined_pages.png",
+            content_type="image/png",
+        )
+    combined_rendered_pages = {
+        "present": bool(combined_object_name),
+        "image_object_path": combined_object_path,
+        "image_signed_url": combined_signed_url,
+        "signed_url_error": combined_signed_url_error,
+        "page_numbers": [
+            int(page_number)
+            for page_number in (combined_manifest.get("page_numbers") or [])
+            if isinstance(page_number, (int, float)) and not isinstance(page_number, bool)
+        ],
+        "layout": str(combined_manifest.get("layout") or "").strip(),
+        "tile_count": int(combined_manifest.get("tile_count") or 0),
+    }
+
+    return rendered_page_images, selection_meta, combined_rendered_pages
+
+
 def _extract_codebook_pages(pdf_bytes: bytes) -> List[Dict[str, Any]]:
     if PdfReader is None:
         raise HTTPException(
             status_code=500,
-            detail="pypdf is not installed, so PDF codebook extraction is unavailable",
+            detail=(
+                "pypdf is not installed, so PDF codebook extraction is unavailable. "
+                "Reinstall dependencies from requirements.txt and restart the service "
+                "(or rebuild and redeploy the image)."
+            ),
         )
 
     try:
@@ -3219,6 +3851,7 @@ def _build_scale_mapping_bundle(
     run_id: str,
     light_contract_decisions: Dict[str, Any],
     family_worker_json: Any,
+    include_rendered_codebook_pages: bool = False,
 ) -> Dict[str, Any]:
     support = _load_canonical_support_artifacts(run_id)
     family_results_by_id = _extract_family_results(family_worker_json)
@@ -3293,27 +3926,15 @@ def _build_scale_mapping_bundle(
         + _split_mapping_text_list(raw_semantic_notes.get("semantic_codebook_and_important_variables"), allow_comma_fallback=False)
     )
 
-    relevant_page_snippets: List[Dict[str, Any]] = []
-    if page_records and query_terms:
-        scored_pages: List[Tuple[int, Dict[str, Any], List[str]]] = []
-        for page in page_records:
-            text = str(page.get("text") or "")
-            lowered = text.lower()
-            matched_terms = [term for term in query_terms if term and term.lower() in lowered]
-            if matched_terms:
-                scored_pages.append((len(matched_terms), page, matched_terms[:8]))
-        for _, page, matched_terms in sorted(scored_pages, key=lambda item: (-item[0], int(item[1].get("page_number") or 0)))[:6]:
-            text = str(page.get("text") or "")
-            snippet = text[:1600]
-            relevant_page_snippets.append(
-                {
-                    "page_number": int(page.get("page_number") or 0),
-                    "matched_terms": matched_terms,
-                    "snippet": snippet,
-                }
-            )
-
     codebook_present = bool(codebook_document.get("object_path"))
+    relevant_page_snippets, _matched_terms_by_page = _build_codebook_relevant_page_snippets(page_records, query_terms)
+    rendered_page_images, rendered_page_selection, combined_rendered_pages = _ensure_scale_mapping_rendered_pages(
+        run_id=run_id,
+        codebook_document=codebook_document,
+        page_records=page_records,
+        relevant_page_snippets=relevant_page_snippets,
+        include_rendered_codebook_pages=include_rendered_codebook_pages,
+    )
     has_mapping_evidence = bool(
         structured_human_mappings
         or codebook_present
@@ -3334,6 +3955,9 @@ def _build_scale_mapping_bundle(
             "document_signed_url": str(codebook_document.get("signed_url") or "").strip(),
             "page_count": int(codebook_document.get("page_count") or 0),
             "relevant_page_snippets": relevant_page_snippets,
+            "rendered_page_images": rendered_page_images,
+            "rendered_page_selection": rendered_page_selection,
+            "combined_rendered_pages": combined_rendered_pages,
         },
     }
 
@@ -4130,7 +4754,7 @@ async def upload_codebook(
         "pages": pages,
     }
     pages_object_path = _upload_json_to_run_object(run_id, "codebook_pages.json", pages_payload)
-    signed_url = _sign_run_object_download(
+    signed_url, signed_url_error = _try_sign_run_object_download(
         run_id,
         object_name,
         filename=filename,
@@ -4144,6 +4768,7 @@ async def upload_codebook(
         "page_count": len(pages),
         "pages_object_path": pages_object_path,
         "signed_url": signed_url,
+        "signed_url_error": signed_url_error,
         "uploaded_at": pd.Timestamp.utcnow().isoformat(),
     }
     _upload_json_to_run_object(run_id, "codebook_document.json", document_payload)
@@ -4155,6 +4780,7 @@ async def upload_codebook(
         "pages_object_path": pages_object_path,
         "page_count": len(pages),
         "signed_url": signed_url,
+        "signed_url_error": signed_url_error,
     }
 
 
@@ -7214,6 +7840,7 @@ class ArtifactBundleRequest(BaseModel):
     replace_policies: Optional[List[str]] = None
     transform_overrides: Optional[Dict[str, Any]] = None
     replace_transforms: Optional[List[str]] = None
+    include_rendered_codebook_pages: bool = False
     debug: bool = False
 
     class Config:
@@ -9873,6 +10500,10 @@ def _run_pruning_smoke_checks() -> None:
     assert family_worker_profile["artifacts"] == ["A8", "B1"]
     family_worker_cfg = family_worker_profile["mode_config"]
 
+    scale_mapping_profile, scale_mapping_source = _load_profile_local("scale_mapping_worker")
+    assert scale_mapping_source == "local"
+    assert scale_mapping_profile["artifacts"] == ["A2"]
+
     table_layout_profile, table_layout_source = _load_profile_local("table_layout_worker")
     assert table_layout_source == "local"
     assert table_layout_profile["artifacts"] == ["A2", "A5", "A9", "A10", "A12", "A14"]
@@ -11607,6 +12238,7 @@ def _build_scale_mapping_worker_bundle_response(req: ArtifactBundleRequest) -> D
         run_id=req.run_id,
         light_contract_decisions=light_contract_decisions,
         family_worker_json=family_worker_json or {},
+        include_rendered_codebook_pages=bool(req.include_rendered_codebook_pages),
     )
     return {
         "run_id": req.run_id,

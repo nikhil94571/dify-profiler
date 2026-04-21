@@ -1,0 +1,26 @@
+{
+  "profile": "scale_mapping_worker",
+  "description": "Fallback pruning profile for the ordered-scale/codebook mapping stage. Keeps only compact A2 label vocabulary and low-cardinality value previews for scale-like columns. The runtime path for this worker still prefers the backend-built compact bundle because it also needs light-contract mappings, family-worker output, and optional codebook snippets.",
+  "artifacts": ["A2"],
+  "pruning": {
+    "A2": {
+      "drop": [
+        "artifact_inputs",
+        "profiler_samples",
+        "numeric_profile",
+        "datetime_profile"
+      ],
+      "transforms": {
+        "project_scale_mapping_grounding": {
+          "type": "project_a2_semantic_context_grounding",
+          "low_cardinality_max_unique_count": 16,
+          "low_cardinality_preview_cap": 120,
+          "top_levels_limit": 8,
+          "priority_filter_keys": [
+            "force_include_columns"
+          ]
+        }
+      }
+    }
+  }
+}

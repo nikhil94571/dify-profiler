@@ -42,6 +42,7 @@ $envVars = @{
   "LOG_LEVEL"                     = "INFO"
   "EXPORT_BUCKET"                 = $EXPORT_BUCKET
   "SIGNING_SA_EMAIL"              = $SA_EMAIL
+  "EXPORT_SIGNER_SERVICE_ACCOUNT" = $SA_EMAIL
   "EXPORT_SIGNED_URL_TTL_MINUTES" = "30"
   "PROFILE_SOURCE"                = "gcs"
   "PROFILE_PREFIX"                = "profiles/"

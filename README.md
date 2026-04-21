@@ -264,6 +264,7 @@ The repository also contains a local profile example:
 
 - [`profiles/grain_worker.json`](/Users/nikhil/Automations/dify-profiler/profiles/grain_worker.json)
 - [`profiles/family_worker.json`](/Users/nikhil/Automations/dify-profiler/profiles/family_worker.json)
+- [`profiles/scale_mapping_worker.json`](/Users/nikhil/Automations/dify-profiler/profiles/scale_mapping_worker.json)
 - [`profiles/table_layout_worker.json`](/Users/nikhil/Automations/dify-profiler/profiles/table_layout_worker.json)
 - [`profiles/analysis_layout_worker.json`](/Users/nikhil/Automations/dify-profiler/profiles/analysis_layout_worker.json)
 - [`profiles/canonical_contract_reviewer.json`](/Users/nikhil/Automations/dify-profiler/profiles/canonical_contract_reviewer.json)
@@ -300,6 +301,7 @@ The intended next stage after family is ordered-scale / codebook mapping:
 1. request `POST /artifact-bundles/view` with `mode = "scale_mapping_worker"` and supply:
    - `light_contract_decisions`
    - `family_worker_json`
+   - optional `include_rendered_codebook_pages = true` on the with-codebook path when you want a signed PNG contact sheet for selected codebook pages in the bundle body
 2. inspect `artifacts.scale_mapping_bundle.has_mapping_evidence`
 3. if it is `false`, skip the extractor and pass an empty extractor sentinel to the resolver
 4. otherwise run [`prompts/scale_mapping_worker_system_prompt.md`](/Users/nikhil/Automations/dify-profiler/prompts/scale_mapping_worker_system_prompt.md)
@@ -315,7 +317,10 @@ The intended next stage after family is ordered-scale / codebook mapping:
 This stage is intentionally narrow:
 - it consumes a backend-built compact bundle rather than the full canonical bundle
 - it may use a codebook PDF when one has been uploaded through `POST /codebooks/upload`
+- when `include_rendered_codebook_pages = true`, the bundle may also include `codebook_context.combined_rendered_pages` as the primary LLM-facing image artifact plus `codebook_context.rendered_page_images` / `codebook_context.rendered_page_selection` as secondary render metadata
+- the intended Dify path for scanned codebooks is one HTTP GET of `codebook_context.combined_rendered_pages.image_signed_url`, then one LLM attachment of that downloaded PNG
 - the deterministic resolver is the final authority; the extractor is proposal-only
+- a local fallback profile exists at [`profiles/scale_mapping_worker.json`](/Users/nikhil/Automations/dify-profiler/profiles/scale_mapping_worker.json), but the active runtime path still prefers the backend-built bundle because profiles alone cannot compose light-contract mappings, family output, and codebook snippets into one packet
 
 The intended next stage after family is a single-pass canonical table-layout proposal worker:
 
@@ -887,6 +892,10 @@ source .venv/bin/activate
 pip install -r requirements.txt
 python -m uvicorn app:app --reload --host 127.0.0.1 --port 8080
 ```
+
+If you use the codebook-upload or rendered-page path (`POST /codebooks/upload` plus `include_rendered_codebook_pages = true` on `scale_mapping_worker` bundles), make sure the runtime was installed from the current [requirements.txt](/Users/nikhil/Automations/dify-profiler/requirements.txt). Those paths require `pypdf`, `pypdfium2`, and Pillow, so older virtualenvs or older Cloud Run images will fail until dependencies are reinstalled or the image is rebuilt.
+
+Signed URL generation for uploaded codebooks is now best-effort. If `EXPORT_SIGNER_SERVICE_ACCOUNT` or `SIGNING_SA_EMAIL` is unavailable, the upload still succeeds and stores extracted page text, but `signed_url` is returned as an empty string and `signed_url_error` explains why.
 
 For local profile testing:
 

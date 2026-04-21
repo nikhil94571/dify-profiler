@@ -57,6 +57,8 @@ The most relevant fields are:
 - `scale_mapping_bundle.accepted_families`
 - `scale_mapping_bundle.candidate_standalone_columns`
 - `scale_mapping_bundle.codebook_context.relevant_page_snippets`
+- `scale_mapping_bundle.codebook_context.combined_rendered_pages`
+- `scale_mapping_bundle.codebook_context.rendered_page_images`
 - the original attached codebook PDF when present
 
 Treat the bundle as the authoritative grounding packet for this worker. Do not request more context. Do not act as if you have the full canonical bundle.
@@ -173,6 +175,16 @@ If there is no meaningful mapping evidence, return exactly:
 - Why it matters: it is the main codebook evidence source for this worker.
 - What not to use it for: do not ignore contradictions between snippets and human notes.
 
+`scale_mapping_bundle.codebook_context.combined_rendered_pages`:
+- What it is: the primary signed PNG contact sheet for selected codebook pages when backend rendering is requested.
+- Why it matters: it is the preferred multimodal codebook image artifact for the worker when Dify is configured to download one file and attach it to the LLM.
+- What not to use it for: do not assume the model saw it unless the workflow actually downloads and attaches the PNG as a file input.
+
+`scale_mapping_bundle.codebook_context.rendered_page_images`:
+- What it is: optional per-page signed PNG URLs for selected codebook pages when backend rendering is requested.
+- Why it matters: it is secondary/debug metadata and a fallback if the combined contact sheet is unavailable.
+- What not to use it for: do not claim codebook confirmation from image URLs unless the worker invocation actually exposes them as usable multimodal inputs.
+
 ## 7) DECISION PROCEDURE
 
 ### STEP 1 - Decide whether to skip
@@ -186,7 +198,7 @@ Only emit targets that are explicitly present in:
 - candidate standalone columns with strong scale evidence.
 
 ### STEP 3 - Confirm ordered labels
-Use codebook snippets first.
+Use the combined rendered contact sheet first, then rendered page images and codebook snippets.
 
 When codebook evidence is clear:
 - emit `mapping_status = codebook_confirmed`

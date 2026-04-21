@@ -179,6 +179,8 @@ PROMPT_SPECS: dict[str, PromptSpec] = {
             "scale_mapping_bundle.accepted_families",
             "scale_mapping_bundle.candidate_standalone_columns",
             "scale_mapping_bundle.codebook_context.relevant_page_snippets",
+            "scale_mapping_bundle.codebook_context.combined_rendered_pages",
+            "scale_mapping_bundle.codebook_context.rendered_page_images",
         ),
         enum_sources=(
             EnumSource(
